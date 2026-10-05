@@ -7,7 +7,7 @@ use voice_scheduler::{
     protocol::{
         Assignment, AudioContext, AudioPacket, AudioPrefix, CacheOutcome, CreateOutcome,
         CreateRejection, FrameRejection, InputFrame, InputOutcome, PacketSequence, PrefixState,
-        SessionId,
+        SessionId, SessionLease,
     },
 };
 
@@ -514,6 +514,40 @@ async fn two_thousand_sessions_use_eight_device_workers_with_sticky_echoes() {
     assert_eq!(report.workers.len(), 8);
     assert!(report.mean_batch_size > 1.0);
     assert!(report.batch_fill_ratio <= 1.0);
+}
+#[tokio::test]
+async fn old_lease_cannot_send_close_or_evict_a_recreated_session() {
+    let node = Node::start(configuration()).await.unwrap();
+    let old = admit(&node, 1).await;
+    let lease = SessionLease {
+        session_id: SessionId(1),
+        generation: old.generation,
+    };
+    node.ingress.close_session(lease).await.unwrap();
+    let current = admit(&node, 1).await;
+    assert!(matches!(
+        node.ingress
+            .input_frame(
+                lease,
+                frame(
+                    0,
+                    PrefixState::default(),
+                    Bytes::from_static(b"stale"),
+                    Duration::from_millis(200)
+                )
+            )
+            .await
+            .unwrap(),
+        InputOutcome::Rejected(FrameRejection::Cancelled)
+    ));
+    assert!(!node.ingress.close_session(lease).await.unwrap());
+    assert!(!node.ingress.evict_cache(lease).await.unwrap());
+    let InputOutcome::Processed(output) = first_packet(&node, 1).await else {
+        panic!("replacement must remain active");
+    };
+    assert_eq!(output.audio.assignment, current);
+    assert_eq!(output.audio.cache, CacheOutcome::Hit);
+    node.shutdown().await.unwrap();
 }
 #[tokio::test]
 async fn partial_batch_runs_immediately_when_all_assigned_sessions_are_ready() {

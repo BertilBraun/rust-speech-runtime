@@ -73,6 +73,40 @@ pub struct Assignment {
     pub worker_id: WorkerId,
     pub generation: Generation,
 }
+#[derive(Clone, Copy, Debug)]
+pub struct SessionLease {
+    pub session_id: SessionId,
+    pub generation: Generation,
+}
+#[derive(Clone, Copy, Debug)]
+pub enum SessionTarget {
+    Current(SessionId),
+    Owned(SessionLease),
+}
+impl SessionTarget {
+    pub fn session_id(self) -> SessionId {
+        match self {
+            Self::Current(id) => id,
+            Self::Owned(lease) => lease.session_id,
+        }
+    }
+    pub fn matches_generation(self, generation: Generation) -> bool {
+        match self {
+            Self::Current(_) => true,
+            Self::Owned(lease) => lease.generation == generation,
+        }
+    }
+}
+impl From<SessionId> for SessionTarget {
+    fn from(id: SessionId) -> Self {
+        Self::Current(id)
+    }
+}
+impl From<SessionLease> for SessionTarget {
+    fn from(lease: SessionLease) -> Self {
+        Self::Owned(lease)
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CreateOutcome {
     Admitted(SessionAdmission),

@@ -4,7 +4,7 @@ use crate::{
     metrics::{ManagerMeasurements, Report},
     protocol::{
         Assignment, CreateOutcome, CreateRejection, FrameRejection, Generation, InputFrame,
-        InputOutcome, SessionAdmission, SessionId, WorkerId,
+        InputOutcome, SessionAdmission, SessionId, SessionTarget, WorkerId,
     },
     runtime::{Command, IngressMeasurements, RuntimeError},
     scheduler::{
@@ -144,15 +144,20 @@ impl SessionManager {
                 let _ = reply.send(self.create(session_id).await?);
             }
             Command::InputFrame {
-                session_id,
+                target,
                 input,
                 reply,
-            } => self.input(session_id, input, reply).await?,
-            Command::CloseSession { session_id, reply } => {
-                let _ = reply.send(self.close(session_id).await?);
+            } => self.input(target, input, reply).await?,
+            Command::CloseSession { target, reply } => {
+                let _ = reply.send(self.close(target).await?);
             }
-            Command::EvictCache { session_id, reply } => {
-                if let Some(session) = self.sessions.get(&session_id) {
+            Command::EvictCache { target, reply } => {
+                let session_id = target.session_id();
+                if let Some(session) = self
+                    .sessions
+                    .get(&session_id)
+                    .filter(|session| target.matches_generation(session.assignment.generation))
+                {
                     self.send_control(
                         session.assignment.worker_id,
                         WorkerCommand::EvictCache {
@@ -221,15 +226,21 @@ impl SessionManager {
     }
     async fn input(
         &mut self,
-        session_id: SessionId,
+        target: SessionTarget,
         input: InputFrame,
         reply: oneshot::Sender<InputOutcome>,
     ) -> Result<(), RuntimeError> {
+        let session_id = target.session_id();
         let Some(session) = self.sessions.get_mut(&session_id) else {
             self.measurements.rejected_frames += 1;
             let _ = reply.send(InputOutcome::Rejected(FrameRejection::UnknownSession));
             return Ok(());
         };
+        if !target.matches_generation(session.assignment.generation) {
+            self.measurements.rejected_frames += 1;
+            let _ = reply.send(InputOutcome::Rejected(FrameRejection::Cancelled));
+            return Ok(());
+        }
         session.last_input_at = Instant::now();
         let command = WorkerCommand::InputReady {
             session_id,
@@ -246,18 +257,27 @@ impl SessionManager {
                 self.measurements.worker_channel_saturation += 1;
                 self.measurements.rejected_frames += 1;
                 let _ = reply.send(InputOutcome::Rejected(FrameRejection::Overloaded));
-                self.close(session_id).await?;
+                self.close(target).await?;
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Closed(_)) => Err(RuntimeError::Stopped),
             Err(mpsc::error::TrySendError::Full(_)) => unreachable!("only input was sent"),
         }
     }
-    async fn close(&mut self, session_id: SessionId) -> Result<bool, RuntimeError> {
+    async fn close(&mut self, target: SessionTarget) -> Result<bool, RuntimeError> {
         self.reconcile();
-        let Some(session) = self.sessions.remove(&session_id) else {
+        let session_id = target.session_id();
+        if !self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| target.matches_generation(session.assignment.generation))
+        {
             return Ok(false);
-        };
+        }
+        let session = self
+            .sessions
+            .remove(&session_id)
+            .expect("validated session target exists");
         let (reply, response) = oneshot::channel();
         self.send_control(
             session.assignment.worker_id,
@@ -284,7 +304,7 @@ impl SessionManager {
             .map(|(session_id, _)| *session_id)
             .collect();
         for session_id in expired {
-            self.close(session_id).await?;
+            self.close(session_id.into()).await?;
             self.measurements.timed_out_sessions += 1;
         }
         Ok(())

@@ -18,7 +18,7 @@ use crate::{
     Ingress, Node, RuntimeError,
     config::RuntimeConfig,
     metrics::Report,
-    protocol::{CreateOutcome, FrameRejection, InputFrame, InputOutcome, SessionId},
+    protocol::{CreateOutcome, FrameRejection, InputFrame, InputOutcome, SessionLease},
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -27,6 +27,76 @@ pub struct GatewayConfig {
     pub maximum_connections: usize,
     pub message_limit: usize,
     pub io_timeout: Duration,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Gateway, GatewayConfig};
+    use crate::{
+        config::RuntimeConfig,
+        protocol::{CacheOutcome, FrameRejection, SessionId},
+        transport::{ClientError, ConnectOutcome, connect_session},
+    };
+    use bytes::Bytes;
+    use std::time::Duration;
+    use tokio::time::Instant;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn obsolete_tcp_connection_cannot_cancel_its_replacement() {
+        let gateway = Gateway::bind(
+            RuntimeConfig {
+                workers: 1,
+                inference_latency: Duration::from_millis(3),
+                calibration_samples: 2,
+                minimum_packet_interval: Duration::from_millis(250),
+                packet_deadline: Duration::from_millis(250),
+                max_batch_wait: Duration::ZERO,
+                ..RuntimeConfig::default()
+            },
+            GatewayConfig {
+                listen_address: "127.0.0.1:0".parse().unwrap(),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let address = gateway.local_address().unwrap();
+        let ingress = gateway.node.ingress.clone();
+        let signal = CancellationToken::new();
+        let task = tokio::spawn(gateway.serve(signal.clone()));
+        let ConnectOutcome::Admitted(mut old) =
+            connect_session(address, SessionId(1), Duration::from_secs(2))
+                .await
+                .unwrap()
+        else {
+            panic!("expected admission");
+        };
+        ingress.close_session(SessionId(1)).await.unwrap();
+        let ConnectOutcome::Admitted(mut current) =
+            connect_session(address, SessionId(1), Duration::from_secs(2))
+                .await
+                .unwrap()
+        else {
+            panic!("expected replacement");
+        };
+        assert!(matches!(
+            old.infer_audio(Bytes::from_static(b"old"), Instant::now())
+                .await,
+            Err(ClientError::Rejected(FrameRejection::Cancelled))
+        ));
+        drop(old);
+        let audio = current
+            .infer_audio(Bytes::from_static(b"current"), Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(audio.cache, CacheOutcome::Hit);
+        assert!(current.close().await.unwrap());
+        signal.cancel();
+        let report = task.await.unwrap().unwrap();
+        assert_eq!(report.runtime.admitted_sessions, 2);
+        assert_eq!(report.runtime.inference.delivered_frames, 1);
+    }
 }
 impl Default for GatewayConfig {
     fn default() -> Self {
@@ -188,8 +258,8 @@ async fn connection_loop(
         &mut session,
     )
     .await;
-    if let Some(session_id) = session {
-        ingress.close_session(session_id).await?;
+    if let Some(lease) = session {
+        ingress.close_session(lease).await?;
     }
     outcome
 }
@@ -215,7 +285,7 @@ async fn serve_connection(
     runtime: &RuntimeConfig,
     configuration: &GatewayConfig,
     cancellation: &CancellationToken,
-    session: &mut Option<SessionId>,
+    session: &mut Option<SessionLease>,
 ) -> Result<(), GatewayError> {
     loop {
         let request = tokio::select! {
@@ -228,8 +298,11 @@ async fn serve_connection(
         match request {
             ClientRequest::Open(session_id) if session.is_none() => {
                 let outcome = ingress.create_session(session_id).await?;
-                if matches!(outcome, CreateOutcome::Admitted(_)) {
-                    *session = Some(session_id);
+                if let CreateOutcome::Admitted(admission) = outcome {
+                    *session = Some(SessionLease {
+                        session_id,
+                        generation: admission.assignment.generation,
+                    });
                 }
                 send_reply(
                     peer,
@@ -246,7 +319,7 @@ async fn serve_connection(
                 packet,
                 remaining_budget,
             } => {
-                let Some(session_id) = *session else {
+                let Some(lease) = *session else {
                     return Err(WireError::InvalidMessage("open a session before audio").into());
                 };
                 if remaining_budget.is_zero() || remaining_budget > runtime.packet_deadline {
@@ -261,7 +334,7 @@ async fn serve_connection(
                 }
                 let timestamp = Instant::now();
                 let future = ingress.input_frame(
-                    session_id,
+                    lease,
                     InputFrame {
                         timestamp,
                         deadline: timestamp + remaining_budget,
@@ -277,13 +350,13 @@ async fn serve_connection(
                             match incoming? {
                                 None => return Ok(()),
                                 Some(ClientRequest::Close) => {
-                                    let closed = ingress.close_session(session_id).await?;
+                                    let closed = ingress.close_session(lease).await?;
                                     *session = None;
                                     send_reply(peer, ServerReply::Closed(closed), configuration, cancellation).await?;
                                     return Ok(());
                                 }
                                 _ => {
-                                    ingress.close_session(session_id).await?;
+                                    ingress.close_session(lease).await?;
                                     *session = None;
                                     send_reply(peer, ServerReply::Rejected(FrameRejection::Overloaded), configuration, cancellation).await?;
                                     return Ok(());
@@ -304,10 +377,10 @@ async fn serve_connection(
                 }
             }
             ClientRequest::EvictCache => {
-                let Some(session_id) = *session else {
+                let Some(lease) = *session else {
                     return Err(WireError::InvalidMessage("open a session before eviction").into());
                 };
-                let removed = ingress.evict_cache(session_id).await?;
+                let removed = ingress.evict_cache(lease).await?;
                 send_reply(
                     peer,
                     ServerReply::CacheEvicted(removed),
@@ -318,7 +391,7 @@ async fn serve_connection(
             }
             ClientRequest::Close => {
                 let closed = match session.take() {
-                    Some(session_id) => ingress.close_session(session_id).await?,
+                    Some(lease) => ingress.close_session(lease).await?,
                     None => false,
                 };
                 send_reply(

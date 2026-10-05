@@ -1,7 +1,7 @@
 use crate::{
     config::{ConfigError, RuntimeConfig},
     metrics::Report,
-    protocol::{CreateOutcome, FrameRejection, InputFrame, InputOutcome, SessionId},
+    protocol::{CreateOutcome, FrameRejection, InputFrame, InputOutcome, SessionId, SessionTarget},
     session::manager::SessionManager,
 };
 use std::sync::{
@@ -32,16 +32,16 @@ pub(crate) enum Command {
         reply: oneshot::Sender<CreateOutcome>,
     },
     InputFrame {
-        session_id: SessionId,
+        target: SessionTarget,
         input: InputFrame,
         reply: oneshot::Sender<InputOutcome>,
     },
     CloseSession {
-        session_id: SessionId,
+        target: SessionTarget,
         reply: oneshot::Sender<bool>,
     },
     EvictCache {
-        session_id: SessionId,
+        target: SessionTarget,
         reply: oneshot::Sender<bool>,
     },
 }
@@ -69,9 +69,10 @@ impl Ingress {
     }
     pub async fn input_frame(
         &self,
-        session_id: SessionId,
+        target: impl Into<SessionTarget>,
         input: InputFrame,
     ) -> Result<InputOutcome, RuntimeError> {
+        let target = target.into();
         if input.packet.payload.len() > self.configuration.audio_limits.max_frame_bytes {
             return Err(RuntimeError::InvalidFrame(
                 "payload exceeds max_frame_bytes",
@@ -86,7 +87,7 @@ impl Ingress {
         }
         let (reply, response) = oneshot::channel();
         match self.commands.try_send(Command::InputFrame {
-            session_id,
+            target,
             input,
             reply,
         }) {
@@ -98,22 +99,34 @@ impl Ingress {
                 self.measurements
                     .inputs_overloaded
                     .fetch_add(1, Ordering::Relaxed);
-                self.close_session(session_id).await?;
+                self.close_session(target).await?;
                 Ok(InputOutcome::Rejected(FrameRejection::Overloaded))
             }
             Err(mpsc::error::TrySendError::Closed(_)) => Err(RuntimeError::Stopped),
         }
     }
-    pub async fn close_session(&self, session_id: SessionId) -> Result<bool, RuntimeError> {
+    pub async fn close_session(
+        &self,
+        target: impl Into<SessionTarget>,
+    ) -> Result<bool, RuntimeError> {
         let (reply, response) = oneshot::channel();
-        self.send_control(Command::CloseSession { session_id, reply })
-            .await?;
+        self.send_control(Command::CloseSession {
+            target: target.into(),
+            reply,
+        })
+        .await?;
         response.await.map_err(|_| RuntimeError::Stopped)
     }
-    pub async fn evict_cache(&self, session_id: SessionId) -> Result<bool, RuntimeError> {
+    pub async fn evict_cache(
+        &self,
+        target: impl Into<SessionTarget>,
+    ) -> Result<bool, RuntimeError> {
         let (reply, response) = oneshot::channel();
-        self.send_control(Command::EvictCache { session_id, reply })
-            .await?;
+        self.send_control(Command::EvictCache {
+            target: target.into(),
+            reply,
+        })
+        .await?;
         response.await.map_err(|_| RuntimeError::Stopped)
     }
     async fn send_control(&self, command: Command) -> Result<(), RuntimeError> {
