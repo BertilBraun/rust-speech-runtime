@@ -52,6 +52,15 @@ pub(crate) struct WorkerProfile {
     pub slowest_packets: Vec<SlowWorkerPacket>,
 }
 impl WorkerProfile {
+    pub(crate) fn merge(&mut self, other: &Self) {
+        self.mailbox.merge(&other.mailbox);
+        self.validation.merge(&other.validation);
+        self.batch_wait.merge(&other.batch_wait);
+        self.device_dispatch.merge(&other.device_dispatch);
+        self.result_delivery.merge(&other.result_delivery);
+        self.sleep_overshoot.merge(&other.sleep_overshoot);
+        self.rejected_queue_delay.merge(&other.rejected_queue_delay);
+    }
     pub(crate) fn record(&mut self, packet: SlowWorkerPacket) {
         self.batch_wait.record(packet.timings.batch_wait);
         self.device_dispatch.record(packet.timings.device_dispatch);

@@ -70,6 +70,9 @@ impl AudioSession {
     pub fn packet_deadline(&self) -> Duration {
         self.admission.packet_deadline
     }
+    pub fn next_sequence(&self) -> PacketSequence {
+        PacketSequence(self.prefix.packets)
+    }
 
     pub async fn infer_audio(
         &mut self,
@@ -95,7 +98,7 @@ impl AudioSession {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<AudioResult, ClientError> {
-        let sequence = PacketSequence(self.prefix.packets);
+        let sequence = self.next_sequence();
         let packet = AudioPacket {
             sequence,
             payload: payload.clone(),

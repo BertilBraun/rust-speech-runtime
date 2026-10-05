@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     metrics::profile::{PacketTimings, RETAINED_TRACES, RuntimeLagReport, monitor_runtime},
     metrics::{LatencyDistribution, LatencyHistogram},
-    protocol::{CacheOutcome, CreateRejection, FrameRejection, SessionId},
+    protocol::{CacheOutcome, CreateRejection, FrameRejection, PacketSequence, SessionId},
     transport::{AudioSession, ClientError, ConnectOutcome, connect_session},
 };
 
@@ -176,7 +176,7 @@ pub struct SimulationReport {
 pub enum ClientPacketTrace {
     Echo {
         session_id: SessionId,
-        sequence: u64,
+        sequence: PacketSequence,
         round_trip: Duration,
         client_start_delay: Duration,
         outside_server: Duration,
@@ -184,7 +184,7 @@ pub enum ClientPacketTrace {
     },
     Failure {
         session_id: SessionId,
-        sequence: u64,
+        sequence: PacketSequence,
         round_trip: Duration,
         client_start_delay: Duration,
         reason: FailureReason,
@@ -321,6 +321,7 @@ async fn run_session(
             tick = ticks.recv() => match tick { Some(tick) => tick, None => break },
         };
         measurements.counters.attempted_frames += 1;
+        let sequence = session.next_sequence();
         let client_start_delay = captured_at.elapsed();
         measurements.client_start_delay.record(client_start_delay);
         match session.infer_audio(payload.clone(), captured_at).await {
@@ -332,7 +333,7 @@ async fn run_session(
                 measurements.outside_server.record(outside_server);
                 measurements.trace(ClientPacketTrace::Echo {
                     session_id,
-                    sequence: audio.sequence.0,
+                    sequence: audio.sequence,
                     round_trip,
                     client_start_delay,
                     outside_server,
@@ -372,7 +373,7 @@ async fn run_session(
                 measurements.failed_round_trip.record(round_trip);
                 measurements.trace(ClientPacketTrace::Failure {
                     session_id,
-                    sequence: measurements.counters.echoed_frames,
+                    sequence,
                     round_trip,
                     client_start_delay,
                     reason,

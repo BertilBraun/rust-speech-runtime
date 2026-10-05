@@ -151,6 +151,7 @@ pub struct WorkerReport {
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub runtime_lag: RuntimeLagReport,
+    pub profile: WorkerProfileReport,
     pub elapsed_secs: f64,
     pub active_sessions_at_shutdown: usize,
     pub peak_active_sessions: usize,
@@ -189,7 +190,9 @@ impl Report {
         let mut inference_latency = LatencyHistogram::default();
         let mut end_to_end_latency = LatencyHistogram::default();
         let mut deadline_lateness = LatencyHistogram::default();
+        let mut profile = WorkerProfile::default();
         for worker in &workers {
+            profile.merge(&worker.profile);
             counters.merge(&worker.counters);
             queue_delay.merge(&worker.queue_delay);
             inference_latency.merge(&worker.inference_latency);
@@ -207,6 +210,7 @@ impl Report {
             .sum();
         Self {
             runtime_lag,
+            profile: profile.report(),
             elapsed_secs: elapsed.as_secs_f64(),
             active_sessions_at_shutdown: manager.active_sessions,
             peak_active_sessions: manager.peak_active_sessions,

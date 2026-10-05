@@ -51,3 +51,31 @@ Tests cover calibration/admission, EDF batching, sticky echoing, prefix continui
 On this Windows machine, the 2026-10-05 release benchmark with eight 12 ms mock devices, 400 attempted sessions and 60 seconds of 48–55 ms packet arrivals admitted 64 sessions and rejected 336 before any audio processing. All 73,965 attempted packets were echoed: no failed sessions, deadline misses, capacity terminations or channel saturation. Round-trip p50/p95/p99/max were 22.4/25.6/26.2/39.1 ms. Batch fill was 16.3%, device utilization 72.8%, and node throughput about 1,221 packets/second. These are measured prototype results, rather than a universal capacity claim.
 
 The three-second-per-case suite also completed low/50%/80%/95% load, capacity overload, aligned/random arrivals, jitter, churn and forced cache replay without session failures or physical deadline misses. Intentional worker slowdown and channel saturation explicitly failed affected sessions and exposed their causes in metrics. Local reports are in `benchmark-results/network-verified-400.json` and `benchmark-results/network-suite-final.json`. All 31 tests, strict Clippy and formatting checks passed. Improving the low batch-fill ratio while preserving the observed latency is the next performance experiment.
+
+## Latency profiling, 2026-10-06
+
+Three sequential release runs used eight workers, batches of up to 16, requested 12 ms inference, a 50 ms capture-to-echo deadline, 1,600-byte packets, random phases and 48–55 ms arrivals. Each attempted 400 sessions and ran for 60 seconds. These diagnostic runs raised admission headroom and batch-fill reserve to 1; the normal admission defaults were not raised.
+
+| Per-worker session cap | Batch wait | Admitted | Failed sessions | Successful RTT p99 | Mean batch size | Device busy fraction |
+| --- | --- | --- | --- | --- | --- | --- |
+| 24 | 10 ms | 192 | 0 | 25.4 ms | 6.13 / 16 | 92.0% |
+| 32 | 10 ms | 256 | 0 | 25.4 ms | 7.96 / 16 | 95.4% |
+| 32 | 20 ms | 256 | 38 | 33.9 ms | 12.60 / 16 | 56.1% |
+
+The last row includes time after 38 sessions failed, so its utilization is not a measurement at a sustained 256 active sessions. The zero-failure rows are observations from individual runs; earlier minute-long runs at 128 and 192 sessions failed, and none of these establish a reliable admission ceiling. Changes in host scheduling conditions and profiling instrumentation can affect timing.
+
+At 256 sessions with a 10 ms batch window, mean ingress delay was 0.007 ms, worker mailbox and prefix validation each took about 0.004 ms, batch waiting about 6.7 ms, device dispatch about 0.05 ms, and result delivery about 0.035 ms. Mean physical inference was 12.34 ms per batch. The client measured 0.052 ms mean capture-to-task delay and 0.163 ms mean remaining round-trip time outside the instrumented server, including serialization, both socket directions and client processing. A two-second CPU sample during this run measured approximately one logical core combined for the gateway and simulator on this eight-logical-processor machine. Normal CPU/routing work was not the dominant latency source.
+
+The tail traces expose a different problem. A 43.3 ms successful packet spent 18.8 ms waiting for a batch, 12.1 ms waiting for the device thread to begin, and 12.1 ms executing. In the 20 ms batch-window run, session 282 packet 675 spent 21.072 ms waiting, 0.006 ms in device dispatch, **37.879 ms inside the requested 12 ms blocking sleep**, and 0.518 ms in result delivery. Ingress, mailbox and prefix validation together took only 0.013 ms. Its client received a deadline rejection after 61.03 ms. The run recorded 25 server completion overruns, four stale results and 38 failed client sessions; the pacer also measured a 47.5 ms wakeup delay.
+
+The measured failure path is delayed blocking-sleep completion plus existing batch wait. A device-dispatch interval contains channel handoff and thread scheduling, so a long dispatch does not by itself identify a Windows scheduler or Tokio defect. The CPU work inside routing is small, and the mock execution interval contains only `std::thread::sleep`; further system-level tracing would be needed to attribute that sleep overshoot to a particular OS mechanism. Increasing batch wait improves throughput efficiency but consumes deadline slack and did not meet the zero-failure requirement in this experiment. The next scheduling change should explicitly balance batch fill against the measured wakeup tail, rather than assuming GPU utilization alone predicts deadline safety.
+
+Reproduce the comparisons with:
+
+```powershell
+cargo run --release -- benchmark --sessions 400 --duration-secs 60 --admission-headroom 1 --batch-fill-reserve 1 --max-sessions-per-worker 24 --output benchmark-results/profile-192.json
+cargo run --release -- benchmark --sessions 400 --duration-secs 60 --admission-headroom 1 --batch-fill-reserve 1 --max-sessions-per-worker 32 --output benchmark-results/profile-256.json
+cargo run --release -- benchmark --sessions 400 --duration-secs 60 --admission-headroom 1 --batch-fill-reserve 1 --max-sessions-per-worker 32 --batch-wait-ms 20 --output benchmark-results/profile-256-wait20.json
+```
+
+The profiles and bounded slow traces are included in each JSON report. Profiling validation covers injected ingress/mailbox/batching delay, complete stage accounting, TCP timing bounds and retention of the eight worst traces. All 33 tests, strict Clippy and formatting checks passed.
