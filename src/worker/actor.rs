@@ -146,6 +146,8 @@ impl Worker {
             let elapsed = result.observed_at.duration_since(result.started_at);
             self.estimator
                 .observe(result.completed_at - result.started_at);
+            self.estimator
+                .observe_host_delay(result.observed_at - result.completed_at);
             self.measurements.calibration_latency.record(elapsed);
         }
         self.epoch = Instant::now();
@@ -214,6 +216,7 @@ impl Worker {
         self.measurements.elapsed = Instant::now().duration_since(self.epoch);
         self.measurements.final_session_limit = self.session_limit;
         self.measurements.service_time = self.estimator.service_time();
+        self.measurements.host_delay = self.estimator.host_delay();
         self.measurements
     }
     fn base_latency(&self) -> Duration {
@@ -241,11 +244,12 @@ impl Worker {
             .map(|pending| Instant::now().duration_since(pending.queued_at))
             .max()
             .unwrap_or(Duration::ZERO);
-        if queued + self.estimator.device_time() > self.configuration.compute_budget() {
-            self.session_limit.min(self.sessions.len())
-        } else {
-            self.session_limit
-        }
+        self.estimator.available_limit(
+            &self.configuration,
+            self.session_limit,
+            self.sessions.len(),
+            queued,
+        )
     }
     fn refresh_capacity(&mut self) {
         self.session_limit = session_limit(&self.configuration, self.estimator.service_time());
@@ -664,6 +668,7 @@ impl Worker {
         }
         let inference_latency = result.completed_at.duration_since(result.started_at);
         let host_wait = result.observed_at.duration_since(result.completed_at);
+        self.estimator.observe_host_delay(host_wait);
         self.measurements
             .profile
             .host_completion_delay
