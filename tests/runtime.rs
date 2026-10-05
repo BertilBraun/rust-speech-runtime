@@ -330,6 +330,69 @@ async fn cancelled_device_work_retains_cache_until_physical_completion() {
     assert_eq!(report.workers[0].peak_retired_cache_slots, 1);
     assert_eq!(report.inference.stale_results, 1);
 }
+
+#[tokio::test]
+async fn cache_replay_that_cannot_join_an_urgent_batch_is_deferred_without_rejection() {
+    let node = Node::start(RuntimeConfig {
+        batch_size: 2,
+        inference_latency: Duration::from_millis(12),
+        replay_latency_per_packet: Duration::from_millis(100),
+        max_batch_wait: Duration::from_millis(20),
+        ..configuration()
+    })
+    .await
+    .unwrap();
+    admit(&node, 1).await;
+    admit(&node, 2).await;
+    let prefix_audio = Bytes::from_static(b"prefix");
+    let first = node
+        .ingress
+        .input_frame(
+            SessionId(2),
+            frame(
+                0,
+                PrefixState::default(),
+                prefix_audio.clone(),
+                Duration::from_millis(200),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(first, InputOutcome::Processed(_)));
+    node.ingress.evict_cache(SessionId(2)).await.unwrap();
+    let captured = Instant::now();
+    let urgent = node.ingress.input_frame(
+        SessionId(1),
+        frame(
+            0,
+            PrefixState::default(),
+            Bytes::from_static(b"urgent"),
+            Duration::from_millis(35),
+        ),
+    );
+    let replay = node.ingress.input_frame(
+        SessionId(2),
+        InputFrame {
+            timestamp: captured,
+            deadline: captured + Duration::from_millis(200),
+            packet: AudioPacket {
+                sequence: PacketSequence(1),
+                payload: Bytes::from_static(b"next"),
+                context: AudioContext::Replay(voice_scheduler::protocol::AudioPrefix(vec![
+                    prefix_audio,
+                ])),
+            },
+        },
+    );
+    let (urgent, replay) = tokio::join!(urgent, replay);
+    assert!(matches!(urgent.unwrap(), InputOutcome::Processed(_)));
+    assert!(matches!(replay.unwrap(), InputOutcome::Processed(_)));
+    let report = node.shutdown().await.unwrap();
+    assert_eq!(report.inference.rejected_frames, 0);
+    assert_eq!(report.inference.replayed_packets, 1);
+    assert_eq!(report.inference.delivered_frames, 3);
+    assert!(report.inference_latency.max_ms >= 111.9);
+}
 #[tokio::test]
 async fn cache_eviction_requires_replaying_all_preceding_audio() {
     let node = Node::start(RuntimeConfig {

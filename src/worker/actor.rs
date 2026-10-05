@@ -600,7 +600,7 @@ impl Worker {
                 .sessions
                 .get_mut(&selected.session_id)
                 .expect("selected session exists");
-            let pending = session.pending.take().expect("pending frame exists");
+            let pending = session.pending.as_ref().expect("pending frame exists");
             let projected = self.estimator.device_time()
                 + replay
                 + pending.item.replay_duration
@@ -608,7 +608,11 @@ impl Worker {
             let batch_deadline = earliest_deadline
                 .unwrap_or(pending.item.input.deadline)
                 .min(pending.item.input.deadline);
-            if predicted_start + projected > batch_deadline {
+            let own_cost = self.estimator.device_time()
+                + pending.item.replay_duration
+                + self.configuration.scheduling_margin;
+            if predicted_start + own_cost > pending.item.input.deadline {
+                let pending = session.pending.take().expect("pending frame exists");
                 self.measurements
                     .profile
                     .rejected_queue_delay
@@ -624,6 +628,10 @@ impl Worker {
                 );
                 continue;
             }
+            if predicted_start + projected > batch_deadline {
+                continue;
+            }
+            let pending = session.pending.take().expect("pending frame exists");
             replay += pending.item.replay_duration;
             earliest_deadline = Some(batch_deadline);
             self.sessions
