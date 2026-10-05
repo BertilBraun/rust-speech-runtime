@@ -54,14 +54,17 @@ impl SimulationConfig {
             || self.sessions > 10_000
             || self.duration.is_zero()
             || self.duration > Duration::from_secs(86400)
-            || self.minimum_interval.is_zero()
+            || self.minimum_interval < Duration::from_millis(1)
             || self.maximum_interval < self.minimum_interval
             || self.maximum_interval > Duration::from_secs(1)
             || self.payload_bytes == 0
             || self.payload_bytes > 4096
             || self.io_timeout.is_zero()
+            || self.io_timeout > Duration::from_secs(86400)
             || self.evict_every == Some(0)
-            || self.churn_after.is_some_and(|duration| duration.is_zero())
+            || self
+                .churn_after
+                .is_some_and(|duration| duration.is_zero() || duration > Duration::from_secs(86400))
         {
             return Err(SimulationError::Configuration(
                 "invalid bounded workload configuration",
@@ -200,12 +203,16 @@ fn pace(
         events.push(Reverse((start + offset, index)));
     }
     let mut measurements = PacerMeasurements::default();
+    let mut last_captures = vec![None; slots.len()];
     while let Some(Reverse((scheduled, index))) = events.pop() {
         if scheduled >= stop || cancellation.is_cancelled() {
             break;
         }
         std::thread::sleep(scheduled.saturating_duration_since(std::time::Instant::now()));
         let captured = std::time::Instant::now();
+        if captured >= stop {
+            break;
+        }
         let slot = &slots[index];
         if slot.cancellation.is_cancelled() {
             continue;
@@ -214,7 +221,14 @@ fn pace(
             .delay
             .record(captured.saturating_duration_since(scheduled));
         match slot.sender.try_send(Instant::from_std(captured)) {
-            Ok(()) => {}
+            Ok(()) => {
+                if let Some(previous) = last_captures[index] {
+                    measurements
+                        .intervals
+                        .record(captured.duration_since(previous));
+                }
+                last_captures[index] = Some(captured);
+            }
             Err(mpsc::error::TrySendError::Closed(_)) => continue,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 measurements.overruns += 1;
@@ -226,8 +240,7 @@ fn pace(
             configuration.minimum_interval.as_micros() as u64
                 ..=configuration.maximum_interval.as_micros() as u64,
         ));
-        measurements.intervals.record(interval);
-        events.push(Reverse((scheduled + interval, index)));
+        events.push(Reverse((captured + interval, index)));
     }
     measurements
 }

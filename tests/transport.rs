@@ -186,6 +186,7 @@ async fn network_simulation_reports_admission_echo_replay_and_churn() {
     assert!(report.counters.replayed_packets > 0);
     assert_eq!(report.counters.failed_sessions, 0);
     assert_eq!(report.generator_overruns, 0);
+    assert!(report.generated_intervals.min_ms >= 47.9);
     assert_eq!(
         report.round_trip_latency.samples,
         report.counters.echoed_frames

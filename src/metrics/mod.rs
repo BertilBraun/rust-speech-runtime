@@ -22,6 +22,7 @@ impl LatencyHistogram {
         LatencyDistribution {
             samples: self.0.len(),
             mean_ms: self.0.mean() / 1000.0,
+            min_ms: self.0.min() as f64 / 1000.0,
             p50_ms: self.0.value_at_quantile(0.5) as f64 / 1000.0,
             p95_ms: self.0.value_at_quantile(0.95) as f64 / 1000.0,
             p99_ms: self.0.value_at_quantile(0.99) as f64 / 1000.0,
@@ -33,6 +34,7 @@ impl LatencyHistogram {
 pub struct LatencyDistribution {
     pub samples: u64,
     pub mean_ms: f64,
+    pub min_ms: f64,
     pub p50_ms: f64,
     pub p95_ms: f64,
     pub p99_ms: f64,

@@ -83,6 +83,7 @@ impl Gateway {
             || configuration.message_limit == 0
             || configuration.message_limit > MAX_MESSAGE_BYTES
             || configuration.io_timeout.is_zero()
+            || configuration.io_timeout > Duration::from_secs(86400)
         {
             return Err(GatewayError::Configuration(
                 "positive bounded connection, message and timeout limits required",
