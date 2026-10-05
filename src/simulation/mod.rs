@@ -76,6 +76,8 @@ impl SimulationConfig {
 }
 #[derive(Debug, thiserror::Error)]
 pub enum SimulationError {
+    #[error("session task exited before the workload was ready: {0}")]
+    Startup(#[from] tokio::sync::oneshot::error::RecvError),
     #[error("CPU measurement failed: {0}")]
     CpuClock(#[from] std::io::Error),
     #[error("invalid simulation configuration: {0}")]
@@ -163,6 +165,7 @@ pub struct SimulationReport {
     pub configuration: SimulationConfig,
     pub elapsed_secs: f64,
     pub admission_secs: f64,
+    pub setup_secs: f64,
     pub counters: ClientCounters,
     pub throughput_frames_per_sec: f64,
     pub round_trip_latency: LatencyDistribution,
@@ -306,6 +309,7 @@ async fn run_session(
     configuration: SimulationConfig,
     mut ticks: mpsc::Receiver<Instant>,
     cancellation: CancellationToken,
+    ready: tokio::sync::oneshot::Sender<()>,
 ) -> ClientMeasurements {
     let mut measurements = ClientMeasurements::default();
     measurements.counters.admitted_sessions = 1;
@@ -315,6 +319,7 @@ async fn run_session(
     let mut lifetime = configuration
         .churn_after
         .map(|duration| duration.mul_f64(random.random_range(0.5..=1.0)));
+    let _ = ready.send(());
     loop {
         let captured_at = tokio::select! {
             _ = cancellation.cancelled() => {
@@ -448,14 +453,15 @@ pub async fn run(
         }
     }
     let admission_secs = admission_start.elapsed().as_secs_f64();
-    let started = Instant::now();
-    let monitor_cancellation = CancellationToken::new();
-    let monitor = monitor_runtime(monitor_cancellation.clone());
+    let setup_start = Instant::now();
     let mut tasks = JoinSet::new();
     let mut slots = Vec::new();
+    let mut readiness = Vec::new();
     for (session_id, session) in admitted {
         let (sender, receiver) = mpsc::channel(1);
         let cancellation = CancellationToken::new();
+        let (ready, initialized) = tokio::sync::oneshot::channel();
+        readiness.push(initialized);
         slots.push(PacerSlot {
             sender,
             cancellation: cancellation.clone(),
@@ -467,8 +473,16 @@ pub async fn run(
             configuration.clone(),
             receiver,
             cancellation,
+            ready,
         ));
     }
+    for initialized in readiness {
+        initialized.await?;
+    }
+    let setup_secs = setup_start.elapsed().as_secs_f64();
+    let started = Instant::now();
+    let monitor_cancellation = CancellationToken::new();
+    let monitor = monitor_runtime(monitor_cancellation.clone());
     let pacing_configuration = configuration.clone();
     let pacer = tokio::task::spawn_blocking(move || {
         pace(slots, pacing_configuration, CancellationToken::new())
@@ -499,6 +513,7 @@ pub async fn run(
         configuration,
         elapsed_secs,
         admission_secs,
+        setup_secs,
         counters: totals.counters,
         round_trip_latency: totals.round_trip.summary(),
         failed_round_trip_latency: totals.failed_round_trip.summary(),
