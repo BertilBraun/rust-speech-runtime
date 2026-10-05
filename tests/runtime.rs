@@ -285,6 +285,51 @@ async fn cancellation_invalidates_work_submitted_while_the_device_is_running() {
     assert_eq!(report.inference.stale_results, 1);
     assert_eq!(report.inference.delivered_frames, 1);
 }
+
+#[tokio::test]
+async fn cancelled_device_work_retains_cache_until_physical_completion() {
+    let node = Node::start(RuntimeConfig {
+        cache_slots_per_worker: 1,
+        inference_latency: Duration::from_millis(40),
+        ..configuration()
+    })
+    .await
+    .unwrap();
+    admit(&node, 1).await;
+    let ingress = node.ingress.clone();
+    let pending = tokio::spawn(async move {
+        ingress
+            .input_frame(
+                SessionId(1),
+                frame(
+                    0,
+                    PrefixState::default(),
+                    Bytes::from_static(b"running"),
+                    Duration::from_millis(200),
+                ),
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    node.ingress.close_session(SessionId(1)).await.unwrap();
+    assert_eq!(
+        node.ingress.create_session(SessionId(2)).await.unwrap(),
+        CreateOutcome::Rejected(CreateRejection::Capacity)
+    );
+    assert!(matches!(
+        pending.await.unwrap(),
+        InputOutcome::Rejected(FrameRejection::Cancelled)
+    ));
+    admit(&node, 2).await;
+    assert!(matches!(
+        first_packet(&node, 2).await,
+        InputOutcome::Processed(_)
+    ));
+    let report = node.shutdown().await.unwrap();
+    assert_eq!(report.workers[0].peak_retired_cache_slots, 1);
+    assert_eq!(report.inference.stale_results, 1);
+}
 #[tokio::test]
 async fn cache_eviction_requires_replaying_all_preceding_audio() {
     let node = Node::start(RuntimeConfig {

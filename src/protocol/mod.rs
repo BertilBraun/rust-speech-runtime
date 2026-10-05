@@ -9,7 +9,7 @@ use tokio::time::Instant;
 pub struct SessionId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkerId(pub usize);
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct Generation(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PacketSequence(pub u64);
@@ -74,7 +74,7 @@ pub struct Assignment {
     pub worker_id: WorkerId,
     pub generation: Generation,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SessionLease {
     pub session_id: SessionId,
     pub generation: Generation,

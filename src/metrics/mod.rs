@@ -109,6 +109,7 @@ pub(crate) struct WorkerMeasurements {
     pub occupied_time: Duration,
     pub occupied_until: Option<tokio::time::Instant>,
     pub peak_device_jobs: usize,
+    pub peak_retired_cache_slots: usize,
     pub device_cpu: CpuUsage,
     pub elapsed: Duration,
     pub batch_sizes: Histogram<u64>,
@@ -132,6 +133,7 @@ impl WorkerMeasurements {
             occupied_time: Duration::ZERO,
             occupied_until: None,
             peak_device_jobs: 0,
+            peak_retired_cache_slots: 0,
             device_cpu: CpuUsage::default(),
             elapsed: Duration::ZERO,
             batch_sizes: Histogram::new(3).expect("valid precision"),
@@ -146,6 +148,7 @@ impl WorkerMeasurements {
 }
 #[derive(Debug, Serialize)]
 pub struct WorkerReport {
+    pub peak_retired_cache_slots: usize,
     pub device_cpu: CpuUsage,
     pub worker_id: WorkerId,
     pub initial_session_limit: usize,
@@ -267,6 +270,7 @@ impl Report {
             workers: workers
                 .into_iter()
                 .map(|worker| WorkerReport {
+                    peak_retired_cache_slots: worker.peak_retired_cache_slots,
                     device_cpu: worker.device_cpu,
                     worker_id: worker.worker_id,
                     initial_session_limit: worker.initial_session_limit,

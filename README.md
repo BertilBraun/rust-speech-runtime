@@ -40,6 +40,8 @@ The scheduler maintains an EDF selection while device work is running. Full batc
 
 Audio packets carry a sequence and the fingerprint of their preceding prefix. Each worker owns a bounded cache pool containing fake KV-prefix fingerprints. Inference updates the entire logical prefix and returns the original audio bytes. Cache eviction preserves logical session history but invalidates GPU-local KV state. A subsequent cache miss requests replay of all preceding audio; replay is verified and contributes proportional simulated compute cost.
 
+Closing a session releases its admission slot immediately, but a cache slot referenced by submitted device work remains retired until that work completes. A replacement can be rejected temporarily when all cache slots are still in use. Reports expose peak retired cache slots, and a test verifies that cancelled inference cannot reuse a replacement's cache memory.
+
 A session retains at most one pending or running packet. Audio is never coalesced or silently replaced. A sequencing error, frame overload, prefix limit, impossible replay deadline or late completion explicitly fails the session. Cache misses are retryable without advancing the prefix. The external client retains the original audio history and automatically replays it after a cache miss. Replay shares the original packet's deadline. Closing/recreating a session assigns a new generation; old physical results cannot reach its replacement.
 
 Admission protects against predictable overload, not arbitrary OS stalls or unforeseen hardware failures. Physical deadline overruns and terminated sessions remain visible in metrics. A late completion is reported as a failure, never as successful realtime audio.

@@ -8,7 +8,7 @@ use crate::{
     metrics::profile::{PacketTimings, SlowWorkerPacket},
     protocol::{
         Assignment, AudioContext, AudioResult, CacheOutcome, FrameRejection, Generation,
-        InferenceOutput, InputFrame, InputOutcome, PrefixState, SessionId, WorkerId,
+        InferenceOutput, InputFrame, InputOutcome, PrefixState, SessionId, SessionLease, WorkerId,
     },
     scheduler::{
         admission::{ServiceEstimator, WorkerStatus, session_limit},
@@ -77,6 +77,7 @@ struct Worker {
     configuration: Arc<RuntimeConfig>,
     sessions: HashMap<SessionId, WorkerSession>,
     cache: CachePool,
+    retired_cache: HashMap<SessionLease, CacheHandle>,
     measurements: WorkerMeasurements,
     estimator: ServiceEstimator,
     status: watch::Sender<WorkerStatus>,
@@ -103,6 +104,7 @@ pub(crate) fn spawn_worker(
         estimator: ServiceEstimator::new(&configuration),
         configuration,
         sessions: HashMap::new(),
+        retired_cache: HashMap::new(),
         measurements: WorkerMeasurements::new(worker_id),
         status,
         submitted: VecDeque::new(),
@@ -265,7 +267,22 @@ impl Worker {
                 self.measurements.counters.rejected_frames += 1;
                 let _ = pending.item.reply.send(InputOutcome::Rejected(reason));
             }
-            self.cache.free(session.cache);
+            if session.in_flight {
+                let prior = self.retired_cache.insert(
+                    SessionLease {
+                        session_id,
+                        generation: session.assignment.generation,
+                    },
+                    session.cache,
+                );
+                assert!(prior.is_none(), "each cache lease is retired once");
+                self.measurements.peak_retired_cache_slots = self
+                    .measurements
+                    .peak_retired_cache_slots
+                    .max(self.retired_cache.len());
+            } else {
+                self.cache.free(session.cache);
+            }
             self.refresh_prepared();
         }
     }
@@ -678,6 +695,12 @@ impl Worker {
                         .observe(inference_latency - result.replay_duration);
                 }
                 for item in items {
+                    if let Some(cache) = self.retired_cache.remove(&SessionLease {
+                        session_id: item.session_id,
+                        generation: item.assignment.generation,
+                    }) {
+                        self.cache.free(cache);
+                    }
                     let handled_at = Instant::now();
                     let timings = PacketTimings {
                         ingress: item.routed_at - item.input.timestamp,
