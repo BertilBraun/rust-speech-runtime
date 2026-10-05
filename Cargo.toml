@@ -7,15 +7,17 @@ license = "MIT"
 
 [dependencies]
 blake3 = "1.8"
+bincode = { version = "2.0", features = ["serde"] }
 bytes = { version = "1.10", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 hdrhistogram = "7.5"
+futures-util = { version = "0.3", features = ["sink"] }
 rand = { version = "0.9", features = ["small_rng"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "fs", "net", "io-util", "test-util"] }
-tokio-util = "0.7"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "fs", "net", "io-util", "io-std", "process", "test-util"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 
 [lints.rust]
 unsafe_code = "forbid"

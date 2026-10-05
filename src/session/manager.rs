@@ -3,8 +3,8 @@ use crate::{
     config::RuntimeConfig,
     metrics::{ManagerMeasurements, Report},
     protocol::{
-        Assignment, CreateOutcome, FrameRejection, Generation, InputFrame, InputOutcome, SessionId,
-        WorkerId,
+        Assignment, CreateOutcome, CreateRejection, FrameRejection, Generation, InputFrame,
+        InputOutcome, SessionAdmission, SessionId, WorkerId,
     },
     runtime::{Command, IngressMeasurements, RuntimeError},
     scheduler::{
@@ -172,7 +172,7 @@ impl SessionManager {
     async fn create(&mut self, session_id: SessionId) -> Result<CreateOutcome, RuntimeError> {
         self.reconcile();
         if self.sessions.contains_key(&session_id) {
-            return Ok(CreateOutcome::AlreadyExists);
+            return Ok(CreateOutcome::Rejected(CreateRejection::AlreadyExists));
         }
         let mut workers = self.statuses();
         while let Some(worker_id) = LeastLoaded.select_worker(&workers) {
@@ -208,12 +208,16 @@ impl SessionManager {
                     .measurements
                     .peak_active_sessions
                     .max(self.sessions.len());
-                return Ok(CreateOutcome::Admitted(assignment));
+                return Ok(CreateOutcome::Admitted(SessionAdmission {
+                    assignment,
+                    audio_limits: self.configuration.audio_limits,
+                    packet_deadline: self.configuration.packet_deadline,
+                }));
             }
             workers[worker_id.0].session_limit = 0;
         }
         self.measurements.rejected_sessions += 1;
-        Ok(CreateOutcome::RejectedCapacity)
+        Ok(CreateOutcome::Rejected(CreateRejection::Capacity))
     }
     async fn input(
         &mut self,

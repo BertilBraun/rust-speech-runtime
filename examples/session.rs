@@ -14,9 +14,10 @@ use voice_scheduler::{
 async fn main() -> Result<(), RuntimeError> {
     let node = Node::start(RuntimeConfig::default()).await?;
     let session_id = SessionId(1);
-    let CreateOutcome::Admitted(assignment) = node.ingress.create_session(session_id).await? else {
+    let CreateOutcome::Admitted(admission) = node.ingress.create_session(session_id).await? else {
         panic!("no realtime capacity");
     };
+    let assignment = admission.assignment;
     let timestamp = Instant::now();
     let outcome = node
         .ingress

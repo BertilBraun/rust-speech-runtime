@@ -1,5 +1,7 @@
+use crate::config::AudioLimits;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tokio::time::Instant;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -73,9 +75,20 @@ pub struct Assignment {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CreateOutcome {
-    Admitted(Assignment),
-    RejectedCapacity,
+    Admitted(SessionAdmission),
+    Rejected(CreateRejection),
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CreateRejection {
+    Capacity,
     AlreadyExists,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionAdmission {
+    pub assignment: Assignment,
+    pub audio_limits: AudioLimits,
+    pub packet_deadline: Duration,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FrameRejection {

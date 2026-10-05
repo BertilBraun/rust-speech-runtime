@@ -37,7 +37,7 @@ impl ServiceEstimator {
         assert!(!self.samples.is_empty(), "admission waits for calibration");
         let mut samples: Vec<Duration> = self.samples.iter().copied().collect();
         samples.sort_unstable();
-        samples[(samples.len() * 99).div_ceil(100) - 1].mul_f64(self.safety_factor)
+        samples[(samples.len() * 95).div_ceil(100) - 1].mul_f64(self.safety_factor)
     }
 }
 pub(crate) fn session_limit(configuration: &RuntimeConfig, service_time: Duration) -> usize {
@@ -51,6 +51,22 @@ pub(crate) fn session_limit(configuration: &RuntimeConfig, service_time: Duratio
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn isolated_spike_does_not_hide_sustained_slowdown() {
+        let mut estimator = ServiceEstimator::new(&RuntimeConfig {
+            latency_safety_factor: 1.0,
+            ..RuntimeConfig::default()
+        });
+        for _ in 0..64 {
+            estimator.observe(Duration::from_millis(12));
+        }
+        estimator.observe(Duration::from_millis(40));
+        assert_eq!(estimator.service_time(), Duration::from_millis(12));
+        for _ in 0..3 {
+            estimator.observe(Duration::from_millis(40));
+        }
+        assert_eq!(estimator.service_time(), Duration::from_millis(40));
+    }
     #[test]
     fn capacity_reserves_whole_batches_and_headroom() {
         let configuration = RuntimeConfig::default();

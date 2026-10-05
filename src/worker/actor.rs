@@ -1,6 +1,6 @@
 use super::{
     cache::{CacheHandle, CachePool},
-    mock_gpu::{self, Batch, DeviceJob, DeviceResult, DeviceWork, WorkItem},
+    mock_gpu::{self, DeviceJob, DeviceResult, DeviceWork, WorkItem},
 };
 use crate::{
     config::RuntimeConfig,
@@ -121,7 +121,6 @@ impl Worker {
         let device =
             tokio::task::spawn_blocking(move || mock_gpu::run(job_mailbox, device_results));
         for _ in 0..self.configuration.calibration_samples {
-            let started_at = Instant::now();
             jobs.send(DeviceJob {
                 work: DeviceWork::Probe,
                 latency: self.configuration.inference_latency,
@@ -129,7 +128,7 @@ impl Worker {
             .await
             .expect("device is running");
             let result = results.recv().await.expect("probe result");
-            let elapsed = Instant::now().duration_since(started_at);
+            let elapsed = result.completed_at.duration_since(result.started_at);
             self.estimator.observe(elapsed);
             self.measurements
                 .calibration_latency
@@ -376,9 +375,9 @@ impl Worker {
             return;
         }
         let prior_prefix = session.prefix;
-        if prior_prefix.packets >= self.configuration.max_prefix_packets as u64
+        if prior_prefix.packets >= self.configuration.audio_limits.max_prefix_packets as u64
             || prior_prefix.bytes + input.packet.payload.len() as u64
-                > self.configuration.max_prefix_bytes as u64
+                > self.configuration.audio_limits.max_prefix_bytes as u64
         {
             self.reject(session_id, reply, FrameRejection::PrefixCapacity);
             return;
@@ -397,12 +396,12 @@ impl Worker {
                 CacheOutcome::Hit
             }
             AudioContext::Replay(prefix) => {
-                if prefix.0.len() > self.configuration.max_prefix_packets
-                    || prefix.byte_len() > self.configuration.max_prefix_bytes
+                if prefix.0.len() > self.configuration.audio_limits.max_prefix_packets
+                    || prefix.byte_len() > self.configuration.audio_limits.max_prefix_bytes
                     || prefix
                         .0
                         .iter()
-                        .any(|frame| frame.len() > self.configuration.max_frame_bytes)
+                        .any(|frame| frame.len() > self.configuration.audio_limits.max_frame_bytes)
                 {
                     self.reject(session_id, reply, FrameRejection::PrefixCapacity);
                     return;
@@ -502,6 +501,7 @@ impl Worker {
         );
         let mut items = Vec::new();
         let mut replay = Duration::ZERO;
+        let mut earliest_deadline = None;
         for selected in selected {
             let session = self
                 .sessions
@@ -512,7 +512,10 @@ impl Worker {
                 + replay
                 + pending.item.replay_duration
                 + self.configuration.scheduling_margin;
-            if Instant::now() + projected > pending.item.input.deadline {
+            let batch_deadline = earliest_deadline
+                .unwrap_or(pending.item.input.deadline)
+                .min(pending.item.input.deadline);
+            if Instant::now() + projected > batch_deadline {
                 self.reject(
                     selected.session_id,
                     pending.item.reply,
@@ -525,6 +528,7 @@ impl Worker {
                 continue;
             }
             replay += pending.item.replay_duration;
+            earliest_deadline = Some(batch_deadline);
             self.sessions
                 .get_mut(&selected.session_id)
                 .expect("session exists")
@@ -537,10 +541,7 @@ impl Worker {
         self.active_device = true;
         jobs.send(DeviceJob {
             latency: self.base_latency() + replay,
-            work: DeviceWork::Inference(Batch {
-                items,
-                dispatched_at: Instant::now(),
-            }),
+            work: DeviceWork::Inference(items),
         })
         .await
         .expect("device is running");
@@ -553,24 +554,21 @@ impl Worker {
                 self.estimator.observe(inference_latency);
                 self.refresh_capacity();
             }
-            DeviceWork::Inference(batch) => {
+            DeviceWork::Inference(items) => {
                 self.measurements.counters.batches += 1;
-                self.measurements.counters.processed_frames += batch.items.len() as u64;
+                self.measurements.counters.processed_frames += items.len() as u64;
                 self.measurements
                     .batch_sizes
-                    .record(batch.items.len() as u64)
+                    .record(items.len() as u64)
                     .expect("bounded batch size");
                 self.measurements.busy_time += inference_latency;
                 self.measurements
                     .inference_latency
                     .record(inference_latency);
-                let replay: Duration = batch.items.iter().map(|item| item.replay_duration).sum();
-                self.estimator.observe(
-                    Instant::now()
-                        .duration_since(batch.dispatched_at)
-                        .saturating_sub(replay),
-                );
-                for item in batch.items {
+                let replay: Duration = items.iter().map(|item| item.replay_duration).sum();
+                self.estimator
+                    .observe(inference_latency.saturating_sub(replay));
+                for item in items {
                     let Some(session) = self
                         .sessions
                         .get_mut(&item.session_id)

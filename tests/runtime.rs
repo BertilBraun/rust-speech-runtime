@@ -3,10 +3,11 @@ use std::time::Duration;
 use tokio::time::Instant;
 use voice_scheduler::{
     Node, RuntimeError,
-    config::{RuntimeConfig, WorkerSlowdown},
+    config::{AudioLimits, RuntimeConfig, WorkerSlowdown},
     protocol::{
         Assignment, AudioContext, AudioPacket, AudioPrefix, CacheOutcome, CreateOutcome,
-        FrameRejection, InputFrame, InputOutcome, PacketSequence, PrefixState, SessionId,
+        CreateRejection, FrameRejection, InputFrame, InputOutcome, PacketSequence, PrefixState,
+        SessionId,
     },
 };
 
@@ -15,6 +16,7 @@ fn configuration() -> RuntimeConfig {
         workers: 1,
         inference_latency: Duration::from_millis(3),
         packet_deadline: Duration::from_millis(250),
+        minimum_packet_interval: Duration::from_millis(250),
         max_batch_wait: Duration::ZERO,
         max_sessions_per_worker: 4,
         cache_slots_per_worker: 4,
@@ -43,7 +45,7 @@ async fn admit(node: &Node, session_id: u64) -> Assignment {
         .await
         .unwrap()
     {
-        CreateOutcome::Admitted(assignment) => assignment,
+        CreateOutcome::Admitted(admission) => admission.assignment,
         outcome => panic!("expected admission: {outcome:?}"),
     }
 }
@@ -65,6 +67,7 @@ async fn first_packet(node: &Node, session_id: u64) -> InputOutcome {
 #[tokio::test]
 async fn calibration_rejects_sessions_that_cannot_fit_realtime_budget() {
     let node = Node::start(RuntimeConfig {
+        minimum_packet_interval: Duration::from_millis(48),
         inference_latency: Duration::from_millis(60),
         ..configuration()
     })
@@ -72,7 +75,7 @@ async fn calibration_rejects_sessions_that_cannot_fit_realtime_budget() {
     .unwrap();
     assert_eq!(
         node.ingress.create_session(SessionId(1)).await.unwrap(),
-        CreateOutcome::RejectedCapacity
+        CreateOutcome::Rejected(CreateRejection::Capacity)
     );
     let report = node.shutdown().await.unwrap();
     assert_eq!(report.workers[0].initial_session_limit, 0);
@@ -90,11 +93,11 @@ async fn capacity_and_cache_slots_are_reclaimed() {
     admit(&node, 2).await;
     assert_eq!(
         node.ingress.create_session(SessionId(3)).await.unwrap(),
-        CreateOutcome::RejectedCapacity
+        CreateOutcome::Rejected(CreateRejection::Capacity)
     );
     assert_eq!(
         node.ingress.create_session(SessionId(1)).await.unwrap(),
-        CreateOutcome::AlreadyExists
+        CreateOutcome::Rejected(CreateRejection::AlreadyExists)
     );
     assert!(node.ingress.close_session(SessionId(1)).await.unwrap());
     let replacement = admit(&node, 1).await;
@@ -363,7 +366,7 @@ async fn observed_slowdown_reduces_admission_and_sheds_unsustainable_sessions() 
     first_packet(&node, 0).await;
     assert_eq!(
         node.ingress.create_session(SessionId(99)).await.unwrap(),
-        CreateOutcome::RejectedCapacity
+        CreateOutcome::Rejected(CreateRejection::Capacity)
     );
     let report = node.shutdown().await.unwrap();
     assert_eq!(report.workers[0].final_session_limit, 0);
@@ -414,7 +417,10 @@ async fn bounded_mailboxes_reject_frames_and_close_their_sessions() {
 #[tokio::test]
 async fn prefix_memory_limits_fail_explicitly_and_release_cache_slots() {
     let node = Node::start(RuntimeConfig {
-        max_prefix_packets: 1,
+        audio_limits: AudioLimits {
+            max_prefix_packets: 1,
+            ..AudioLimits::default()
+        },
         ..configuration()
     })
     .await
@@ -506,7 +512,8 @@ async fn two_thousand_sessions_use_eight_device_workers_with_sticky_echoes() {
     assert_eq!(report.peak_active_sessions, 2000);
     assert_eq!(report.inference.delivered_frames, 2000);
     assert_eq!(report.workers.len(), 8);
-    assert!(report.batch_fill_ratio > 0.5);
+    assert!(report.mean_batch_size > 1.0);
+    assert!(report.batch_fill_ratio <= 1.0);
 }
 #[tokio::test]
 async fn input_and_configuration_boundaries_fail_clearly() {

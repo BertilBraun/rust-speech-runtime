@@ -72,7 +72,7 @@ impl Ingress {
         session_id: SessionId,
         input: InputFrame,
     ) -> Result<InputOutcome, RuntimeError> {
-        if input.packet.payload.len() > self.configuration.max_frame_bytes {
+        if input.packet.payload.len() > self.configuration.audio_limits.max_frame_bytes {
             return Err(RuntimeError::InvalidFrame(
                 "payload exceeds max_frame_bytes",
             ));

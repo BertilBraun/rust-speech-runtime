@@ -1,6 +1,6 @@
 use crate::protocol::WorkerId;
 use hdrhistogram::Histogram;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 pub(crate) struct LatencyHistogram(Histogram<u64>);
@@ -29,7 +29,7 @@ impl LatencyHistogram {
         }
     }
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LatencyDistribution {
     pub samples: u64,
     pub mean_ms: f64,

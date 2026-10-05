@@ -14,13 +14,9 @@ pub(super) struct WorkItem {
     pub replay_duration: Duration,
     pub reply: oneshot::Sender<InputOutcome>,
 }
-pub(super) struct Batch {
-    pub items: Vec<WorkItem>,
-    pub dispatched_at: Instant,
-}
 pub(super) enum DeviceWork {
     Probe,
-    Inference(Batch),
+    Inference(Vec<WorkItem>),
 }
 pub(super) struct DeviceJob {
     pub work: DeviceWork,

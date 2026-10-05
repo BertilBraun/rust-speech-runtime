@@ -1,6 +1,23 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AudioLimits {
+    pub max_frame_bytes: usize,
+    pub max_prefix_bytes: usize,
+    pub max_prefix_packets: usize,
+}
+impl Default for AudioLimits {
+    fn default() -> Self {
+        Self {
+            max_frame_bytes: 4096,
+            max_prefix_bytes: 16 * 1024 * 1024,
+            max_prefix_packets: 10_000,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RuntimeConfig {
@@ -14,9 +31,7 @@ pub struct RuntimeConfig {
     pub cache_slots_per_worker: usize,
     pub ingress_capacity: usize,
     pub worker_channel_capacity: usize,
-    pub max_frame_bytes: usize,
-    pub max_prefix_bytes: usize,
-    pub max_prefix_packets: usize,
+    pub audio_limits: AudioLimits,
     pub replay_latency_per_packet: Duration,
     pub session_timeout: Duration,
     pub scheduling_margin: Duration,
@@ -47,15 +62,13 @@ impl Default for RuntimeConfig {
             cache_slots_per_worker: 64,
             ingress_capacity: 1024,
             worker_channel_capacity: 256,
-            max_frame_bytes: 4096,
-            max_prefix_bytes: 16 * 1024 * 1024,
-            max_prefix_packets: 10_000,
+            audio_limits: AudioLimits::default(),
             replay_latency_per_packet: Duration::from_micros(100),
             session_timeout: Duration::from_secs(30),
             scheduling_margin: Duration::from_millis(5),
-            admission_headroom: 0.8,
+            admission_headroom: 0.7,
             batch_fill_reserve: 0.5,
-            latency_safety_factor: 1.2,
+            latency_safety_factor: 1.5,
             calibration_samples: 16,
             latency_window: 64,
             probe_interval: Duration::from_secs(1),
@@ -76,9 +89,9 @@ impl RuntimeConfig {
             ("cache_slots_per_worker", self.cache_slots_per_worker),
             ("ingress_capacity", self.ingress_capacity),
             ("worker_channel_capacity", self.worker_channel_capacity),
-            ("max_frame_bytes", self.max_frame_bytes),
-            ("max_prefix_bytes", self.max_prefix_bytes),
-            ("max_prefix_packets", self.max_prefix_packets),
+            ("max_frame_bytes", self.audio_limits.max_frame_bytes),
+            ("max_prefix_bytes", self.audio_limits.max_prefix_bytes),
+            ("max_prefix_packets", self.audio_limits.max_prefix_packets),
             ("calibration_samples", self.calibration_samples),
             ("latency_window", self.latency_window),
         ] {
