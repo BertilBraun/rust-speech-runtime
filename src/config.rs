@@ -207,13 +207,24 @@ impl RuntimeConfig {
                 "scheduling_margin must be less than the deadline and minimum interval".into(),
             ));
         }
-        if self.max_batch_wait >= self.packet_deadline
-            || self.latency_window < self.calibration_samples
-            || self.device_queue_capacity > 16
-            || self.launch_ahead > self.packet_deadline
-        {
+        if self.max_batch_wait >= self.packet_deadline {
             return Err(ConfigError(
-                "batch wait must be below deadline and latency window must hold calibration".into(),
+                "max_batch_wait must be below packet_deadline".into(),
+            ));
+        }
+        if self.latency_window < self.calibration_samples {
+            return Err(ConfigError(
+                "latency_window must hold calibration_samples".into(),
+            ));
+        }
+        if self.device_queue_capacity > 16 {
+            return Err(ConfigError(
+                "device_queue_capacity must be in 1..=16".into(),
+            ));
+        }
+        if self.launch_ahead > self.packet_deadline {
+            return Err(ConfigError(
+                "launch_ahead must not exceed packet_deadline".into(),
             ));
         }
         if self.cache_slots_per_worker > u32::MAX as usize
