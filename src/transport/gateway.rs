@@ -17,7 +17,10 @@ use super::wire::{ClientRequest, MAX_MESSAGE_BYTES, ServerPeer, ServerReply, Wir
 use crate::{
     Ingress, Node, RuntimeError,
     config::RuntimeConfig,
-    metrics::Report,
+    metrics::{
+        Report,
+        cpu::{CpuUsage, ProcessCpuMeasurement},
+    },
     protocol::{CreateOutcome, FrameRejection, InputFrame, InputOutcome, SessionLease},
 };
 
@@ -130,6 +133,7 @@ pub struct ConnectionMetrics {
 }
 #[derive(Debug, Serialize)]
 pub struct GatewayReport {
+    pub process_cpu: CpuUsage,
     pub runtime_configuration: RuntimeConfig,
     pub gateway_configuration: GatewayConfig,
     pub connections: ConnectionMetrics,
@@ -190,6 +194,7 @@ impl Gateway {
         self,
         cancellation: CancellationToken,
     ) -> Result<GatewayReport, GatewayError> {
+        let cpu = ProcessCpuMeasurement::start()?;
         let mut tasks: JoinSet<Result<(), GatewayError>> = JoinSet::new();
         let permits = Arc::new(Semaphore::new(self.configuration.maximum_connections));
         let mut metrics = ConnectionMetrics::default();
@@ -232,6 +237,7 @@ impl Gateway {
             return Err(error.into());
         }
         Ok(GatewayReport {
+            process_cpu: cpu.finish()?,
             runtime_configuration: self.runtime_configuration,
             gateway_configuration: self.configuration,
             connections: metrics,

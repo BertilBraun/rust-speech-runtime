@@ -3,7 +3,9 @@ use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+pub mod cpu;
 pub mod profile;
+use cpu::CpuUsage;
 use profile::{RuntimeLagReport, SlowWorkerPacket, WorkerProfile, WorkerProfileReport};
 
 pub(crate) struct LatencyHistogram(Histogram<u64>);
@@ -107,6 +109,7 @@ pub(crate) struct WorkerMeasurements {
     pub occupied_time: Duration,
     pub occupied_until: Option<tokio::time::Instant>,
     pub peak_device_jobs: usize,
+    pub device_cpu: CpuUsage,
     pub elapsed: Duration,
     pub batch_sizes: Histogram<u64>,
     pub queue_delay: LatencyHistogram,
@@ -129,6 +132,7 @@ impl WorkerMeasurements {
             occupied_time: Duration::ZERO,
             occupied_until: None,
             peak_device_jobs: 0,
+            device_cpu: CpuUsage::default(),
             elapsed: Duration::ZERO,
             batch_sizes: Histogram::new(3).expect("valid precision"),
             queue_delay: LatencyHistogram::default(),
@@ -142,6 +146,7 @@ impl WorkerMeasurements {
 }
 #[derive(Debug, Serialize)]
 pub struct WorkerReport {
+    pub device_cpu: CpuUsage,
     pub worker_id: WorkerId,
     pub initial_session_limit: usize,
     pub final_session_limit: usize,
@@ -262,6 +267,7 @@ impl Report {
             workers: workers
                 .into_iter()
                 .map(|worker| WorkerReport {
+                    device_cpu: worker.device_cpu,
                     worker_id: worker.worker_id,
                     initial_session_limit: worker.initial_session_limit,
                     final_session_limit: worker.final_session_limit,

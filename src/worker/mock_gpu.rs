@@ -1,5 +1,7 @@
 use crate::config::DeviceWait;
+use crate::metrics::cpu::CpuUsage;
 use crate::protocol::{Assignment, CacheOutcome, InputFrame, InputOutcome, PrefixState, SessionId};
+use cpu_time::ThreadTime;
 use std::{
     sync::{Arc, OnceLock},
     time::Duration,
@@ -60,7 +62,9 @@ pub(super) fn run(
     mut jobs: mpsc::Receiver<DeviceJob>,
     results: mpsc::Sender<DeviceResult>,
     wait: DeviceWait,
-) {
+) -> CpuUsage {
+    let cpu = ThreadTime::now();
+    let wall = std::time::Instant::now();
     let mut previous_completion = Instant::now();
     while let Some(job) = jobs.blocking_recv() {
         let host_started_at = Instant::now();
@@ -109,6 +113,7 @@ pub(super) fn run(
             break;
         }
     }
+    CpuUsage::measured(cpu.elapsed(), wall.elapsed())
 }
 
 fn wait_until(deadline: Instant, strategy: DeviceWait) {

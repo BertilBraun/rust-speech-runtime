@@ -10,6 +10,7 @@ blake3 = "1.8"
 bincode = { version = "2.0", features = ["serde"] }
 bytes = { version = "1.10", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
+cpu-time = "1.0"
 hdrhistogram = "7.5"
 futures-util = { version = "0.3", features = ["sink"] }
 rand = { version = "0.9", features = ["small_rng"] }

@@ -76,6 +76,8 @@ impl SimulationConfig {
 }
 #[derive(Debug, thiserror::Error)]
 pub enum SimulationError {
+    #[error("CPU measurement failed: {0}")]
+    CpuClock(#[from] std::io::Error),
     #[error("invalid simulation configuration: {0}")]
     Configuration(&'static str),
     #[error(transparent)]
@@ -157,6 +159,7 @@ impl ClientCounters {
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SimulationReport {
+    pub process_cpu: crate::metrics::cpu::CpuUsage,
     pub configuration: SimulationConfig,
     pub elapsed_secs: f64,
     pub admission_secs: f64,
@@ -422,6 +425,7 @@ pub async fn run(
     configuration: SimulationConfig,
 ) -> Result<SimulationReport, SimulationError> {
     configuration.validate()?;
+    let cpu = crate::metrics::cpu::ProcessCpuMeasurement::start()?;
     let admission_start = Instant::now();
     let mut connections = JoinSet::new();
     for index in 0..configuration.sessions {
@@ -489,6 +493,7 @@ pub async fn run(
     monitor_cancellation.cancel();
     let runtime_lag = monitor.await?;
     Ok(SimulationReport {
+        process_cpu: cpu.finish()?,
         throughput_frames_per_sec: totals.counters.echoed_frames as f64
             / elapsed_secs.max(f64::EPSILON),
         configuration,

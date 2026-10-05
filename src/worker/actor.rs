@@ -208,7 +208,7 @@ impl Worker {
             }
         }
         drop(jobs);
-        device.await.expect("mock device does not panic");
+        self.measurements.device_cpu = device.await.expect("mock device does not panic");
         self.measurements.elapsed = Instant::now().duration_since(self.epoch);
         self.measurements.final_session_limit = self.session_limit;
         self.measurements.service_time = self.estimator.service_time();
