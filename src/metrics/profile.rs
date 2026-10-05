@@ -13,7 +13,7 @@ pub struct PacketTimings {
     pub worker_mailbox: Duration,
     pub validation: Duration,
     pub batch_wait: Duration,
-    pub device_dispatch: Duration,
+    pub device_queue: Duration,
     pub device_execution: Duration,
     pub host_completion_delay: Duration,
     pub result_delivery: Duration,
@@ -25,7 +25,7 @@ impl PacketTimings {
             + self.worker_mailbox
             + self.validation
             + self.batch_wait
-            + self.device_dispatch
+            + self.device_queue
             + self.device_execution
             + self.host_completion_delay
             + self.result_delivery
@@ -47,10 +47,12 @@ pub(crate) struct WorkerProfile {
     pub mailbox: LatencyHistogram,
     pub validation: LatencyHistogram,
     pub batch_wait: LatencyHistogram,
-    pub device_dispatch: LatencyHistogram,
     pub result_delivery: LatencyHistogram,
     pub sleep_overshoot: LatencyHistogram,
     pub rejected_queue_delay: LatencyHistogram,
+    pub device_queue: LatencyHistogram,
+    pub batch_preparation: LatencyHistogram,
+    pub host_device_wakeup: LatencyHistogram,
     pub slowest_packets: Vec<SlowWorkerPacket>,
 }
 impl WorkerProfile {
@@ -58,15 +60,17 @@ impl WorkerProfile {
         self.mailbox.merge(&other.mailbox);
         self.validation.merge(&other.validation);
         self.batch_wait.merge(&other.batch_wait);
-        self.device_dispatch.merge(&other.device_dispatch);
         self.result_delivery.merge(&other.result_delivery);
         self.sleep_overshoot.merge(&other.sleep_overshoot);
         self.rejected_queue_delay.merge(&other.rejected_queue_delay);
+        self.device_queue.merge(&other.device_queue);
+        self.batch_preparation.merge(&other.batch_preparation);
+        self.host_device_wakeup.merge(&other.host_device_wakeup);
     }
     pub(crate) fn record(&mut self, packet: SlowWorkerPacket) {
         self.batch_wait.record(packet.timings.batch_wait);
-        self.device_dispatch.record(packet.timings.device_dispatch);
         self.result_delivery.record(packet.timings.result_delivery);
+        self.device_queue.record(packet.timings.device_queue);
         self.slowest_packets.push(packet);
         self.slowest_packets
             .sort_unstable_by_key(|packet| std::cmp::Reverse(packet.timings.total()));
@@ -77,10 +81,12 @@ impl WorkerProfile {
             worker_mailbox: self.mailbox.summary(),
             input_validation: self.validation.summary(),
             batch_wait: self.batch_wait.summary(),
-            device_dispatch: self.device_dispatch.summary(),
             result_delivery: self.result_delivery.summary(),
             sleep_overshoot: self.sleep_overshoot.summary(),
             rejected_queue_delay: self.rejected_queue_delay.summary(),
+            device_queue: self.device_queue.summary(),
+            batch_preparation: self.batch_preparation.summary(),
+            host_device_wakeup: self.host_device_wakeup.summary(),
         }
     }
 }
@@ -90,10 +96,12 @@ pub struct WorkerProfileReport {
     pub worker_mailbox: LatencyDistribution,
     pub input_validation: LatencyDistribution,
     pub batch_wait: LatencyDistribution,
-    pub device_dispatch: LatencyDistribution,
     pub result_delivery: LatencyDistribution,
     pub sleep_overshoot: LatencyDistribution,
     pub rejected_queue_delay: LatencyDistribution,
+    pub device_queue: LatencyDistribution,
+    pub batch_preparation: LatencyDistribution,
+    pub host_device_wakeup: LatencyDistribution,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

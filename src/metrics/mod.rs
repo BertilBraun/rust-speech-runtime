@@ -59,6 +59,8 @@ pub struct InferenceCounters {
     pub capacity_terminations: u64,
     pub busy_rejections: u64,
     pub prefix_rejections: u64,
+    pub prepared_while_running: u64,
+    pub queued_batch_launches: u64,
 }
 impl InferenceCounters {
     fn merge(&mut self, other: &Self) {
@@ -76,6 +78,8 @@ impl InferenceCounters {
         self.capacity_terminations += other.capacity_terminations;
         self.busy_rejections += other.busy_rejections;
         self.prefix_rejections += other.prefix_rejections;
+        self.prepared_while_running += other.prepared_while_running;
+        self.queued_batch_launches += other.queued_batch_launches;
     }
 }
 #[derive(Default)]
@@ -101,6 +105,8 @@ pub(crate) struct WorkerMeasurements {
     pub counters: InferenceCounters,
     pub busy_time: Duration,
     pub occupied_time: Duration,
+    pub occupied_until: Option<tokio::time::Instant>,
+    pub peak_device_jobs: usize,
     pub elapsed: Duration,
     pub batch_sizes: Histogram<u64>,
     pub queue_delay: LatencyHistogram,
@@ -121,6 +127,8 @@ impl WorkerMeasurements {
             counters: InferenceCounters::default(),
             busy_time: Duration::ZERO,
             occupied_time: Duration::ZERO,
+            occupied_until: None,
+            peak_device_jobs: 0,
             elapsed: Duration::ZERO,
             batch_sizes: Histogram::new(3).expect("valid precision"),
             queue_delay: LatencyHistogram::default(),
@@ -145,6 +153,7 @@ pub struct WorkerReport {
     pub batch_fill_ratio: f64,
     pub utilization: f64,
     pub worker_occupancy: f64,
+    pub peak_device_jobs: usize,
     pub queue_delay: LatencyDistribution,
     pub inference_latency: LatencyDistribution,
     pub calibration_latency: LatencyDistribution,
@@ -272,6 +281,7 @@ impl Report {
                         worker.occupied_time.as_secs_f64(),
                         worker.elapsed.as_secs_f64(),
                     ),
+                    peak_device_jobs: worker.peak_device_jobs,
                     inference: worker.counters,
                     queue_delay: worker.queue_delay.summary(),
                     inference_latency: worker.inference_latency.summary(),

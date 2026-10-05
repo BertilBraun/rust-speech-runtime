@@ -50,6 +50,10 @@ struct RuntimeArguments {
     #[arg(long)]
     device_wait: Option<DeviceWait>,
     #[arg(long)]
+    device_queue_capacity: Option<usize>,
+    #[arg(long)]
+    launch_ahead_us: Option<u64>,
+    #[arg(long)]
     deadline_ms: Option<u64>,
     #[arg(long)]
     batch_wait_ms: Option<u64>,
@@ -82,6 +86,12 @@ impl RuntimeArguments {
         }
         if let Some(value) = self.device_wait {
             configuration.device_wait = value;
+        }
+        if let Some(value) = self.device_queue_capacity {
+            configuration.device_queue_capacity = value;
+        }
+        if let Some(value) = self.launch_ahead_us {
+            configuration.launch_ahead = Duration::from_micros(value);
         }
         if let Some(value) = self.deadline_ms {
             configuration.packet_deadline = Duration::from_millis(value);

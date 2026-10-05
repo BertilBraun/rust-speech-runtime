@@ -1,10 +1,28 @@
 use crate::config::DeviceWait;
 use crate::protocol::{Assignment, CacheOutcome, InputFrame, InputOutcome, PrefixState, SessionId};
-use std::time::Duration;
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tokio::{
     sync::{mpsc, oneshot},
     time::Instant,
 };
+
+#[derive(Clone, Default)]
+pub(super) struct SessionCancellation(Arc<OnceLock<Instant>>);
+impl SessionCancellation {
+    pub(super) fn cancel(&self) {
+        self.0
+            .set(Instant::now())
+            .expect("a session is removed once");
+    }
+    fn was_cancelled_before(&self, started_at: Instant) -> bool {
+        self.0
+            .get()
+            .is_some_and(|cancelled_at| *cancelled_at <= started_at)
+    }
+}
 
 pub(super) struct WorkItem {
     pub session_id: SessionId,
@@ -17,6 +35,7 @@ pub(super) struct WorkItem {
     pub routed_at: Instant,
     pub received_at: Instant,
     pub queued_at: Instant,
+    pub cancellation: SessionCancellation,
 }
 pub(super) enum DeviceWork {
     Probe,
@@ -32,6 +51,9 @@ pub(super) struct DeviceResult {
     pub started_at: Instant,
     pub completed_at: Instant,
     pub observed_at: Instant,
+    pub host_started_at: Instant,
+    pub processed_frames: usize,
+    pub replay_duration: Duration,
     pub submitted_at: Instant,
 }
 pub(super) fn run(
@@ -39,16 +61,47 @@ pub(super) fn run(
     results: mpsc::Sender<DeviceResult>,
     wait: DeviceWait,
 ) {
+    let mut previous_completion = Instant::now();
     while let Some(job) = jobs.blocking_recv() {
-        let started_at = Instant::now();
-        let completed_at = started_at + job.latency;
+        let host_started_at = Instant::now();
+        let started_at = previous_completion.max(job.submitted_at);
+        let (processed_frames, latency, replay_duration) = match &job.work {
+            DeviceWork::Probe => (0, job.latency, Duration::ZERO),
+            DeviceWork::Inference(items) => {
+                let mut active = 0;
+                let mut cancelled_replay = Duration::ZERO;
+                let mut active_replay = Duration::ZERO;
+                for item in items {
+                    if item.cancellation.was_cancelled_before(started_at) {
+                        cancelled_replay += item.replay_duration;
+                    } else {
+                        active += 1;
+                        active_replay += item.replay_duration;
+                    }
+                }
+                (
+                    active,
+                    if active == 0 {
+                        Duration::ZERO
+                    } else {
+                        job.latency - cancelled_replay
+                    },
+                    active_replay,
+                )
+            }
+        };
+        let completed_at = started_at + latency;
         wait_until(completed_at, wait);
+        previous_completion = completed_at;
         if results
             .blocking_send(DeviceResult {
                 work: job.work,
                 started_at,
                 completed_at,
                 observed_at: Instant::now(),
+                host_started_at,
+                processed_frames,
+                replay_duration,
                 submitted_at: job.submitted_at,
             })
             .is_err()
@@ -123,6 +176,7 @@ mod tests {
             routed_at: now,
             received_at: now,
             queued_at: now,
+            cancellation: super::SessionCancellation::default(),
         }
     }
 
@@ -180,5 +234,63 @@ mod tests {
             drop(jobs);
             device.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn prequeued_batches_execute_serially_without_waiting_for_host_result_handling() {
+        let (jobs, mailbox) = mpsc::channel(3);
+        let (results, mut responses) = mpsc::channel(3);
+        let device = tokio::task::spawn_blocking(move || run(mailbox, results, DeviceWait::Sleep));
+        for session_id in 0..3 {
+            jobs.send(DeviceJob {
+                work: DeviceWork::Inference(vec![item(session_id)]),
+                latency: Duration::from_millis(10),
+                submitted_at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let first = responses.recv().await.unwrap();
+        let second = responses.recv().await.unwrap();
+        let third = responses.recv().await.unwrap();
+        assert_eq!(second.started_at, first.completed_at);
+        assert_eq!(third.started_at, second.completed_at);
+        assert_eq!(
+            third.completed_at - first.started_at,
+            Duration::from_millis(30)
+        );
+        drop(jobs);
+        device.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_device_start_skips_compute_without_losing_the_result() {
+        let (jobs, mailbox) = mpsc::channel(2);
+        let (results, mut responses) = mpsc::channel(2);
+        let device = tokio::task::spawn_blocking(move || run(mailbox, results, DeviceWait::Sleep));
+        jobs.send(DeviceJob {
+            work: DeviceWork::Inference(vec![item(1)]),
+            latency: Duration::from_millis(10),
+            submitted_at: Instant::now(),
+        })
+        .await
+        .unwrap();
+        let cancelled = item(2);
+        cancelled.cancellation.cancel();
+        jobs.send(DeviceJob {
+            work: DeviceWork::Inference(vec![cancelled]),
+            latency: Duration::from_millis(10),
+            submitted_at: Instant::now(),
+        })
+        .await
+        .unwrap();
+        let first = responses.recv().await.unwrap();
+        let second = responses.recv().await.unwrap();
+        assert_eq!(first.processed_frames, 1);
+        assert_eq!(second.processed_frames, 0);
+        assert_eq!(second.completed_at, second.started_at);
+        drop(jobs);
+        device.await.unwrap();
     }
 }

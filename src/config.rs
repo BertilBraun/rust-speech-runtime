@@ -27,6 +27,8 @@ pub struct RuntimeConfig {
     pub batch_size: usize,
     pub inference_latency: Duration,
     pub device_wait: DeviceWait,
+    pub device_queue_capacity: usize,
+    pub launch_ahead: Duration,
     pub max_batch_wait: Duration,
     pub max_sessions_per_worker: usize,
     pub cache_slots_per_worker: usize,
@@ -59,6 +61,8 @@ impl Default for RuntimeConfig {
             batch_size: 16,
             inference_latency: Duration::from_millis(12),
             device_wait: DeviceWait::Sleep,
+            device_queue_capacity: 2,
+            launch_ahead: Duration::from_millis(2),
             max_batch_wait: Duration::from_millis(10),
             max_sessions_per_worker: 52,
             cache_slots_per_worker: 64,
@@ -157,6 +161,7 @@ impl RuntimeConfig {
             ("cache_slots_per_worker", self.cache_slots_per_worker),
             ("ingress_capacity", self.ingress_capacity),
             ("worker_channel_capacity", self.worker_channel_capacity),
+            ("device_queue_capacity", self.device_queue_capacity),
             ("max_frame_bytes", self.audio_limits.max_frame_bytes),
             ("max_prefix_bytes", self.audio_limits.max_prefix_bytes),
             ("max_prefix_packets", self.audio_limits.max_prefix_packets),
@@ -204,6 +209,8 @@ impl RuntimeConfig {
         }
         if self.max_batch_wait >= self.packet_deadline
             || self.latency_window < self.calibration_samples
+            || self.device_queue_capacity > 16
+            || self.launch_ahead > self.packet_deadline
         {
             return Err(ConfigError(
                 "batch wait must be below deadline and latency window must hold calibration".into(),

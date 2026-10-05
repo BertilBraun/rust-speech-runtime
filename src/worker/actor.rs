@@ -1,6 +1,6 @@
 use super::{
     cache::{CacheHandle, CachePool},
-    mock_gpu::{self, DeviceJob, DeviceResult, DeviceWork, WorkItem},
+    mock_gpu::{self, DeviceJob, DeviceResult, DeviceWork, SessionCancellation, WorkItem},
 };
 use crate::{
     config::RuntimeConfig,
@@ -16,7 +16,7 @@ use crate::{
     },
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -66,6 +66,12 @@ struct WorkerSession {
     prefix: PrefixState,
     pending: Option<PendingFrame>,
     in_flight: bool,
+    cancellation: SessionCancellation,
+}
+struct SubmittedBatch {
+    submitted_at: Instant,
+    latency: Duration,
+    expected_completion: Instant,
 }
 struct Worker {
     configuration: Arc<RuntimeConfig>,
@@ -74,7 +80,8 @@ struct Worker {
     measurements: WorkerMeasurements,
     estimator: ServiceEstimator,
     status: watch::Sender<WorkerStatus>,
-    active_device: bool,
+    submitted: VecDeque<SubmittedBatch>,
+    prepared: Vec<ReadySession>,
     session_limit: usize,
     epoch: Instant,
 }
@@ -98,7 +105,8 @@ pub(crate) fn spawn_worker(
         sessions: HashMap::new(),
         measurements: WorkerMeasurements::new(worker_id),
         status,
-        active_device: false,
+        submitted: VecDeque::new(),
+        prepared: Vec::new(),
         session_limit: 0,
         epoch: Instant::now(),
     };
@@ -118,8 +126,9 @@ impl Worker {
         cancellation: CancellationToken,
         ready: oneshot::Sender<()>,
     ) -> WorkerMeasurements {
-        let (jobs, job_mailbox) = mpsc::channel(1);
-        let (device_results, mut results) = mpsc::channel(1);
+        let (jobs, job_mailbox) = mpsc::channel(self.configuration.device_queue_capacity);
+        let (device_results, mut results) =
+            mpsc::channel(self.configuration.device_queue_capacity + 1);
         let wait = self.configuration.device_wait;
         let device =
             tokio::task::spawn_blocking(move || mock_gpu::run(job_mailbox, device_results, wait));
@@ -133,7 +142,8 @@ impl Worker {
             .expect("device is running");
             let result = results.recv().await.expect("probe result");
             let elapsed = result.observed_at.duration_since(result.started_at);
-            self.estimator.observe(elapsed);
+            self.estimator
+                .observe(result.completed_at - result.started_at);
             self.measurements.calibration_latency.record(elapsed);
         }
         self.epoch = Instant::now();
@@ -143,20 +153,16 @@ impl Worker {
         let mut next_probe = self.epoch + self.configuration.probe_interval;
         loop {
             let wakeup = self.next_wakeup();
-            if !self.active_device && wakeup <= Instant::now() {
-                if cancellation.is_cancelled() {
-                    break;
-                }
-                self.dispatch_batch(&jobs).await;
-                continue;
-            }
+            let can_dispatch = !self.prepared.is_empty()
+                && self.submitted.len() < self.configuration.device_queue_capacity + 1
+                && wakeup <= Instant::now();
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => break,
-                result = results.recv(), if self.active_device => {
+                result = results.recv(), if !self.submitted.is_empty() => {
                     self.complete(result.expect("device returns active work"));
                 }
-                _ = tokio::time::sleep_until(wakeup), if !self.active_device => self.dispatch_batch(&jobs).await,
+                permit = jobs.reserve(), if can_dispatch => self.dispatch_batch(permit.expect("device is running")),
                 command = commands.recv() => {
                     let Some(command) = command else { break; };
                     if matches!(&command, WorkerCommand::InputReady { .. }) && !self.configuration.worker_input_delay.is_zero() {
@@ -167,9 +173,12 @@ impl Worker {
                     }
                     self.handle(command).await;
                 }
-                _ = tokio::time::sleep_until(next_probe), if !self.active_device && self.sessions.is_empty() => {
-                    self.active_device = true;
-                    jobs.send(DeviceJob { work: DeviceWork::Probe, latency: self.base_latency(), submitted_at: Instant::now() }).await.expect("device is running");
+                _ = tokio::time::sleep_until(wakeup), if !can_dispatch => {},
+                _ = tokio::time::sleep_until(next_probe), if self.submitted.is_empty() && self.sessions.is_empty() => {
+                    let submitted_at = Instant::now();
+                    let latency = self.base_latency();
+                    jobs.send(DeviceJob { work: DeviceWork::Probe, latency, submitted_at }).await.expect("device is running");
+                    self.track_submission(submitted_at, latency);
                     next_probe = Instant::now() + self.configuration.probe_interval;
                 }
             }
@@ -178,7 +187,7 @@ impl Worker {
         for session_id in sessions {
             self.terminate(session_id, FrameRejection::Cancelled);
         }
-        if self.active_device {
+        while !self.submitted.is_empty() {
             self.complete(results.recv().await.expect("drain physical device work"));
         }
         commands.close();
@@ -251,11 +260,13 @@ impl Worker {
     }
     fn terminate(&mut self, session_id: SessionId, reason: FrameRejection) {
         if let Some(session) = self.sessions.remove(&session_id) {
+            session.cancellation.cancel();
             if let Some(pending) = session.pending {
                 self.measurements.counters.rejected_frames += 1;
                 let _ = pending.item.reply.send(InputOutcome::Rejected(reason));
             }
             self.cache.free(session.cache);
+            self.refresh_prepared();
         }
     }
     async fn handle(&mut self, command: WorkerCommand) {
@@ -283,6 +294,7 @@ impl Worker {
                         prefix: PrefixState::default(),
                         pending: None,
                         in_flight: false,
+                        cancellation: SessionCancellation::default(),
                     },
                 );
                 self.measurements.peak_sessions =
@@ -478,13 +490,60 @@ impl Worker {
                 routed_at,
                 received_at,
                 queued_at,
+                cancellation: session.cancellation.clone(),
             },
             queued_at: Instant::now(),
         });
+        self.refresh_prepared();
         self.publish();
+    }
+    fn refresh_prepared(&mut self) {
+        let started = Instant::now();
+        self.prepared = construct_batch(
+            self.sessions
+                .iter()
+                .filter_map(|(session_id, session)| {
+                    session.pending.as_ref().map(|pending| ReadySession {
+                        session_id: *session_id,
+                        deadline: pending.item.input.deadline,
+                    })
+                })
+                .collect(),
+            self.configuration.batch_size,
+        );
+        if !self.submitted.is_empty() && !self.prepared.is_empty() {
+            self.measurements.counters.prepared_while_running += 1;
+        }
+        self.measurements
+            .profile
+            .batch_preparation
+            .record(started.elapsed());
+    }
+    fn track_submission(&mut self, submitted_at: Instant, latency: Duration) {
+        let start = self.submitted.back().map_or(submitted_at, |batch| {
+            batch.expected_completion.max(submitted_at)
+        });
+        self.submitted.push_back(SubmittedBatch {
+            submitted_at,
+            latency,
+            expected_completion: start + latency,
+        });
+        self.measurements.peak_device_jobs =
+            self.measurements.peak_device_jobs.max(self.submitted.len());
     }
     fn next_wakeup(&self) -> Instant {
         let now = Instant::now();
+        if self.prepared.is_empty()
+            || self.submitted.len() > self.configuration.device_queue_capacity
+        {
+            return now + self.configuration.session_timeout;
+        }
+        if self.prepared.len() == self.configuration.batch_size {
+            return now;
+        }
+        if let Some(previous) = self.submitted.back() {
+            return previous.expected_completion - self.configuration.launch_ahead;
+        }
         let mut count = 0;
         let mut wakeup = now + self.configuration.session_timeout;
         for pending in self
@@ -506,19 +565,11 @@ impl Worker {
             wakeup
         }
     }
-    async fn dispatch_batch(&mut self, jobs: &mpsc::Sender<DeviceJob>) {
-        let selected = construct_batch(
-            self.sessions
-                .iter()
-                .filter_map(|(session_id, session)| {
-                    session.pending.as_ref().map(|pending| ReadySession {
-                        session_id: *session_id,
-                        deadline: pending.item.input.deadline,
-                    })
-                })
-                .collect(),
-            self.configuration.batch_size,
-        );
+    fn dispatch_batch(&mut self, permit: mpsc::Permit<'_, DeviceJob>) {
+        let selected = std::mem::take(&mut self.prepared);
+        let predicted_start = self.submitted.back().map_or(Instant::now(), |batch| {
+            batch.expected_completion.max(Instant::now())
+        });
         let mut items = Vec::new();
         let mut replay = Duration::ZERO;
         let mut earliest_deadline = None;
@@ -535,7 +586,7 @@ impl Worker {
             let batch_deadline = earliest_deadline
                 .unwrap_or(pending.item.input.deadline)
                 .min(pending.item.input.deadline);
-            if Instant::now() + projected > batch_deadline {
+            if predicted_start + projected > batch_deadline {
                 self.measurements
                     .profile
                     .rejected_queue_delay
@@ -560,42 +611,72 @@ impl Worker {
             items.push(pending.item);
         }
         if items.is_empty() {
+            self.refresh_prepared();
             return;
         }
-        self.active_device = true;
-        jobs.send(DeviceJob {
-            latency: self.base_latency() + replay,
+        if !self.submitted.is_empty() {
+            self.measurements.counters.queued_batch_launches += 1;
+        }
+        let submitted_at = Instant::now();
+        let latency = self.base_latency() + replay;
+        permit.send(DeviceJob {
+            latency,
             work: DeviceWork::Inference(items),
-            submitted_at: Instant::now(),
-        })
-        .await
-        .expect("device is running");
+            submitted_at,
+        });
+        self.track_submission(submitted_at, latency);
+        self.refresh_prepared();
     }
     fn complete(&mut self, result: DeviceResult) {
-        self.active_device = false;
+        self.submitted
+            .pop_front()
+            .expect("completion matches submitted work");
+        let mut completion = result.completed_at;
+        for batch in &mut self.submitted {
+            completion = completion.max(batch.submitted_at) + batch.latency;
+            batch.expected_completion = completion;
+        }
         let inference_latency = result.completed_at.duration_since(result.started_at);
         let host_wait = result.observed_at.duration_since(result.completed_at);
         self.measurements.profile.sleep_overshoot.record(host_wait);
+        self.measurements.profile.host_device_wakeup.record(
+            result
+                .host_started_at
+                .saturating_duration_since(result.started_at),
+        );
         match result.work {
             DeviceWork::Probe => {
-                self.estimator.observe(inference_latency + host_wait);
+                self.estimator.observe(inference_latency);
                 self.refresh_capacity();
             }
             DeviceWork::Inference(items) => {
-                self.measurements.counters.batches += 1;
-                self.measurements.counters.processed_frames += items.len() as u64;
-                self.measurements
-                    .batch_sizes
-                    .record(items.len() as u64)
-                    .expect("bounded batch size");
+                if result.processed_frames > 0 {
+                    self.measurements.counters.batches += 1;
+                    self.measurements.counters.processed_frames += result.processed_frames as u64;
+                    self.measurements
+                        .batch_sizes
+                        .record(result.processed_frames as u64)
+                        .expect("bounded batch size");
+                }
                 self.measurements.busy_time += inference_latency;
-                self.measurements.occupied_time += inference_latency + host_wait;
-                self.measurements
-                    .inference_latency
-                    .record(inference_latency);
-                let replay: Duration = items.iter().map(|item| item.replay_duration).sum();
-                self.estimator
-                    .observe((inference_latency + host_wait).saturating_sub(replay));
+                let occupied_start = self
+                    .measurements
+                    .occupied_until
+                    .map_or(result.started_at, |previous| {
+                        previous.max(result.started_at)
+                    });
+                self.measurements.occupied_time +=
+                    result.observed_at.saturating_duration_since(occupied_start);
+                self.measurements.occupied_until = Some(result.observed_at);
+                if result.processed_frames > 0 {
+                    self.measurements
+                        .inference_latency
+                        .record(inference_latency);
+                }
+                if result.processed_frames > 0 {
+                    self.estimator
+                        .observe(inference_latency - result.replay_duration);
+                }
                 for item in items {
                     let handled_at = Instant::now();
                     let timings = PacketTimings {
@@ -603,7 +684,7 @@ impl Worker {
                         worker_mailbox: item.received_at - item.routed_at,
                         validation: item.queued_at - item.received_at,
                         batch_wait: result.submitted_at - item.queued_at,
-                        device_dispatch: result.started_at - result.submitted_at,
+                        device_queue: result.started_at - result.submitted_at,
                         device_execution: inference_latency,
                         host_completion_delay: host_wait,
                         result_delivery: handled_at - result.observed_at,

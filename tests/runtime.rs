@@ -180,6 +180,111 @@ async fn packet_profile_separates_ingress_mailbox_batching_and_device_time() {
     assert_eq!(worker.profile.batch_wait.samples, 1);
     assert_eq!(worker.slowest_packets.len(), 1);
 }
+
+#[tokio::test]
+async fn batches_are_prepared_and_submitted_while_the_device_is_running() {
+    let node = Node::start(RuntimeConfig {
+        batch_size: 1,
+        inference_latency: Duration::from_millis(20),
+        device_queue_capacity: 2,
+        admission_headroom: 1.0,
+        batch_fill_reserve: 1.0,
+        latency_safety_factor: 1.0,
+        ..configuration()
+    })
+    .await
+    .unwrap();
+    for session_id in 0..3 {
+        admit(&node, session_id).await;
+    }
+    let mut requests = Vec::new();
+    for session_id in 0..3 {
+        let ingress = node.ingress.clone();
+        requests.push(tokio::spawn(async move {
+            ingress
+                .input_frame(
+                    SessionId(session_id),
+                    frame(
+                        0,
+                        PrefixState::default(),
+                        Bytes::from_static(b"queued"),
+                        Duration::from_millis(200),
+                    ),
+                )
+                .await
+                .unwrap()
+        }));
+    }
+    for request in requests {
+        assert!(matches!(request.await.unwrap(), InputOutcome::Processed(_)));
+    }
+    let report = node.shutdown().await.unwrap();
+    assert!(report.inference.prepared_while_running > 0);
+    assert_eq!(report.inference.queued_batch_launches, 2);
+    assert_eq!(report.workers[0].peak_device_jobs, 3);
+    assert_eq!(report.inference.processed_frames, 3);
+    assert!((report.inference_latency.mean_ms - 20.0).abs() < 0.02);
+    assert!(report.profile.device_queue.max_ms >= 39.0);
+}
+
+#[tokio::test]
+async fn cancellation_invalidates_work_submitted_while_the_device_is_running() {
+    let node = Node::start(RuntimeConfig {
+        batch_size: 1,
+        inference_latency: Duration::from_millis(30),
+        device_queue_capacity: 2,
+        admission_headroom: 1.0,
+        batch_fill_reserve: 1.0,
+        latency_safety_factor: 1.0,
+        ..configuration()
+    })
+    .await
+    .unwrap();
+    admit(&node, 1).await;
+    admit(&node, 2).await;
+    let first_ingress = node.ingress.clone();
+    let first = tokio::spawn(async move {
+        first_ingress
+            .input_frame(
+                SessionId(1),
+                frame(
+                    0,
+                    PrefixState::default(),
+                    Bytes::from_static(b"first"),
+                    Duration::from_millis(200),
+                ),
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let second_ingress = node.ingress.clone();
+    let second = tokio::spawn(async move {
+        second_ingress
+            .input_frame(
+                SessionId(2),
+                frame(
+                    0,
+                    PrefixState::default(),
+                    Bytes::from_static(b"cancelled"),
+                    Duration::from_millis(200),
+                ),
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    node.ingress.close_session(SessionId(2)).await.unwrap();
+    assert!(matches!(first.await.unwrap(), InputOutcome::Processed(_)));
+    assert!(matches!(
+        second.await.unwrap(),
+        InputOutcome::Rejected(FrameRejection::Cancelled)
+    ));
+    let report = node.shutdown().await.unwrap();
+    assert!(report.inference.processed_frames <= 2);
+    assert_eq!(report.inference.stale_results, 1);
+    assert_eq!(report.inference.delivered_frames, 1);
+}
 #[tokio::test]
 async fn cache_eviction_requires_replaying_all_preceding_audio() {
     let node = Node::start(RuntimeConfig {
