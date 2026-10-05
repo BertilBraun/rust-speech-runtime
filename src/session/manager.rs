@@ -95,16 +95,25 @@ impl SessionManager {
                     _ = cancellation.cancelled() => break,
                     command = commands.recv() => {
                         let Some(command) = command else { break; };
-                        self.handle(command).await?;
+                        tokio::select! {
+                            _ = cancellation.cancelled() => break,
+                            outcome = self.handle(command) => outcome?,
+                        }
                     }
                     Some(output) = self.completions.recv() => self.dispatch(output),
-                    _ = maintenance.tick() => self.expire_sessions().await?,
+                    _ = maintenance.tick() => {
+                        tokio::select! {
+                            _ = cancellation.cancelled() => break,
+                            outcome = self.expire_sessions() => outcome?,
+                        }
+                    }
                 }
             }
             Ok(())
         }
         .await;
         commands.close();
+        self.measurements.active_sessions = self.sessions.len();
         self.worker_cancellation.cancel();
         let mut workers = Vec::with_capacity(self.worker_tasks.len());
         for task in self.worker_tasks.drain(..) {
@@ -286,7 +295,11 @@ impl SessionManager {
         }
         match self.outputs.try_send(output) {
             Ok(()) => self.measurements.delivered_results += 1,
-            Err(_) => self.measurements.output_channel_saturation += 1,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.measurements.output_channel_saturation += 1;
+                self.measurements.dropped_results += 1;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => self.measurements.dropped_results += 1,
         }
     }
 

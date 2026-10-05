@@ -59,6 +59,7 @@ pub(crate) struct ManagerMeasurements {
     pub unknown_session_inputs: u64,
     pub worker_channel_saturation: u64,
     pub output_channel_saturation: u64,
+    pub dropped_results: u64,
     pub stale_results: u64,
     pub delivered_results: u64,
     pub phase_added_latency: LatencyHistogram,
@@ -74,7 +75,9 @@ pub(crate) struct WorkerMeasurements {
     pub stale_results: u64,
     pub stale_inputs: u64,
     pub coalesced_inputs: u64,
+    pub skipped_inference_ticks: u64,
     pub result_channel_saturation: u64,
+    pub dropped_results: u64,
     pub busy_time: Duration,
     pub elapsed: Duration,
     pub batch_sizes: Histogram<u64>,
@@ -96,7 +99,9 @@ impl WorkerMeasurements {
             stale_results: 0,
             stale_inputs: 0,
             coalesced_inputs: 0,
+            skipped_inference_ticks: 0,
             result_channel_saturation: 0,
+            dropped_results: 0,
             busy_time: Duration::ZERO,
             elapsed: Duration::ZERO,
             batch_sizes: Histogram::new(3).expect("valid precision"),
@@ -142,6 +147,7 @@ pub struct Report {
     pub inputs_stale: u64,
     pub unknown_session_inputs: u64,
     pub coalesced_inputs: u64,
+    pub skipped_inference_ticks: u64,
     pub processed_frames: u64,
     pub delivered_results: u64,
     pub throughput_frames_per_sec: f64,
@@ -152,6 +158,7 @@ pub struct Report {
     pub deadline_misses: u64,
     pub deadline_miss_ratio: f64,
     pub stale_results_discarded: u64,
+    pub dropped_results: u64,
     pub channel_saturation_events: u64,
     pub ingress_channel_saturation: u64,
     pub worker_channel_saturation: u64,
@@ -216,6 +223,10 @@ impl Report {
                     .sum::<u64>(),
             unknown_session_inputs: manager.unknown_session_inputs,
             coalesced_inputs: workers.iter().map(|worker| worker.coalesced_inputs).sum(),
+            skipped_inference_ticks: workers
+                .iter()
+                .map(|worker| worker.skipped_inference_ticks)
+                .sum(),
             processed_frames,
             delivered_results: manager.delivered_results,
             throughput_frames_per_sec: ratio(
@@ -232,6 +243,11 @@ impl Report {
                 + workers
                     .iter()
                     .map(|worker| worker.stale_results)
+                    .sum::<u64>(),
+            dropped_results: manager.dropped_results
+                + workers
+                    .iter()
+                    .map(|worker| worker.dropped_results)
                     .sum::<u64>(),
             channel_saturation_events: ingress_saturation
                 + manager.worker_channel_saturation

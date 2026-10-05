@@ -157,7 +157,7 @@ async fn disconnect_during_inference_discards_old_generation_after_recreation() 
 async fn bounded_worker_channel_exposes_overload_without_losing_close() {
     let node = Node::start(RuntimeConfig {
         worker_channel_capacity: 1,
-        worker_control_delay: Duration::from_millis(20),
+        worker_input_delay: Duration::from_millis(20),
         max_input_age: Duration::from_secs(2),
         ..configuration()
     })
@@ -323,4 +323,117 @@ fn invalid_configuration_fails_before_spawning_tasks() {
         })
         .is_err()
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn closing_queued_work_prevents_any_inference() {
+    let node = Node::start(configuration()).unwrap();
+    admit(&node, 1).await;
+    node.ingress
+        .input_frame(SessionId(1), frame())
+        .await
+        .unwrap();
+    node.ingress.close_session(SessionId(1)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let report = node.shutdown().await.unwrap();
+    assert_eq!(report.batches, 0);
+    assert_eq!(report.stale_results_discarded, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_input_survives_an_earlier_batch_completion() {
+    let mut node = Node::start(RuntimeConfig {
+        batch_size: 1,
+        ..configuration()
+    })
+    .unwrap();
+    let mut outputs = node.take_outputs().unwrap();
+    admit(&node, 1).await;
+    node.ingress
+        .input_frame(SessionId(1), frame())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let second_timestamp = Instant::now();
+    node.ingress
+        .input_frame(SessionId(1), frame())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    outputs.try_recv().unwrap();
+    assert_eq!(
+        outputs.try_recv().unwrap().input_timestamp,
+        second_timestamp
+    );
+    assert!(outputs.try_recv().is_err());
+    assert_eq!(node.shutdown().await.unwrap().delivered_results, 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_producers_saturate_ingress_with_explicit_rejections() {
+    let node = Node::start(RuntimeConfig {
+        ingress_capacity: 1,
+        ..configuration()
+    })
+    .unwrap();
+    admit(&node, 1).await;
+    let mut producers = Vec::new();
+    for _ in 0..32 {
+        let ingress = node.ingress.clone();
+        producers.push(tokio::spawn(async move {
+            ingress.input_frame(SessionId(1), frame()).await.unwrap()
+        }));
+    }
+    let mut overloaded = 0;
+    for producer in producers {
+        if producer.await.unwrap() == InputOutcome::Overloaded {
+            overloaded += 1;
+        }
+    }
+    assert!(overloaded > 0);
+    let report = node.shutdown().await.unwrap();
+    assert_eq!(report.ingress_channel_saturation, overloaded);
+    assert_eq!(report.inputs_overloaded, overloaded);
+}
+
+#[tokio::test(start_paused = true)]
+async fn completion_mailbox_saturation_is_counted_separately_from_outputs() {
+    let node = Node::start(RuntimeConfig {
+        result_channel_capacity: 1,
+        ..configuration()
+    })
+    .unwrap();
+    for session_id in 0..4 {
+        admit(&node, session_id).await;
+        node.ingress
+            .input_frame(SessionId(session_id), frame())
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let report = node.shutdown().await.unwrap();
+    assert_eq!(report.result_channel_saturation, 3);
+    assert_eq!(report.dropped_results, 3);
+    assert_eq!(report.delivered_results, 1);
+    assert_eq!(report.output_channel_saturation, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn disconnected_output_consumer_does_not_count_as_channel_saturation() {
+    let mut node = Node::start(RuntimeConfig {
+        batch_size: 1,
+        ..configuration()
+    })
+    .unwrap();
+    drop(node.take_outputs().unwrap());
+    admit(&node, 1).await;
+    node.ingress
+        .input_frame(SessionId(1), frame())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let report = node.shutdown().await.unwrap();
+    assert_eq!(report.delivered_results, 0);
+    assert_eq!(report.output_channel_saturation, 0);
+    assert_eq!(report.dropped_results, 1);
 }

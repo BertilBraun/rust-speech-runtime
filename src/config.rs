@@ -1,8 +1,9 @@
 use std::time::Duration;
 
+use serde::Serialize;
 use thiserror::Error;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct RuntimeConfig {
     pub workers: usize,
     pub tick_interval: Duration,
@@ -19,11 +20,11 @@ pub struct RuntimeConfig {
     pub session_timeout: Duration,
     pub phase_bucket: Option<Duration>,
     pub scheduling_margin: Duration,
-    pub worker_control_delay: Duration,
+    pub worker_input_delay: Duration,
     pub slowdown: Option<WorkerSlowdown>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct WorkerSlowdown {
     pub after: Duration,
     pub inference_latency: Duration,
@@ -47,7 +48,7 @@ impl Default for RuntimeConfig {
             session_timeout: Duration::from_secs(30),
             phase_bucket: None,
             scheduling_margin: Duration::from_millis(1),
-            worker_control_delay: Duration::ZERO,
+            worker_input_delay: Duration::ZERO,
             slowdown: None,
         }
     }
