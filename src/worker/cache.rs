@@ -1,4 +1,4 @@
-use crate::protocol::WorkerId;
+use crate::protocol::{PrefixState, WorkerId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CacheHandle {
@@ -10,6 +10,7 @@ pub(crate) struct CachePool {
     worker_id: WorkerId,
     free_slots: Vec<u32>,
     allocated: Vec<bool>,
+    prefixes: Vec<Option<PrefixState>>,
 }
 
 impl CachePool {
@@ -18,6 +19,7 @@ impl CachePool {
             worker_id,
             free_slots: (0..capacity as u32).rev().collect(),
             allocated: vec![false; capacity],
+            prefixes: vec![None; capacity],
         }
     }
 
@@ -25,6 +27,7 @@ impl CachePool {
         let slot = self.free_slots.pop()?;
         assert!(!self.allocated[slot as usize]);
         self.allocated[slot as usize] = true;
+        self.prefixes[slot as usize] = Some(PrefixState::default());
         Some(CacheHandle {
             worker_id: self.worker_id,
             slot,
@@ -34,6 +37,7 @@ impl CachePool {
     pub(crate) fn free(&mut self, handle: CacheHandle) {
         self.assert_owned(handle);
         self.allocated[handle.slot as usize] = false;
+        self.prefixes[handle.slot as usize] = None;
         self.free_slots.push(handle.slot);
     }
 
@@ -46,6 +50,21 @@ impl CachePool {
             self.allocated[handle.slot as usize],
             "cache slot is not allocated"
         );
+    }
+
+    pub(crate) fn lookup(&self, handle: CacheHandle) -> Option<PrefixState> {
+        self.assert_owned(handle);
+        self.prefixes[handle.slot as usize]
+    }
+
+    pub(crate) fn update(&mut self, handle: CacheHandle, prefix: PrefixState) {
+        self.assert_owned(handle);
+        self.prefixes[handle.slot as usize] = Some(prefix);
+    }
+
+    pub(crate) fn evict(&mut self, handle: CacheHandle) {
+        self.assert_owned(handle);
+        self.prefixes[handle.slot as usize] = None;
     }
 }
 

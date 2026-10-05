@@ -1,30 +1,44 @@
-use crate::protocol::WorkerId;
-use crate::scheduler::admission::has_capacity;
-
-pub trait PlacementPolicy: Send {
-    fn select_worker(&self, loads: &[usize], limit: usize) -> Option<WorkerId>;
+use crate::{protocol::WorkerId, scheduler::admission::WorkerStatus};
+pub(crate) trait PlacementPolicy: Send {
+    fn select_worker(&self, workers: &[WorkerStatus]) -> Option<WorkerId>;
 }
-
-pub struct LeastLoaded;
-
+pub(crate) struct LeastLoaded;
 impl PlacementPolicy for LeastLoaded {
-    fn select_worker(&self, loads: &[usize], limit: usize) -> Option<WorkerId> {
-        loads
+    fn select_worker(&self, workers: &[WorkerStatus]) -> Option<WorkerId> {
+        workers
             .iter()
-            .enumerate()
-            .filter(|(_, load)| has_capacity(**load, limit))
-            .min_by_key(|(index, load)| (**load, *index))
-            .map(|(index, _)| WorkerId(index))
+            .filter(|worker| worker.sessions.len() < worker.session_limit)
+            .min_by_key(|worker| {
+                (
+                    worker.sessions.len(),
+                    worker.service_time,
+                    worker.worker_id.0,
+                )
+            })
+            .map(|worker| worker.worker_id)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::protocol::SessionId;
+    use std::time::Duration;
     #[test]
-    fn selects_least_loaded_with_stable_ties() {
-        assert_eq!(LeastLoaded.select_worker(&[3, 1, 1], 4), Some(WorkerId(1)));
-        assert_eq!(LeastLoaded.select_worker(&[4, 4], 4), None);
+    fn placement_respects_each_workers_measured_capacity() {
+        let workers = vec![
+            WorkerStatus {
+                worker_id: WorkerId(0),
+                sessions: std::collections::HashSet::from([SessionId(1)]),
+                session_limit: 1,
+                service_time: Duration::from_millis(20),
+            },
+            WorkerStatus {
+                worker_id: WorkerId(1),
+                sessions: std::collections::HashSet::from([SessionId(2)]),
+                session_limit: 2,
+                service_time: Duration::from_millis(12),
+            },
+        ];
+        assert_eq!(LeastLoaded.select_worker(&workers), Some(WorkerId(1)));
     }
 }

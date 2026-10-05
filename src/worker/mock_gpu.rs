@@ -1,49 +1,48 @@
+use crate::protocol::{Assignment, CacheOutcome, InputFrame, InputOutcome, PrefixState, SessionId};
 use std::time::Duration;
-
-use tokio::{sync::mpsc, time::Instant};
-
-use crate::config::WorkerSlowdown;
-use crate::protocol::{Assignment, InputFrame, SessionId};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::Instant,
+};
 
 pub(super) struct WorkItem {
     pub session_id: SessionId,
     pub assignment: Assignment,
     pub input: InputFrame,
-    pub deadline: Instant,
+    pub prefix: PrefixState,
+    pub cache: CacheOutcome,
+    pub replay_duration: Duration,
+    pub reply: oneshot::Sender<InputOutcome>,
 }
-
 pub(super) struct Batch {
     pub items: Vec<WorkItem>,
+    pub dispatched_at: Instant,
 }
-
-pub(super) struct BatchResult {
-    pub batch: Batch,
+pub(super) enum DeviceWork {
+    Probe,
+    Inference(Batch),
+}
+pub(super) struct DeviceJob {
+    pub work: DeviceWork,
+    pub latency: Duration,
+}
+pub(super) struct DeviceResult {
+    pub work: DeviceWork,
     pub started_at: Instant,
     pub completed_at: Instant,
 }
-
-pub(super) async fn run(
-    mut batches: mpsc::Receiver<Batch>,
-    results: mpsc::Sender<BatchResult>,
-    latency: Duration,
-    slowdown: Option<WorkerSlowdown>,
-    epoch: Instant,
-) {
-    while let Some(batch) = batches.recv().await {
+pub(super) fn run(mut jobs: mpsc::Receiver<DeviceJob>, results: mpsc::Sender<DeviceResult>) {
+    while let Some(job) = jobs.blocking_recv() {
         let started_at = Instant::now();
-        let duration = match &slowdown {
-            Some(slowdown) if started_at.duration_since(epoch) >= slowdown.after => {
-                slowdown.inference_latency
-            }
-            _ => latency,
-        };
-        tokio::time::sleep(duration).await;
-        let result = BatchResult {
-            batch,
-            started_at,
-            completed_at: Instant::now(),
-        };
-        if results.send(result).await.is_err() {
+        std::thread::sleep(job.latency);
+        if results
+            .blocking_send(DeviceResult {
+                work: job.work,
+                started_at,
+                completed_at: Instant::now(),
+            })
+            .is_err()
+        {
             break;
         }
     }

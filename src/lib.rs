@@ -3,7 +3,6 @@ pub mod metrics;
 pub mod protocol;
 pub mod scheduler;
 pub mod session;
-pub mod simulation;
 pub mod worker;
 
 mod runtime;
