@@ -191,6 +191,7 @@ async fn network_simulation_reports_admission_echo_replay_and_churn() {
     assert!(report.counters.replayed_packets > 0);
     assert_eq!(report.counters.failed_sessions, 0);
     assert_eq!(report.generator_overruns, 0);
+    assert_eq!(report.counters.metric_samples_dropped, 0);
     assert!(report.generated_intervals.min_ms >= 47.9);
     assert_eq!(
         report.round_trip_latency.samples,
@@ -202,4 +203,32 @@ async fn network_simulation_reports_admission_echo_replay_and_churn() {
         gateway.runtime.inference.delivered_frames,
         report.counters.echoed_frames
     );
+}
+
+#[tokio::test]
+async fn bounded_client_metrics_preserve_audio_and_account_for_all_samples() {
+    let (address, signal, task) = start(configuration()).await;
+    let report = simulation::run(
+        address,
+        SimulationConfig {
+            sessions: 8,
+            duration: Duration::from_millis(300),
+            phase: voice_scheduler::simulation::ArrivalPhase::Aligned,
+            metric_channel_capacity: 1,
+            ..SimulationConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.counters.failed_sessions, 0);
+    assert!(report.counters.echoed_frames > 8);
+    assert_eq!(
+        report.round_trip_latency.samples
+            + report.failed_round_trip_latency.samples
+            + report.counters.metric_samples_dropped,
+        report.counters.attempted_frames
+    );
+    assert!(report.slowest_packets.len() <= 8);
+    signal.cancel();
+    task.await.unwrap().unwrap();
 }

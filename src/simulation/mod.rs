@@ -1,5 +1,9 @@
 use std::{cmp::Reverse, collections::BinaryHeap, net::SocketAddr, time::Duration};
 
+mod measurements;
+pub use measurements::ClientPacketTrace;
+use measurements::PacketMeasurements;
+
 use bytes::Bytes;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use serde::{Deserialize, Serialize};
@@ -7,9 +11,9 @@ use tokio::{sync::mpsc, task::JoinSet, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    metrics::profile::{PacketTimings, RETAINED_TRACES, RuntimeLagReport, monitor_runtime},
+    metrics::profile::{RuntimeLagReport, monitor_runtime},
     metrics::{LatencyDistribution, LatencyHistogram},
-    protocol::{CacheOutcome, CreateRejection, FrameRejection, PacketSequence, SessionId},
+    protocol::{CacheOutcome, CreateRejection, FrameRejection, SessionId},
     transport::{AudioSession, ClientError, ConnectOutcome, connect_session},
 };
 
@@ -32,6 +36,7 @@ pub struct SimulationConfig {
     pub evict_every: Option<u64>,
     pub churn_after: Option<Duration>,
     pub io_timeout: Duration,
+    pub metric_channel_capacity: usize,
 }
 impl Default for SimulationConfig {
     fn default() -> Self {
@@ -46,6 +51,7 @@ impl Default for SimulationConfig {
             evict_every: None,
             churn_after: None,
             io_timeout: Duration::from_secs(5),
+            metric_channel_capacity: 4096,
         }
     }
 }
@@ -63,6 +69,8 @@ impl SimulationConfig {
             || self.io_timeout.is_zero()
             || self.io_timeout > Duration::from_secs(86400)
             || self.evict_every == Some(0)
+            || self.metric_channel_capacity == 0
+            || self.metric_channel_capacity > 1_000_000
             || self
                 .churn_after
                 .is_some_and(|duration| duration.is_zero() || duration > Duration::from_secs(86400))
@@ -113,6 +121,7 @@ pub struct ClientCounters {
     pub replayed_frames: u64,
     pub replayed_packets: u64,
     pub replayed_bytes: u64,
+    pub metric_samples_dropped: u64,
     pub failures: Vec<FailureCount>,
 }
 impl ClientCounters {
@@ -140,6 +149,7 @@ impl ClientCounters {
         self.replayed_frames += other.replayed_frames;
         self.replayed_packets += other.replayed_packets;
         self.replayed_bytes += other.replayed_bytes;
+        self.metric_samples_dropped += other.metric_samples_dropped;
         for failure in other.failures {
             if let Some(entry) = self
                 .failures
@@ -178,51 +188,14 @@ pub struct SimulationReport {
     pub runtime_lag: RuntimeLagReport,
     pub slowest_packets: Vec<ClientPacketTrace>,
 }
-#[derive(Debug, Serialize, Deserialize)]
-pub enum ClientPacketTrace {
-    Echo {
-        session_id: SessionId,
-        sequence: PacketSequence,
-        round_trip: Duration,
-        client_start_delay: Duration,
-        outside_server: Duration,
-        server: PacketTimings,
-    },
-    Failure {
-        session_id: SessionId,
-        sequence: PacketSequence,
-        round_trip: Duration,
-        client_start_delay: Duration,
-        reason: FailureReason,
-    },
-}
-impl ClientPacketTrace {
-    fn round_trip(&self) -> Duration {
-        match self {
-            Self::Echo { round_trip, .. } | Self::Failure { round_trip, .. } => *round_trip,
-        }
-    }
-}
-#[derive(Default)]
-struct ClientMeasurements {
-    counters: ClientCounters,
-    round_trip: LatencyHistogram,
-    failed_round_trip: LatencyHistogram,
-    client_start_delay: LatencyHistogram,
-    outside_server: LatencyHistogram,
-    slowest_packets: Vec<ClientPacketTrace>,
-}
-impl ClientMeasurements {
-    fn trace(&mut self, packet: ClientPacketTrace) {
-        self.slowest_packets.push(packet);
-        self.slowest_packets
-            .sort_unstable_by_key(|packet| Reverse(packet.round_trip()));
-        self.slowest_packets.truncate(RETAINED_TRACES);
-    }
-}
 struct PacerSlot {
     sender: mpsc::Sender<Instant>,
     cancellation: CancellationToken,
+}
+struct SessionInput {
+    ticks: mpsc::Receiver<Instant>,
+    cancellation: CancellationToken,
+    ready: tokio::sync::oneshot::Sender<()>,
 }
 #[derive(Default)]
 struct PacerMeasurements {
@@ -307,12 +280,18 @@ async fn run_session(
     session_id: SessionId,
     address: SocketAddr,
     configuration: SimulationConfig,
-    mut ticks: mpsc::Receiver<Instant>,
-    cancellation: CancellationToken,
-    ready: tokio::sync::oneshot::Sender<()>,
-) -> ClientMeasurements {
-    let mut measurements = ClientMeasurements::default();
-    measurements.counters.admitted_sessions = 1;
+    input: SessionInput,
+    metrics: mpsc::Sender<ClientPacketTrace>,
+) -> ClientCounters {
+    let SessionInput {
+        mut ticks,
+        cancellation,
+        ready,
+    } = input;
+    let mut counters = ClientCounters {
+        admitted_sessions: 1,
+        ..ClientCounters::default()
+    };
     let payload = Bytes::from(vec![42; configuration.payload_bytes]);
     let mut random = SmallRng::seed_from_u64(configuration.seed.wrapping_add(session_id.0));
     let mut created = Instant::now();
@@ -323,37 +302,39 @@ async fn run_session(
     loop {
         let captured_at = tokio::select! {
             _ = cancellation.cancelled() => {
-                measurements.counters.failure(FailureReason::GeneratorOverrun);
-                return measurements;
+                counters.failure(FailureReason::GeneratorOverrun);
+                return counters;
             }
             tick = ticks.recv() => match tick { Some(tick) => tick, None => break },
         };
-        measurements.counters.attempted_frames += 1;
+        counters.attempted_frames += 1;
         let sequence = session.next_sequence();
         let client_start_delay = captured_at.elapsed();
-        measurements.client_start_delay.record(client_start_delay);
         match session.infer_audio(payload.clone(), captured_at).await {
             Ok(audio) => {
                 let round_trip = captured_at.elapsed();
                 let outside_server =
                     round_trip.saturating_sub(client_start_delay + audio.timings.total());
-                measurements.round_trip.record(round_trip);
-                measurements.outside_server.record(outside_server);
-                measurements.trace(ClientPacketTrace::Echo {
-                    session_id,
-                    sequence: audio.sequence,
-                    round_trip,
-                    client_start_delay,
-                    outside_server,
-                    server: *audio.timings,
-                });
-                measurements.counters.echoed_frames += 1;
+                if metrics
+                    .try_send(ClientPacketTrace::Echo {
+                        session_id,
+                        sequence: audio.sequence,
+                        round_trip,
+                        client_start_delay,
+                        outside_server,
+                        server: *audio.timings,
+                    })
+                    .is_err()
+                {
+                    counters.metric_samples_dropped += 1;
+                }
+                counters.echoed_frames += 1;
                 match audio.cache {
-                    CacheOutcome::Hit => measurements.counters.cache_hits += 1,
+                    CacheOutcome::Hit => counters.cache_hits += 1,
                     CacheOutcome::Replayed { packets, bytes } => {
-                        measurements.counters.replayed_frames += 1;
-                        measurements.counters.replayed_packets += packets;
-                        measurements.counters.replayed_bytes += bytes;
+                        counters.replayed_frames += 1;
+                        counters.replayed_packets += packets;
+                        counters.replayed_bytes += bytes;
                     }
                 }
                 if configuration
@@ -365,12 +346,12 @@ async fn run_session(
                     {
                         Ok(Ok(_)) => {}
                         Ok(Err(error)) => {
-                            measurements.counters.failure(classify(error));
-                            return measurements;
+                            counters.failure(classify(error));
+                            return counters;
                         }
                         Err(_) => {
-                            measurements.counters.failure(FailureReason::Connection);
-                            return measurements;
+                            counters.failure(FailureReason::Connection);
+                            return counters;
                         }
                     }
                 }
@@ -378,38 +359,42 @@ async fn run_session(
             Err(error) => {
                 let round_trip = captured_at.elapsed();
                 let reason = classify(error);
-                measurements.failed_round_trip.record(round_trip);
-                measurements.trace(ClientPacketTrace::Failure {
-                    session_id,
-                    sequence,
-                    round_trip,
-                    client_start_delay,
-                    reason,
-                });
-                measurements.counters.failure(reason);
-                return measurements;
+                if metrics
+                    .try_send(ClientPacketTrace::Failure {
+                        session_id,
+                        sequence,
+                        round_trip,
+                        client_start_delay,
+                        reason,
+                    })
+                    .is_err()
+                {
+                    counters.metric_samples_dropped += 1;
+                }
+                counters.failure(reason);
+                return counters;
             }
         }
         if lifetime.is_some_and(|duration| created.elapsed() >= duration) {
             match tokio::time::timeout(configuration.io_timeout, session.close()).await {
-                Ok(Ok(_)) => measurements.counters.closed_sessions += 1,
+                Ok(Ok(_)) => counters.closed_sessions += 1,
                 _ => {
-                    measurements.counters.failure(FailureReason::Connection);
-                    return measurements;
+                    counters.failure(FailureReason::Connection);
+                    return counters;
                 }
             }
             match connect_session(address, session_id, configuration.io_timeout).await {
                 Ok(ConnectOutcome::Admitted(new_session)) => {
                     session = new_session;
-                    measurements.counters.admitted_sessions += 1;
+                    counters.admitted_sessions += 1;
                 }
                 Ok(ConnectOutcome::Rejected(reason)) => {
-                    measurements.counters.admission(reason);
-                    return measurements;
+                    counters.admission(reason);
+                    return counters;
                 }
                 Err(error) => {
-                    measurements.counters.failure(classify(error));
-                    return measurements;
+                    counters.failure(classify(error));
+                    return counters;
                 }
             }
             created = Instant::now();
@@ -419,10 +404,10 @@ async fn run_session(
         }
     }
     match tokio::time::timeout(configuration.io_timeout, session.close()).await {
-        Ok(Ok(_)) => measurements.counters.closed_sessions += 1,
-        _ => measurements.counters.failure(FailureReason::Connection),
+        Ok(Ok(_)) => counters.closed_sessions += 1,
+        _ => counters.failure(FailureReason::Connection),
     }
-    measurements
+    counters
 }
 
 pub async fn run(
@@ -443,13 +428,13 @@ pub async fn run(
         });
     }
     let mut admitted = Vec::new();
-    let mut totals = ClientMeasurements::default();
+    let mut counters = ClientCounters::default();
     while let Some(result) = connections.join_next().await {
         let (session_id, outcome) = result?;
         match outcome {
             Ok(ConnectOutcome::Admitted(session)) => admitted.push((session_id, session)),
-            Ok(ConnectOutcome::Rejected(reason)) => totals.counters.admission(reason),
-            Err(error) => totals.counters.failure(classify(error)),
+            Ok(ConnectOutcome::Rejected(reason)) => counters.admission(reason),
+            Err(error) => counters.failure(classify(error)),
         }
     }
     let admission_secs = admission_start.elapsed().as_secs_f64();
@@ -457,6 +442,8 @@ pub async fn run(
     let mut tasks = JoinSet::new();
     let mut slots = Vec::new();
     let mut readiness = Vec::new();
+    let (metrics, packet_mailbox) = mpsc::channel(configuration.metric_channel_capacity);
+    let collector = tokio::spawn(PacketMeasurements::default().collect(packet_mailbox));
     for (session_id, session) in admitted {
         let (sender, receiver) = mpsc::channel(1);
         let cancellation = CancellationToken::new();
@@ -471,11 +458,15 @@ pub async fn run(
             session_id,
             address,
             configuration.clone(),
-            receiver,
-            cancellation,
-            ready,
+            SessionInput {
+                ticks: receiver,
+                cancellation,
+                ready,
+            },
+            metrics.clone(),
         ));
     }
+    drop(metrics);
     for initialized in readiness {
         initialized.await?;
     }
@@ -488,33 +479,21 @@ pub async fn run(
         pace(slots, pacing_configuration, CancellationToken::new())
     });
     while let Some(result) = tasks.join_next().await {
-        let measurements = result?;
-        totals.round_trip.merge(&measurements.round_trip);
-        totals
-            .failed_round_trip
-            .merge(&measurements.failed_round_trip);
-        totals.counters.merge(measurements.counters);
-        totals
-            .client_start_delay
-            .merge(&measurements.client_start_delay);
-        totals.outside_server.merge(&measurements.outside_server);
-        for packet in measurements.slowest_packets {
-            totals.trace(packet);
-        }
+        counters.merge(result?);
     }
     let pacing = pacer.await?;
     let elapsed_secs = started.elapsed().as_secs_f64();
     monitor_cancellation.cancel();
     let runtime_lag = monitor.await?;
+    let totals = collector.await?;
     Ok(SimulationReport {
         process_cpu: cpu.finish()?,
-        throughput_frames_per_sec: totals.counters.echoed_frames as f64
-            / elapsed_secs.max(f64::EPSILON),
+        throughput_frames_per_sec: counters.echoed_frames as f64 / elapsed_secs.max(f64::EPSILON),
         configuration,
         elapsed_secs,
         admission_secs,
         setup_secs,
-        counters: totals.counters,
+        counters,
         round_trip_latency: totals.round_trip.summary(),
         failed_round_trip_latency: totals.failed_round_trip.summary(),
         generator_delay: pacing.delay.summary(),
