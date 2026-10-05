@@ -1,0 +1,23 @@
+[package]
+name = "voice-scheduler"
+version = "0.1.0"
+edition = "2024"
+description = "Bounded, deadline-aware Tokio runtime for simulated realtime voice inference"
+license = "MIT"
+
+[dependencies]
+bytes = "1.10"
+clap = { version = "4.5", features = ["derive"] }
+hdrhistogram = "7.5"
+rand = { version = "0.9", features = ["small_rng"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "test-util"] }
+tokio-util = "0.7"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
