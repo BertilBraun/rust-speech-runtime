@@ -169,7 +169,7 @@ async fn packet_profile_separates_ingress_mailbox_batching_and_device_time() {
     let timings = &output.audio.timings;
     assert!(timings.ingress >= Duration::from_millis(5));
     assert!(timings.worker_mailbox >= Duration::from_millis(5));
-    assert!(timings.batch_wait >= Duration::from_millis(10));
+    assert!(timings.scheduler_queue >= Duration::from_millis(10));
     assert!(timings.device_execution >= Duration::from_millis(3));
     assert!(timings.total() >= output.completed_at - output.input_timestamp);
     assert!(timings.total() <= output.input_timestamp.elapsed());
@@ -177,7 +177,7 @@ async fn packet_profile_separates_ingress_mailbox_batching_and_device_time() {
     assert_eq!(report.ingress_delay.samples, 1);
     let worker = &report.workers[0];
     assert_eq!(worker.profile.worker_mailbox.samples, 1);
-    assert_eq!(worker.profile.batch_wait.samples, 1);
+    assert_eq!(worker.profile.scheduler_queue.samples, 1);
     assert_eq!(worker.slowest_packets.len(), 1);
 }
 

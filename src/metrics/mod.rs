@@ -11,13 +11,13 @@ use profile::{RuntimeLagReport, SlowWorkerPacket, WorkerProfile, WorkerProfileRe
 pub(crate) struct LatencyHistogram(Histogram<u64>);
 impl Default for LatencyHistogram {
     fn default() -> Self {
-        Self(Histogram::new_with_bounds(1, 86_400_000_000, 3).expect("valid bounds"))
+        Self(Histogram::new_with_bounds(1, 86_400_000_000_000, 3).expect("valid bounds"))
     }
 }
 impl LatencyHistogram {
     pub(crate) fn record(&mut self, duration: Duration) {
         self.0
-            .record(duration.as_micros().min(86_400_000_000) as u64)
+            .record(duration.as_nanos().min(86_400_000_000_000) as u64)
             .expect("bounded sample");
     }
     pub(crate) fn merge(&mut self, other: &Self) {
@@ -26,12 +26,12 @@ impl LatencyHistogram {
     pub(crate) fn summary(&self) -> LatencyDistribution {
         LatencyDistribution {
             samples: self.0.len(),
-            mean_ms: self.0.mean() / 1000.0,
-            min_ms: self.0.min() as f64 / 1000.0,
-            p50_ms: self.0.value_at_quantile(0.5) as f64 / 1000.0,
-            p95_ms: self.0.value_at_quantile(0.95) as f64 / 1000.0,
-            p99_ms: self.0.value_at_quantile(0.99) as f64 / 1000.0,
-            max_ms: self.0.max() as f64 / 1000.0,
+            mean_ms: self.0.mean() / 1_000_000.0,
+            min_ms: self.0.min() as f64 / 1_000_000.0,
+            p50_ms: self.0.value_at_quantile(0.5) as f64 / 1_000_000.0,
+            p95_ms: self.0.value_at_quantile(0.95) as f64 / 1_000_000.0,
+            p99_ms: self.0.value_at_quantile(0.99) as f64 / 1_000_000.0,
+            max_ms: self.0.max() as f64 / 1_000_000.0,
         }
     }
 }
@@ -308,5 +308,22 @@ fn ratio(numerator: f64, denominator: f64) -> f64 {
         0.0
     } else {
         numerator / denominator
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LatencyHistogram;
+    use std::time::Duration;
+
+    #[test]
+    fn profiling_preserves_submicrosecond_samples_and_long_latency_tails() {
+        let mut histogram = LatencyHistogram::default();
+        histogram.record(Duration::from_nanos(500));
+        histogram.record(Duration::from_millis(50));
+        let distribution = histogram.summary();
+        assert_eq!(distribution.samples, 2);
+        assert!((distribution.min_ms - 0.0005).abs() < 0.000001);
+        assert!((distribution.max_ms - 50.0).abs() < 0.05);
     }
 }

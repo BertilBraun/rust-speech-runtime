@@ -64,6 +64,8 @@ struct RuntimeArguments {
     #[arg(long)]
     batch_fill_reserve: Option<f64>,
     #[arg(long)]
+    latency_safety_factor: Option<f64>,
+    #[arg(long)]
     worker_channel_capacity: Option<usize>,
     #[arg(long)]
     worker_input_delay_ms: Option<u64>,
@@ -107,6 +109,9 @@ impl RuntimeArguments {
         }
         if let Some(value) = self.batch_fill_reserve {
             configuration.batch_fill_reserve = value;
+        }
+        if let Some(value) = self.latency_safety_factor {
+            configuration.latency_safety_factor = value;
         }
         if let Some(value) = self.worker_channel_capacity {
             configuration.worker_channel_capacity = value;

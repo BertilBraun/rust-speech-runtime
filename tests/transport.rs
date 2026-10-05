@@ -95,7 +95,7 @@ async fn tcp_echo_is_sticky_and_replays_complete_prefix_on_cache_miss() {
     assert_eq!(report.runtime.inference.delivered_frames, 4);
     assert_eq!(report.runtime.inference.replayed_packets, 3);
     assert_eq!(report.runtime.inference.cache_misses, 1);
-    assert_eq!(report.runtime.profile.batch_wait.samples, 4);
+    assert_eq!(report.runtime.profile.scheduler_queue.samples, 4);
     assert_eq!(report.runtime.active_sessions_at_shutdown, 0);
 }
 

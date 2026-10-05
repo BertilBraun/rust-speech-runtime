@@ -583,6 +583,7 @@ impl Worker {
         }
     }
     fn dispatch_batch(&mut self, permit: mpsc::Permit<'_, DeviceJob>) {
+        let assembly_started = Instant::now();
         let selected = std::mem::take(&mut self.prepared);
         let predicted_start = self.submitted.back().map_or(Instant::now(), |batch| {
             batch.expected_completion.max(Instant::now())
@@ -631,11 +632,19 @@ impl Worker {
             self.refresh_prepared();
             return;
         }
-        if !self.submitted.is_empty() {
+        if self
+            .submitted
+            .back()
+            .is_some_and(|previous| previous.expected_completion > Instant::now())
+        {
             self.measurements.counters.queued_batch_launches += 1;
         }
         let submitted_at = Instant::now();
         let latency = self.base_latency() + replay;
+        self.measurements
+            .profile
+            .batch_assembly
+            .record(assembly_started.elapsed());
         permit.send(DeviceJob {
             latency,
             work: DeviceWork::Inference(items),
@@ -655,7 +664,10 @@ impl Worker {
         }
         let inference_latency = result.completed_at.duration_since(result.started_at);
         let host_wait = result.observed_at.duration_since(result.completed_at);
-        self.measurements.profile.sleep_overshoot.record(host_wait);
+        self.measurements
+            .profile
+            .host_completion_delay
+            .record(host_wait);
         self.measurements.profile.host_device_wakeup.record(
             result
                 .host_started_at
@@ -706,7 +718,7 @@ impl Worker {
                         ingress: item.routed_at - item.input.timestamp,
                         worker_mailbox: item.received_at - item.routed_at,
                         validation: item.queued_at - item.received_at,
-                        batch_wait: result.submitted_at - item.queued_at,
+                        scheduler_queue: result.submitted_at - item.queued_at,
                         device_queue: result.started_at - result.submitted_at,
                         device_execution: inference_latency,
                         host_completion_delay: host_wait,

@@ -12,7 +12,7 @@ pub struct PacketTimings {
     pub ingress: Duration,
     pub worker_mailbox: Duration,
     pub validation: Duration,
-    pub batch_wait: Duration,
+    pub scheduler_queue: Duration,
     pub device_queue: Duration,
     pub device_execution: Duration,
     pub host_completion_delay: Duration,
@@ -24,7 +24,7 @@ impl PacketTimings {
         self.ingress
             + self.worker_mailbox
             + self.validation
-            + self.batch_wait
+            + self.scheduler_queue
             + self.device_queue
             + self.device_execution
             + self.host_completion_delay
@@ -46,12 +46,13 @@ pub struct SlowWorkerPacket {
 pub(crate) struct WorkerProfile {
     pub mailbox: LatencyHistogram,
     pub validation: LatencyHistogram,
-    pub batch_wait: LatencyHistogram,
+    pub scheduler_queue: LatencyHistogram,
     pub result_delivery: LatencyHistogram,
-    pub sleep_overshoot: LatencyHistogram,
+    pub host_completion_delay: LatencyHistogram,
     pub rejected_queue_delay: LatencyHistogram,
     pub device_queue: LatencyHistogram,
     pub batch_preparation: LatencyHistogram,
+    pub batch_assembly: LatencyHistogram,
     pub host_device_wakeup: LatencyHistogram,
     pub slowest_packets: Vec<SlowWorkerPacket>,
 }
@@ -59,16 +60,18 @@ impl WorkerProfile {
     pub(crate) fn merge(&mut self, other: &Self) {
         self.mailbox.merge(&other.mailbox);
         self.validation.merge(&other.validation);
-        self.batch_wait.merge(&other.batch_wait);
+        self.scheduler_queue.merge(&other.scheduler_queue);
         self.result_delivery.merge(&other.result_delivery);
-        self.sleep_overshoot.merge(&other.sleep_overshoot);
+        self.host_completion_delay
+            .merge(&other.host_completion_delay);
         self.rejected_queue_delay.merge(&other.rejected_queue_delay);
         self.device_queue.merge(&other.device_queue);
         self.batch_preparation.merge(&other.batch_preparation);
+        self.batch_assembly.merge(&other.batch_assembly);
         self.host_device_wakeup.merge(&other.host_device_wakeup);
     }
     pub(crate) fn record(&mut self, packet: SlowWorkerPacket) {
-        self.batch_wait.record(packet.timings.batch_wait);
+        self.scheduler_queue.record(packet.timings.scheduler_queue);
         self.result_delivery.record(packet.timings.result_delivery);
         self.device_queue.record(packet.timings.device_queue);
         self.slowest_packets.push(packet);
@@ -80,12 +83,13 @@ impl WorkerProfile {
         WorkerProfileReport {
             worker_mailbox: self.mailbox.summary(),
             input_validation: self.validation.summary(),
-            batch_wait: self.batch_wait.summary(),
+            scheduler_queue: self.scheduler_queue.summary(),
             result_delivery: self.result_delivery.summary(),
-            sleep_overshoot: self.sleep_overshoot.summary(),
+            host_completion_delay: self.host_completion_delay.summary(),
             rejected_queue_delay: self.rejected_queue_delay.summary(),
             device_queue: self.device_queue.summary(),
             batch_preparation: self.batch_preparation.summary(),
+            batch_assembly: self.batch_assembly.summary(),
             host_device_wakeup: self.host_device_wakeup.summary(),
         }
     }
@@ -95,12 +99,13 @@ impl WorkerProfile {
 pub struct WorkerProfileReport {
     pub worker_mailbox: LatencyDistribution,
     pub input_validation: LatencyDistribution,
-    pub batch_wait: LatencyDistribution,
+    pub scheduler_queue: LatencyDistribution,
     pub result_delivery: LatencyDistribution,
-    pub sleep_overshoot: LatencyDistribution,
+    pub host_completion_delay: LatencyDistribution,
     pub rejected_queue_delay: LatencyDistribution,
     pub device_queue: LatencyDistribution,
     pub batch_preparation: LatencyDistribution,
+    pub batch_assembly: LatencyDistribution,
     pub host_device_wakeup: LatencyDistribution,
 }
 
@@ -158,7 +163,7 @@ mod tests {
                 elapsed_secs: index as f64,
                 deadline_exceeded: false,
                 timings: PacketTimings {
-                    batch_wait: Duration::from_millis(index),
+                    scheduler_queue: Duration::from_millis(index),
                     ..PacketTimings::default()
                 },
             });
@@ -166,6 +171,6 @@ mod tests {
         assert_eq!(profile.slowest_packets.len(), RETAINED_TRACES);
         assert_eq!(profile.slowest_packets[0].sequence, PacketSequence(31));
         assert_eq!(profile.slowest_packets[7].sequence, PacketSequence(24));
-        assert_eq!(profile.report().batch_wait.samples, 32);
+        assert_eq!(profile.report().scheduler_queue.samples, 32);
     }
 }
