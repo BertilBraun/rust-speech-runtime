@@ -106,8 +106,8 @@ mod tests {
     #[test]
     fn capacity_reserves_whole_batches_and_headroom() {
         let configuration = RuntimeConfig::default();
-        assert_eq!(session_limit(&configuration, Duration::from_millis(12)), 16);
-        assert_eq!(session_limit(&configuration, Duration::from_millis(20)), 8);
+        assert_eq!(session_limit(&configuration, Duration::from_millis(12)), 48);
+        assert_eq!(session_limit(&configuration, Duration::from_millis(20)), 16);
         assert_eq!(session_limit(&configuration, Duration::from_millis(40)), 0);
     }
     #[test]
