@@ -228,7 +228,7 @@ impl Worker {
             .map(|pending| Instant::now().duration_since(pending.queued_at))
             .max()
             .unwrap_or(Duration::ZERO);
-        if queued + self.estimator.service_time() > self.configuration.compute_budget() {
+        if queued + self.estimator.device_time() > self.configuration.compute_budget() {
             self.session_limit.min(self.sessions.len())
         } else {
             self.session_limit
@@ -428,7 +428,7 @@ impl Worker {
                 .mul_f64(packets as f64),
         };
         if Instant::now()
-            + self.estimator.service_time()
+            + self.estimator.device_time()
             + replay_duration
             + self.configuration.scheduling_margin
             > input.deadline
@@ -474,13 +474,13 @@ impl Worker {
         {
             count += 1;
             let latest = pending.item.input.deadline
-                - self.estimator.service_time()
+                - self.estimator.device_time()
                 - pending.item.replay_duration
                 - self.configuration.scheduling_margin;
             wakeup =
                 wakeup.min((pending.queued_at + self.configuration.max_batch_wait).min(latest));
         }
-        if count >= self.configuration.batch_size {
+        if count >= self.configuration.batch_size || (count > 0 && count == self.sessions.len()) {
             now
         } else {
             wakeup
@@ -508,7 +508,7 @@ impl Worker {
                 .get_mut(&selected.session_id)
                 .expect("selected session exists");
             let pending = session.pending.take().expect("pending frame exists");
-            let projected = self.estimator.service_time()
+            let projected = self.estimator.device_time()
                 + replay
                 + pending.item.replay_duration
                 + self.configuration.scheduling_margin;

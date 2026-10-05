@@ -34,10 +34,13 @@ impl ServiceEstimator {
         self.samples.push_back(duration);
     }
     pub(crate) fn service_time(&self) -> Duration {
+        self.device_time().mul_f64(self.safety_factor)
+    }
+    pub(crate) fn device_time(&self) -> Duration {
         assert!(!self.samples.is_empty(), "admission waits for calibration");
         let mut samples: Vec<Duration> = self.samples.iter().copied().collect();
         samples.sort_unstable();
-        samples[(samples.len() * 95).div_ceil(100) - 1].mul_f64(self.safety_factor)
+        samples[(samples.len() * 95).div_ceil(100) - 1]
     }
 }
 pub(crate) fn session_limit(configuration: &RuntimeConfig, service_time: Duration) -> usize {

@@ -516,6 +516,27 @@ async fn two_thousand_sessions_use_eight_device_workers_with_sticky_echoes() {
     assert!(report.batch_fill_ratio <= 1.0);
 }
 #[tokio::test]
+async fn partial_batch_runs_immediately_when_all_assigned_sessions_are_ready() {
+    let node = Node::start(RuntimeConfig {
+        max_sessions_per_worker: 1,
+        cache_slots_per_worker: 1,
+        batch_size: 32,
+        max_batch_wait: Duration::from_millis(200),
+        packet_deadline: Duration::from_millis(500),
+        ..configuration()
+    })
+    .await
+    .unwrap();
+    admit(&node, 1).await;
+    assert!(matches!(
+        first_packet(&node, 1).await,
+        InputOutcome::Processed(_)
+    ));
+    let report = node.shutdown().await.unwrap();
+    assert_eq!(report.mean_batch_size, 1.0);
+    assert!(report.queue_delay.max_ms < 150.0);
+}
+#[tokio::test]
 async fn input_and_configuration_boundaries_fail_clearly() {
     assert!(
         Node::start(RuntimeConfig {
