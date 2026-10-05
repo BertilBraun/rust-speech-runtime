@@ -354,7 +354,11 @@ impl Worker {
                 reply,
             } => {
                 let removed = match self.sessions.get(&session_id) {
-                    Some(session) if session.assignment.generation == generation => {
+                    Some(session)
+                        if session.assignment.generation == generation
+                            && !session.in_flight
+                            && session.pending.is_none() =>
+                    {
                         self.cache.evict(session.cache);
                         self.measurements.counters.cache_evictions += 1;
                         true

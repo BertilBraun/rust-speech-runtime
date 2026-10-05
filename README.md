@@ -48,6 +48,8 @@ Audio packets carry a sequence and the fingerprint of their preceding prefix. Ea
 
 Closing a session releases its admission slot immediately, but a cache slot referenced by submitted device work remains retired until that work completes. A replacement can be rejected temporarily when all cache slots are still in use. Reports expose peak retired cache slots, and a test verifies that cancelled inference cannot reuse a replacement's cache memory.
 
+Cache contents are also pinned while an input is pending or submitted. Explicit eviction returns false during that interval; once inference finishes, eviction invalidates the cache and the next input must replay its preceding audio. This avoids invalidating cache data still needed by an outstanding kernel.
+
 A session retains at most one pending or running packet. Audio is never coalesced or silently replaced. A sequencing error, frame overload, prefix limit, impossible replay deadline or late completion explicitly fails the session. Cache misses are retryable without advancing the prefix. The external client retains the original audio history and automatically replays it after a cache miss. Replay shares the original packet's deadline. Closing/recreating a session assigns a new generation; old physical results cannot reach its replacement.
 
 An otherwise viable cache replay is deferred to a successor batch when adding it would make an earlier packet late. It is rejected only when its own projected completion cannot meet its deadline, rather than merely because it cannot join the current batch.

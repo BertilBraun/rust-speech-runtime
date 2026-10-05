@@ -393,6 +393,55 @@ async fn cache_replay_that_cannot_join_an_urgent_batch_is_deferred_without_rejec
     assert_eq!(report.inference.delivered_frames, 3);
     assert!(report.inference_latency.max_ms >= 111.9);
 }
+
+#[tokio::test]
+async fn cache_cannot_be_evicted_while_device_work_still_references_it() {
+    let node = Node::start(RuntimeConfig {
+        inference_latency: Duration::from_millis(40),
+        ..configuration()
+    })
+    .await
+    .unwrap();
+    admit(&node, 1).await;
+    let ingress = node.ingress.clone();
+    let work = tokio::spawn(async move {
+        ingress
+            .input_frame(
+                SessionId(1),
+                frame(
+                    0,
+                    PrefixState::default(),
+                    Bytes::from_static(b"audio"),
+                    Duration::from_millis(200),
+                ),
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(!node.ingress.evict_cache(SessionId(1)).await.unwrap());
+    let InputOutcome::Processed(output) = work.await.unwrap() else {
+        panic!("expected audio");
+    };
+    assert!(node.ingress.evict_cache(SessionId(1)).await.unwrap());
+    assert!(matches!(
+        node.ingress
+            .input_frame(
+                SessionId(1),
+                frame(
+                    1,
+                    output.audio.prefix,
+                    Bytes::from_static(b"next"),
+                    Duration::from_millis(200)
+                ),
+            )
+            .await
+            .unwrap(),
+        InputOutcome::CacheMiss
+    ));
+    let report = node.shutdown().await.unwrap();
+    assert_eq!(report.inference.cache_evictions, 1);
+}
 #[tokio::test]
 async fn cache_eviction_requires_replaying_all_preceding_audio() {
     let node = Node::start(RuntimeConfig {
