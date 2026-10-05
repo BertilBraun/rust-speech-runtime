@@ -132,8 +132,7 @@ impl Worker {
         let (device_results, mut results) =
             mpsc::channel(self.configuration.device_queue_capacity + 1);
         let wait = self.configuration.device_wait;
-        let device =
-            tokio::task::spawn_blocking(move || mock_gpu::run(job_mailbox, device_results, wait));
+        let device = mock_gpu::spawn(job_mailbox, device_results, wait);
         for _ in 0..self.configuration.calibration_samples {
             jobs.send(DeviceJob {
                 work: DeviceWork::Probe,
@@ -152,7 +151,7 @@ impl Worker {
         }
         self.epoch = Instant::now();
         self.refresh_capacity();
-        self.measurements.initial_session_limit = self.session_limit;
+        self.measurements.initial_session_limit = self.admission_limit();
         let _ = ready.send(());
         let mut next_probe = self.epoch + self.configuration.probe_interval;
         loop {
@@ -214,7 +213,7 @@ impl Worker {
         drop(jobs);
         self.measurements.device_cpu = device.await.expect("mock device does not panic");
         self.measurements.elapsed = Instant::now().duration_since(self.epoch);
-        self.measurements.final_session_limit = self.session_limit;
+        self.measurements.final_session_limit = self.admission_limit();
         self.measurements.service_time = self.estimator.service_time();
         self.measurements.host_delay = self.estimator.host_delay();
         self.measurements

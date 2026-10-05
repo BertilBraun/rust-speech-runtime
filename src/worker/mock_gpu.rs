@@ -1,5 +1,5 @@
-use crate::config::DeviceWait;
-use crate::metrics::cpu::CpuUsage;
+use crate::config::{DeviceWait, ThreadWait};
+use crate::metrics::cpu::{CpuUsage, DeviceCpuUsage};
 use crate::protocol::{Assignment, CacheOutcome, InputFrame, InputOutcome, PrefixState, SessionId};
 use cpu_time::ThreadTime;
 use std::{
@@ -58,15 +58,35 @@ pub(super) struct DeviceResult {
     pub replay_duration: Duration,
     pub submitted_at: Instant,
 }
-pub(super) fn run(
+pub(super) fn spawn(
+    jobs: mpsc::Receiver<DeviceJob>,
+    results: mpsc::Sender<DeviceResult>,
+    wait: DeviceWait,
+) -> tokio::task::JoinHandle<DeviceCpuUsage> {
+    match wait {
+        DeviceWait::Tokio => tokio::spawn(async move {
+            run(jobs, results, wait).await;
+            DeviceCpuUsage::SharedRuntime
+        }),
+        DeviceWait::Thread(_) => {
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                let cpu = ThreadTime::now();
+                let wall = std::time::Instant::now();
+                runtime.block_on(run(jobs, results, wait));
+                DeviceCpuUsage::DedicatedThread(CpuUsage::measured(cpu.elapsed(), wall.elapsed()))
+            })
+        }
+    }
+}
+
+async fn run(
     mut jobs: mpsc::Receiver<DeviceJob>,
     results: mpsc::Sender<DeviceResult>,
     wait: DeviceWait,
-) -> CpuUsage {
-    let cpu = ThreadTime::now();
-    let wall = std::time::Instant::now();
+) {
     let mut previous_completion = Instant::now();
-    while let Some(job) = jobs.blocking_recv() {
+    while let Some(job) = jobs.recv().await {
         let host_started_at = Instant::now();
         let started_at = previous_completion.max(job.submitted_at);
         let (processed_frames, latency, replay_duration) = match &job.work {
@@ -95,10 +115,13 @@ pub(super) fn run(
             }
         };
         let completed_at = started_at + latency;
-        wait_until(completed_at, wait);
+        match wait {
+            DeviceWait::Tokio => tokio::time::sleep_until(completed_at).await,
+            DeviceWait::Thread(strategy) => wait_until(completed_at, strategy),
+        }
         previous_completion = completed_at;
         if results
-            .blocking_send(DeviceResult {
+            .send(DeviceResult {
                 work: job.work,
                 started_at,
                 completed_at,
@@ -108,22 +131,22 @@ pub(super) fn run(
                 replay_duration,
                 submitted_at: job.submitted_at,
             })
+            .await
             .is_err()
         {
             break;
         }
     }
-    CpuUsage::measured(cpu.elapsed(), wall.elapsed())
 }
 
-fn wait_until(deadline: Instant, strategy: DeviceWait) {
+fn wait_until(deadline: Instant, strategy: ThreadWait) {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return;
     }
     match strategy {
-        DeviceWait::Sleep => std::thread::sleep(remaining),
-        DeviceWait::Hybrid { spin_tail } => {
+        ThreadWait::Sleep => std::thread::sleep(remaining),
+        ThreadWait::Hybrid { spin_tail } => {
             let sleeping = remaining.saturating_sub(spin_tail);
             if !sleeping.is_zero() {
                 std::thread::sleep(sleeping);
@@ -132,7 +155,7 @@ fn wait_until(deadline: Instant, strategy: DeviceWait) {
                 std::hint::spin_loop();
             }
         }
-        DeviceWait::Poll { sleep_interval } => loop {
+        ThreadWait::Poll { sleep_interval } => loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
@@ -144,9 +167,9 @@ fn wait_until(deadline: Instant, strategy: DeviceWait) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceJob, DeviceWork, WorkItem, run};
+    use super::{DeviceJob, DeviceWork, WorkItem, spawn};
     use crate::{
-        config::DeviceWait,
+        config::{DeviceWait, ThreadWait},
         protocol::{
             Assignment, AudioContext, AudioPacket, CacheOutcome, Generation, InputFrame,
             PacketSequence, PrefixState, SessionId, WorkerId,
@@ -190,42 +213,72 @@ mod tests {
 
     #[tokio::test]
     async fn partial_and_full_batches_have_the_same_modeled_compute_cost() {
+        for strategy in [DeviceWait::Tokio, DeviceWait::Thread(ThreadWait::Sleep)] {
+            let (jobs, mailbox) = mpsc::channel(1);
+            let (results, mut responses) = mpsc::channel(1);
+            let device = spawn(mailbox, results, strategy);
+            for count in [1, 8, 16] {
+                jobs.send(DeviceJob {
+                    work: DeviceWork::Inference((0..count).map(item).collect()),
+                    latency: Duration::from_millis(2),
+                    submitted_at: Instant::now(),
+                })
+                .await
+                .unwrap();
+                let result = responses.recv().await.unwrap();
+                assert_eq!(
+                    result.completed_at - result.started_at,
+                    Duration::from_millis(2)
+                );
+                assert!(result.observed_at >= result.completed_at);
+            }
+            drop(jobs);
+            device.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn async_device_completion_does_not_block_the_single_thread_tokio_runtime() {
         let (jobs, mailbox) = mpsc::channel(1);
         let (results, mut responses) = mpsc::channel(1);
-        let device = tokio::task::spawn_blocking(move || run(mailbox, results, DeviceWait::Sleep));
-        for count in [1, 8, 16] {
-            jobs.send(DeviceJob {
-                work: DeviceWork::Inference((0..count).map(item).collect()),
-                latency: Duration::from_millis(2),
-                submitted_at: Instant::now(),
-            })
+        let device = spawn(mailbox, results, DeviceWait::Tokio);
+        jobs.send(DeviceJob {
+            work: DeviceWork::Inference(vec![item(1)]),
+            latency: Duration::from_millis(100),
+            submitted_at: Instant::now(),
+        })
+        .await
+        .unwrap();
+        tokio::spawn(async { tokio::task::yield_now().await })
             .await
             .unwrap();
-            let result = responses.recv().await.unwrap();
-            assert_eq!(
-                result.completed_at - result.started_at,
-                Duration::from_millis(2)
-            );
-            assert!(result.observed_at >= result.completed_at);
-        }
+        assert!(matches!(
+            responses.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(responses.recv().await.unwrap().processed_frames, 1);
         drop(jobs);
-        device.await.unwrap();
+        assert!(matches!(
+            device.await.unwrap(),
+            crate::metrics::cpu::DeviceCpuUsage::SharedRuntime
+        ));
     }
 
     #[tokio::test]
     async fn wait_strategies_preserve_the_requested_device_timeline() {
         for strategy in [
-            DeviceWait::Sleep,
-            DeviceWait::Hybrid {
+            DeviceWait::Tokio,
+            DeviceWait::Thread(ThreadWait::Sleep),
+            DeviceWait::Thread(ThreadWait::Hybrid {
                 spin_tail: Duration::from_micros(200),
-            },
-            DeviceWait::Poll {
+            }),
+            DeviceWait::Thread(ThreadWait::Poll {
                 sleep_interval: Duration::from_nanos(500),
-            },
+            }),
         ] {
             let (jobs, mailbox) = mpsc::channel(1);
             let (results, mut responses) = mpsc::channel(1);
-            let device = tokio::task::spawn_blocking(move || run(mailbox, results, strategy));
+            let device = spawn(mailbox, results, strategy);
             jobs.send(DeviceJob {
                 work: DeviceWork::Probe,
                 latency: Duration::from_millis(2),
@@ -248,7 +301,7 @@ mod tests {
     async fn prequeued_batches_execute_serially_without_waiting_for_host_result_handling() {
         let (jobs, mailbox) = mpsc::channel(3);
         let (results, mut responses) = mpsc::channel(3);
-        let device = tokio::task::spawn_blocking(move || run(mailbox, results, DeviceWait::Sleep));
+        let device = spawn(mailbox, results, DeviceWait::Thread(ThreadWait::Sleep));
         for session_id in 0..3 {
             jobs.send(DeviceJob {
                 work: DeviceWork::Inference(vec![item(session_id)]),
@@ -276,7 +329,7 @@ mod tests {
     async fn cancellation_before_device_start_skips_compute_without_losing_the_result() {
         let (jobs, mailbox) = mpsc::channel(2);
         let (results, mut responses) = mpsc::channel(2);
-        let device = tokio::task::spawn_blocking(move || run(mailbox, results, DeviceWait::Sleep));
+        let device = spawn(mailbox, results, DeviceWait::Thread(ThreadWait::Sleep));
         jobs.send(DeviceJob {
             work: DeviceWork::Inference(vec![item(1)]),
             latency: Duration::from_millis(10),

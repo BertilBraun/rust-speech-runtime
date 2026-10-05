@@ -18,6 +18,13 @@ impl CpuUsage {
     }
 }
 
+#[derive(Debug, Serialize)]
+#[serde(tag = "executor", content = "usage", rename_all = "snake_case")]
+pub enum DeviceCpuUsage {
+    DedicatedThread(CpuUsage),
+    SharedRuntime,
+}
+
 pub(crate) struct ProcessCpuMeasurement {
     cpu: ProcessTime,
     wall: Instant,

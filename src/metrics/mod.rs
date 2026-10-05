@@ -5,7 +5,7 @@ use std::time::Duration;
 
 pub mod cpu;
 pub mod profile;
-use cpu::CpuUsage;
+use cpu::DeviceCpuUsage;
 use profile::{RuntimeLagReport, SlowWorkerPacket, WorkerProfile, WorkerProfileReport};
 
 pub(crate) struct LatencyHistogram(Histogram<u64>);
@@ -111,7 +111,7 @@ pub(crate) struct WorkerMeasurements {
     pub occupied_until: Option<tokio::time::Instant>,
     pub peak_device_jobs: usize,
     pub peak_retired_cache_slots: usize,
-    pub device_cpu: CpuUsage,
+    pub device_cpu: DeviceCpuUsage,
     pub elapsed: Duration,
     pub batch_sizes: Histogram<u64>,
     pub queue_delay: LatencyHistogram,
@@ -136,7 +136,7 @@ impl WorkerMeasurements {
             occupied_until: None,
             peak_device_jobs: 0,
             peak_retired_cache_slots: 0,
-            device_cpu: CpuUsage::default(),
+            device_cpu: DeviceCpuUsage::SharedRuntime,
             elapsed: Duration::ZERO,
             batch_sizes: Histogram::new(3).expect("valid precision"),
             queue_delay: LatencyHistogram::default(),
@@ -151,7 +151,7 @@ impl WorkerMeasurements {
 #[derive(Debug, Serialize)]
 pub struct WorkerReport {
     pub peak_retired_cache_slots: usize,
-    pub device_cpu: CpuUsage,
+    pub device_cpu: DeviceCpuUsage,
     pub worker_id: WorkerId,
     pub initial_session_limit: usize,
     pub final_session_limit: usize,

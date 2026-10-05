@@ -61,12 +61,15 @@ impl ServiceEstimator {
         queue_delay: Duration,
     ) -> usize {
         let host_delay = self.host_delay();
-        if host_delay > configuration.scheduling_margin
-            || queue_delay + self.device_time() + host_delay > configuration.compute_budget()
-        {
-            capacity.min(active_sessions)
+        let available = capacity.min(session_limit_for_budget(
+            configuration,
+            configuration.compute_budget().saturating_sub(host_delay),
+            self.service_time(),
+        ));
+        if queue_delay + self.device_time() + host_delay > configuration.compute_budget() {
+            available.min(active_sessions)
         } else {
-            capacity
+            available
         }
     }
     pub(crate) fn device_time(&self) -> Duration {
@@ -77,7 +80,14 @@ impl ServiceEstimator {
     }
 }
 pub(crate) fn session_limit(configuration: &RuntimeConfig, service_time: Duration) -> usize {
-    let batches = configuration.compute_budget().as_nanos() / service_time.as_nanos();
+    session_limit_for_budget(configuration, configuration.compute_budget(), service_time)
+}
+fn session_limit_for_budget(
+    configuration: &RuntimeConfig,
+    budget: Duration,
+    service_time: Duration,
+) -> usize {
+    let batches = budget.as_nanos() / service_time.as_nanos();
     (((batches as usize).saturating_mul(configuration.batch_size) as f64
         * configuration.batch_fill_reserve)
         .floor() as usize)
@@ -135,26 +145,45 @@ mod tests {
         }
         estimator.observe_host_delay(Duration::from_millis(20));
         assert_eq!(
-            estimator.available_limit(&configuration, 8, 4, Duration::ZERO),
-            8
+            estimator.available_limit(&configuration, 48, 32, Duration::ZERO),
+            48
         );
         for _ in 0..3 {
             estimator.observe_host_delay(Duration::from_millis(20));
         }
         assert_eq!(
-            estimator.available_limit(&configuration, 8, 4, Duration::ZERO),
-            4
+            estimator.available_limit(&configuration, 48, 32, Duration::ZERO),
+            16
         );
         assert_eq!(estimator.device_time(), Duration::from_millis(12));
         for _ in 0..64 {
             estimator.observe_host_delay(Duration::from_millis(1));
         }
         assert_eq!(
-            estimator.available_limit(&configuration, 8, 4, Duration::ZERO),
-            8
+            estimator.available_limit(&configuration, 48, 32, Duration::ZERO),
+            48
         );
         assert_eq!(
-            estimator.available_limit(&configuration, 8, 4, Duration::from_millis(40)),
+            estimator.available_limit(&configuration, 48, 32, Duration::from_millis(40)),
+            32
+        );
+    }
+
+    #[test]
+    fn host_delay_uses_available_deadline_budget_instead_of_a_fixed_margin_cutoff() {
+        let configuration = RuntimeConfig {
+            packet_deadline: Duration::from_millis(250),
+            minimum_packet_interval: Duration::from_millis(250),
+            batch_size: 4,
+            max_sessions_per_worker: 4,
+            cache_slots_per_worker: 4,
+            ..RuntimeConfig::default()
+        };
+        let mut estimator = ServiceEstimator::new(&configuration);
+        estimator.observe(Duration::from_millis(3));
+        estimator.observe_host_delay(Duration::from_millis(10));
+        assert_eq!(
+            estimator.available_limit(&configuration, 4, 0, Duration::ZERO),
             4
         );
     }

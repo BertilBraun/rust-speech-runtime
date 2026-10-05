@@ -60,7 +60,7 @@ impl Default for RuntimeConfig {
             packet_deadline: Duration::from_millis(50),
             batch_size: 16,
             inference_latency: Duration::from_millis(12),
-            device_wait: DeviceWait::Sleep,
+            device_wait: DeviceWait::Tokio,
             device_queue_capacity: 2,
             launch_ahead: Duration::from_millis(2),
             max_batch_wait: Duration::ZERO,
@@ -90,23 +90,27 @@ pub struct ConfigError(pub String);
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub enum DeviceWait {
     #[default]
+    Tokio,
+    Thread(ThreadWait),
+}
+#[derive(Clone, Copy, Debug, Serialize)]
+pub enum ThreadWait {
     Sleep,
-    Hybrid {
-        spin_tail: Duration,
-    },
-    Poll {
-        sleep_interval: Duration,
-    },
+    Hybrid { spin_tail: Duration },
+    Poll { sleep_interval: Duration },
 }
 impl FromStr for DeviceWait {
     type Err = ConfigError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value == "tokio" {
+            return Ok(Self::Tokio);
+        }
         if value == "sleep" {
-            return Ok(Self::Sleep);
+            return Ok(Self::Thread(ThreadWait::Sleep));
         }
         let (kind, interval) = value.split_once(':').ok_or_else(|| {
-            ConfigError("device wait must be sleep, hybrid:200us or poll:500ns".into())
+            ConfigError("device wait must be tokio, sleep, hybrid:200us or poll:500ns".into())
         })?;
         let duration = if let Some(amount) = interval.strip_suffix("ns") {
             Duration::from_nanos(
@@ -125,14 +129,14 @@ impl FromStr for DeviceWait {
         };
         match kind {
             "hybrid" if !duration.is_zero() && duration <= Duration::from_millis(1) => {
-                Ok(Self::Hybrid {
+                Ok(Self::Thread(ThreadWait::Hybrid {
                     spin_tail: duration,
-                })
+                }))
             }
             "poll" if !duration.is_zero() && duration <= Duration::from_millis(1) => {
-                Ok(Self::Poll {
+                Ok(Self::Thread(ThreadWait::Poll {
                     sleep_interval: duration,
-                })
+                }))
             }
             _ => Err(ConfigError(
                 "device wait interval must be in (0, 1 ms]".into(),
@@ -142,17 +146,22 @@ impl FromStr for DeviceWait {
 }
 impl RuntimeConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
-        let wait_interval = match self.device_wait {
-            DeviceWait::Sleep => Duration::ZERO,
-            DeviceWait::Hybrid { spin_tail } => spin_tail,
-            DeviceWait::Poll { sleep_interval } => sleep_interval,
-        };
-        if !matches!(self.device_wait, DeviceWait::Sleep)
-            && (wait_interval.is_zero() || wait_interval > Duration::from_millis(1))
-        {
-            return Err(ConfigError(
-                "device wait interval must be in (0, 1 ms]".into(),
-            ));
+        match self.device_wait {
+            DeviceWait::Tokio | DeviceWait::Thread(ThreadWait::Sleep) => {}
+            DeviceWait::Thread(
+                ThreadWait::Hybrid {
+                    spin_tail: interval,
+                }
+                | ThreadWait::Poll {
+                    sleep_interval: interval,
+                },
+            ) => {
+                if interval.is_zero() || interval > Duration::from_millis(1) {
+                    return Err(ConfigError(
+                        "device wait interval must be in (0, 1 ms]".into(),
+                    ));
+                }
+            }
         }
         for (name, size) in [
             ("workers", self.workers),
