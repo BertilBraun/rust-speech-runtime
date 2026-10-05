@@ -13,6 +13,9 @@ pub(super) struct WorkItem {
     pub cache: CacheOutcome,
     pub replay_duration: Duration,
     pub reply: oneshot::Sender<InputOutcome>,
+    pub routed_at: Instant,
+    pub received_at: Instant,
+    pub queued_at: Instant,
 }
 pub(super) enum DeviceWork {
     Probe,
@@ -21,11 +24,14 @@ pub(super) enum DeviceWork {
 pub(super) struct DeviceJob {
     pub work: DeviceWork,
     pub latency: Duration,
+    pub submitted_at: Instant,
 }
 pub(super) struct DeviceResult {
     pub work: DeviceWork,
     pub started_at: Instant,
     pub completed_at: Instant,
+    pub submitted_at: Instant,
+    pub requested_latency: Duration,
 }
 pub(super) fn run(mut jobs: mpsc::Receiver<DeviceJob>, results: mpsc::Sender<DeviceResult>) {
     while let Some(job) = jobs.blocking_recv() {
@@ -36,6 +42,8 @@ pub(super) fn run(mut jobs: mpsc::Receiver<DeviceJob>, results: mpsc::Sender<Dev
                 work: job.work,
                 started_at,
                 completed_at: Instant::now(),
+                submitted_at: job.submitted_at,
+                requested_latency: job.latency,
             })
             .is_err()
         {

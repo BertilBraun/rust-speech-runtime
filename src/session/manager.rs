@@ -1,6 +1,7 @@
 use super::state::SessionState;
 use crate::{
     config::RuntimeConfig,
+    metrics::profile::monitor_runtime,
     metrics::{ManagerMeasurements, Report},
     protocol::{
         Assignment, CreateOutcome, CreateRejection, FrameRejection, Generation, InputFrame,
@@ -69,6 +70,8 @@ impl SessionManager {
         mut commands: mpsc::Receiver<Command>,
         cancellation: CancellationToken,
     ) -> Result<Report, RuntimeError> {
+        let monitor_cancellation = CancellationToken::new();
+        let monitor = monitor_runtime(monitor_cancellation.clone());
         let mut maintenance = tokio::time::interval(
             self.configuration
                 .minimum_packet_interval
@@ -105,6 +108,8 @@ impl SessionManager {
         for worker in self.workers.drain(..) {
             workers.push(worker.task.await?);
         }
+        monitor_cancellation.cancel();
+        let runtime_lag = monitor.await?;
         outcome?;
         Ok(Report::assemble(
             self.measurements,
@@ -117,6 +122,7 @@ impl SessionManager {
                 .load(Ordering::Relaxed),
             Instant::now().duration_since(self.epoch),
             self.configuration.batch_size,
+            runtime_lag,
         ))
     }
     fn statuses(&self) -> Vec<WorkerStatus> {
@@ -139,6 +145,8 @@ impl SessionManager {
         self.measurements.active_sessions = self.sessions.len();
     }
     async fn handle(&mut self, command: Command) -> Result<(), RuntimeError> {
+        let control = !matches!(command, Command::InputFrame { .. });
+        let started = Instant::now();
         match command {
             Command::CreateSession { session_id, reply } => {
                 let _ = reply.send(self.create(session_id).await?);
@@ -171,6 +179,9 @@ impl SessionManager {
                     let _ = reply.send(false);
                 }
             }
+        }
+        if control {
+            self.measurements.control_duration.record(started.elapsed());
         }
         Ok(())
     }
@@ -242,11 +253,15 @@ impl SessionManager {
             return Ok(());
         }
         session.last_input_at = Instant::now();
+        self.measurements
+            .ingress_delay
+            .record(input.timestamp.elapsed());
         let command = WorkerCommand::InputReady {
             session_id,
             generation: session.assignment.generation,
             input,
             reply,
+            routed_at: Instant::now(),
         };
         match self.workers[session.assignment.worker_id.0]
             .commands

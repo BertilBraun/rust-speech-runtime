@@ -1,4 +1,5 @@
 use crate::config::AudioLimits;
+use crate::metrics::profile::PacketTimings;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -149,6 +150,7 @@ pub struct AudioResult {
     pub payload: Bytes,
     pub prefix: PrefixState,
     pub cache: CacheOutcome,
+    pub timings: Box<PacketTimings>,
 }
 #[derive(Debug)]
 pub struct InferenceOutput {

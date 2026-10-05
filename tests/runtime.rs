@@ -142,6 +142,44 @@ async fn audio_echo_preserves_sequence_payload_and_entire_prefix() {
     assert_eq!(report.inference.delivered_frames, 5);
     assert_eq!(report.inference.cache_hits, 5);
 }
+
+#[tokio::test]
+async fn packet_profile_separates_ingress_mailbox_batching_and_device_time() {
+    let node = Node::start(RuntimeConfig {
+        worker_input_delay: Duration::from_millis(5),
+        max_batch_wait: Duration::from_millis(10),
+        ..configuration()
+    })
+    .await
+    .unwrap();
+    admit(&node, 1).await;
+    admit(&node, 2).await;
+    let input = frame(
+        0,
+        PrefixState::default(),
+        Bytes::from_static(b"profile"),
+        Duration::from_millis(200),
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let InputOutcome::Processed(output) =
+        node.ingress.input_frame(SessionId(1), input).await.unwrap()
+    else {
+        panic!("expected profiled audio");
+    };
+    let timings = &output.audio.timings;
+    assert!(timings.ingress >= Duration::from_millis(5));
+    assert!(timings.worker_mailbox >= Duration::from_millis(5));
+    assert!(timings.batch_wait >= Duration::from_millis(10));
+    assert!(timings.device_execution >= Duration::from_millis(3));
+    assert!(timings.total() >= output.completed_at - output.input_timestamp);
+    assert!(timings.total() <= output.input_timestamp.elapsed());
+    let report = node.shutdown().await.unwrap();
+    assert_eq!(report.ingress_delay.samples, 1);
+    let worker = &report.workers[0];
+    assert_eq!(worker.profile.worker_mailbox.samples, 1);
+    assert_eq!(worker.profile.batch_wait.samples, 1);
+    assert_eq!(worker.slowest_packets.len(), 1);
+}
 #[tokio::test]
 async fn cache_eviction_requires_replaying_all_preceding_audio() {
     let node = Node::start(RuntimeConfig {

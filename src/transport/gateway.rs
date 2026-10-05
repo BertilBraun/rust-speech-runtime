@@ -367,7 +367,12 @@ async fn serve_connection(
                 };
                 let terminal = matches!(outcome, InputOutcome::Rejected(_));
                 let reply = match outcome {
-                    InputOutcome::Processed(output) => ServerReply::Audio(output.audio),
+                    InputOutcome::Processed(mut output) => {
+                        output.audio.timings.gateway_return = Instant::now()
+                            .duration_since(output.completed_at)
+                            .saturating_sub(output.audio.timings.result_delivery);
+                        ServerReply::Audio(output.audio)
+                    }
                     InputOutcome::CacheMiss => ServerReply::CacheMiss,
                     InputOutcome::Rejected(reason) => ServerReply::Rejected(reason),
                 };

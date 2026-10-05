@@ -5,6 +5,7 @@ use super::{
 use crate::{
     config::RuntimeConfig,
     metrics::WorkerMeasurements,
+    metrics::profile::{PacketTimings, SlowWorkerPacket},
     protocol::{
         Assignment, AudioContext, AudioResult, CacheOutcome, FrameRejection, Generation,
         InferenceOutput, InputFrame, InputOutcome, PrefixState, SessionId, WorkerId,
@@ -37,6 +38,7 @@ pub(crate) enum WorkerCommand {
         generation: Generation,
         input: InputFrame,
         reply: oneshot::Sender<InputOutcome>,
+        routed_at: Instant,
     },
     RemoveSession {
         session_id: SessionId,
@@ -124,6 +126,7 @@ impl Worker {
             jobs.send(DeviceJob {
                 work: DeviceWork::Probe,
                 latency: self.configuration.inference_latency,
+                submitted_at: Instant::now(),
             })
             .await
             .expect("device is running");
@@ -167,7 +170,7 @@ impl Worker {
                 }
                 _ = tokio::time::sleep_until(next_probe), if !self.active_device && self.sessions.is_empty() => {
                     self.active_device = true;
-                    jobs.send(DeviceJob { work: DeviceWork::Probe, latency: self.base_latency() }).await.expect("device is running");
+                    jobs.send(DeviceJob { work: DeviceWork::Probe, latency: self.base_latency(), submitted_at: Instant::now() }).await.expect("device is running");
                     next_probe = Instant::now() + self.configuration.probe_interval;
                 }
             }
@@ -293,7 +296,11 @@ impl Worker {
                 generation,
                 input,
                 reply,
-            } => self.queue_input(session_id, generation, input, reply).await,
+                routed_at,
+            } => {
+                self.queue_input(session_id, generation, input, reply, routed_at)
+                    .await
+            }
             WorkerCommand::RemoveSession {
                 session_id,
                 generation,
@@ -353,7 +360,13 @@ impl Worker {
         generation: Generation,
         input: InputFrame,
         reply: oneshot::Sender<InputOutcome>,
+        routed_at: Instant,
     ) {
+        let received_at = Instant::now();
+        self.measurements
+            .profile
+            .mailbox
+            .record(received_at - routed_at);
         let Some(session) = self.sessions.get(&session_id) else {
             let _ = reply.send(InputOutcome::Rejected(FrameRejection::UnknownSession));
             return;
@@ -445,6 +458,11 @@ impl Worker {
             return;
         }
         let prefix = prior_prefix.append(&input.packet.payload);
+        let queued_at = Instant::now();
+        self.measurements
+            .profile
+            .validation
+            .record(queued_at - received_at);
         let session = self
             .sessions
             .get_mut(&session_id)
@@ -458,6 +476,9 @@ impl Worker {
                 cache,
                 replay_duration,
                 reply,
+                routed_at,
+                received_at,
+                queued_at,
             },
             queued_at: Instant::now(),
         });
@@ -516,6 +537,10 @@ impl Worker {
                 .unwrap_or(pending.item.input.deadline)
                 .min(pending.item.input.deadline);
             if Instant::now() + projected > batch_deadline {
+                self.measurements
+                    .profile
+                    .rejected_queue_delay
+                    .record(pending.item.input.timestamp.elapsed());
                 self.reject(
                     selected.session_id,
                     pending.item.reply,
@@ -542,6 +567,7 @@ impl Worker {
         jobs.send(DeviceJob {
             latency: self.base_latency() + replay,
             work: DeviceWork::Inference(items),
+            submitted_at: Instant::now(),
         })
         .await
         .expect("device is running");
@@ -549,6 +575,10 @@ impl Worker {
     fn complete(&mut self, result: DeviceResult) {
         self.active_device = false;
         let inference_latency = result.completed_at.duration_since(result.started_at);
+        self.measurements
+            .profile
+            .sleep_overshoot
+            .record(inference_latency.saturating_sub(result.requested_latency));
         match result.work {
             DeviceWork::Probe => {
                 self.estimator.observe(inference_latency);
@@ -569,6 +599,24 @@ impl Worker {
                 self.estimator
                     .observe(inference_latency.saturating_sub(replay));
                 for item in items {
+                    let handled_at = Instant::now();
+                    let timings = PacketTimings {
+                        ingress: item.routed_at - item.input.timestamp,
+                        worker_mailbox: item.received_at - item.routed_at,
+                        validation: item.queued_at - item.received_at,
+                        batch_wait: result.submitted_at - item.queued_at,
+                        device_dispatch: result.started_at - result.submitted_at,
+                        device_execution: inference_latency,
+                        result_delivery: handled_at - result.completed_at,
+                        gateway_return: Duration::ZERO,
+                    };
+                    self.measurements.profile.record(SlowWorkerPacket {
+                        session_id: item.session_id,
+                        sequence: item.input.packet.sequence,
+                        elapsed_secs: handled_at.duration_since(self.epoch).as_secs_f64(),
+                        deadline_exceeded: handled_at > item.input.deadline,
+                        timings,
+                    });
                     let Some(session) = self
                         .sessions
                         .get_mut(&item.session_id)
@@ -619,6 +667,7 @@ impl Worker {
                             payload: item.input.packet.payload,
                             prefix: item.prefix,
                             cache: item.cache,
+                            timings: Box::new(timings),
                         },
                     };
                     if item.reply.send(InputOutcome::Processed(output)).is_ok() {

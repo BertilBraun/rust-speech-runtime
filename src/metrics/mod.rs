@@ -3,6 +3,9 @@ use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+pub mod profile;
+use profile::{RuntimeLagReport, SlowWorkerPacket, WorkerProfile, WorkerProfileReport};
+
 pub(crate) struct LatencyHistogram(Histogram<u64>);
 impl Default for LatencyHistogram {
     fn default() -> Self {
@@ -86,6 +89,8 @@ pub(crate) struct ManagerMeasurements {
     pub terminated_sessions: u64,
     pub worker_channel_saturation: u64,
     pub rejected_frames: u64,
+    pub ingress_delay: LatencyHistogram,
+    pub control_duration: LatencyHistogram,
 }
 pub(crate) struct WorkerMeasurements {
     pub worker_id: WorkerId,
@@ -102,6 +107,7 @@ pub(crate) struct WorkerMeasurements {
     pub end_to_end_latency: LatencyHistogram,
     pub deadline_lateness: LatencyHistogram,
     pub calibration_latency: LatencyHistogram,
+    pub profile: WorkerProfile,
 }
 impl WorkerMeasurements {
     pub(crate) fn new(worker_id: WorkerId) -> Self {
@@ -120,6 +126,7 @@ impl WorkerMeasurements {
             end_to_end_latency: LatencyHistogram::default(),
             deadline_lateness: LatencyHistogram::default(),
             calibration_latency: LatencyHistogram::default(),
+            profile: WorkerProfile::default(),
         }
     }
 }
@@ -138,9 +145,12 @@ pub struct WorkerReport {
     pub queue_delay: LatencyDistribution,
     pub inference_latency: LatencyDistribution,
     pub calibration_latency: LatencyDistribution,
+    pub profile: WorkerProfileReport,
+    pub slowest_packets: Vec<SlowWorkerPacket>,
 }
 #[derive(Debug, Serialize)]
 pub struct Report {
+    pub runtime_lag: RuntimeLagReport,
     pub elapsed_secs: f64,
     pub active_sessions_at_shutdown: usize,
     pub peak_active_sessions: usize,
@@ -160,6 +170,8 @@ pub struct Report {
     pub inference_latency: LatencyDistribution,
     pub end_to_end_latency: LatencyDistribution,
     pub deadline_lateness: LatencyDistribution,
+    pub ingress_delay: LatencyDistribution,
+    pub control_duration: LatencyDistribution,
     pub workers: Vec<WorkerReport>,
 }
 impl Report {
@@ -170,6 +182,7 @@ impl Report {
         ingress_rejections: u64,
         elapsed: Duration,
         batch_size: usize,
+        runtime_lag: RuntimeLagReport,
     ) -> Self {
         let mut counters = InferenceCounters::default();
         let mut queue_delay = LatencyHistogram::default();
@@ -193,6 +206,7 @@ impl Report {
             .map(|worker| worker.elapsed.as_secs_f64())
             .sum();
         Self {
+            runtime_lag,
             elapsed_secs: elapsed.as_secs_f64(),
             active_sessions_at_shutdown: manager.active_sessions,
             peak_active_sessions: manager.peak_active_sessions,
@@ -221,6 +235,8 @@ impl Report {
             inference_latency: inference_latency.summary(),
             end_to_end_latency: end_to_end_latency.summary(),
             deadline_lateness: deadline_lateness.summary(),
+            ingress_delay: manager.ingress_delay.summary(),
+            control_duration: manager.control_duration.summary(),
             workers: workers
                 .into_iter()
                 .map(|worker| WorkerReport {
@@ -243,6 +259,8 @@ impl Report {
                     queue_delay: worker.queue_delay.summary(),
                     inference_latency: worker.inference_latency.summary(),
                     calibration_latency: worker.calibration_latency.summary(),
+                    profile: worker.profile.report(),
+                    slowest_packets: worker.profile.slowest_packets,
                 })
                 .collect(),
         }
