@@ -5,7 +5,7 @@ use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use voice_scheduler::{
-    config::{RuntimeConfig, WorkerSlowdown},
+    config::{DeviceWait, RuntimeConfig, WorkerSlowdown},
     simulation::{self, ArrivalPhase, SimulationConfig, SimulationReport},
     transport::{Gateway, GatewayConfig, GatewayReport},
 };
@@ -48,6 +48,8 @@ struct RuntimeArguments {
     #[arg(long)]
     inference_ms: Option<u64>,
     #[arg(long)]
+    device_wait: Option<DeviceWait>,
+    #[arg(long)]
     deadline_ms: Option<u64>,
     #[arg(long)]
     batch_wait_ms: Option<u64>,
@@ -77,6 +79,9 @@ impl RuntimeArguments {
         }
         if let Some(value) = self.inference_ms {
             configuration.inference_latency = Duration::from_millis(value);
+        }
+        if let Some(value) = self.device_wait {
+            configuration.device_wait = value;
         }
         if let Some(value) = self.deadline_ms {
             configuration.packet_deadline = Duration::from_millis(value);

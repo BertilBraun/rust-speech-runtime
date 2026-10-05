@@ -15,6 +15,7 @@ pub struct PacketTimings {
     pub batch_wait: Duration,
     pub device_dispatch: Duration,
     pub device_execution: Duration,
+    pub host_completion_delay: Duration,
     pub result_delivery: Duration,
     pub gateway_return: Duration,
 }
@@ -26,6 +27,7 @@ impl PacketTimings {
             + self.batch_wait
             + self.device_dispatch
             + self.device_execution
+            + self.host_completion_delay
             + self.result_delivery
             + self.gateway_return
     }

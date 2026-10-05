@@ -100,6 +100,7 @@ pub(crate) struct WorkerMeasurements {
     pub peak_sessions: usize,
     pub counters: InferenceCounters,
     pub busy_time: Duration,
+    pub occupied_time: Duration,
     pub elapsed: Duration,
     pub batch_sizes: Histogram<u64>,
     pub queue_delay: LatencyHistogram,
@@ -119,6 +120,7 @@ impl WorkerMeasurements {
             peak_sessions: 0,
             counters: InferenceCounters::default(),
             busy_time: Duration::ZERO,
+            occupied_time: Duration::ZERO,
             elapsed: Duration::ZERO,
             batch_sizes: Histogram::new(3).expect("valid precision"),
             queue_delay: LatencyHistogram::default(),
@@ -142,6 +144,7 @@ pub struct WorkerReport {
     pub batch_size_p95: u64,
     pub batch_fill_ratio: f64,
     pub utilization: f64,
+    pub worker_occupancy: f64,
     pub queue_delay: LatencyDistribution,
     pub inference_latency: LatencyDistribution,
     pub calibration_latency: LatencyDistribution,
@@ -165,6 +168,7 @@ pub struct Report {
     pub mean_batch_size: f64,
     pub batch_fill_ratio: f64,
     pub worker_utilization: f64,
+    pub worker_occupancy: f64,
     pub deadline_miss_ratio: f64,
     pub channel_saturation_events: u64,
     pub queue_delay: LatencyDistribution,
@@ -208,6 +212,10 @@ impl Report {
             .iter()
             .map(|worker| worker.elapsed.as_secs_f64())
             .sum();
+        let occupied_secs: f64 = workers
+            .iter()
+            .map(|worker| worker.occupied_time.as_secs_f64())
+            .sum();
         Self {
             runtime_lag,
             profile: profile.report(),
@@ -234,6 +242,7 @@ impl Report {
             ),
             inference: counters,
             worker_utilization: ratio(busy_secs, worker_secs),
+            worker_occupancy: ratio(occupied_secs, worker_secs),
             channel_saturation_events: ingress_saturation + manager.worker_channel_saturation,
             queue_delay: queue_delay.summary(),
             inference_latency: inference_latency.summary(),
@@ -257,6 +266,10 @@ impl Report {
                     ),
                     utilization: ratio(
                         worker.busy_time.as_secs_f64(),
+                        worker.elapsed.as_secs_f64(),
+                    ),
+                    worker_occupancy: ratio(
+                        worker.occupied_time.as_secs_f64(),
                         worker.elapsed.as_secs_f64(),
                     ),
                     inference: worker.counters,

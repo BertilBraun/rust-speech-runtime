@@ -120,8 +120,9 @@ impl Worker {
     ) -> WorkerMeasurements {
         let (jobs, job_mailbox) = mpsc::channel(1);
         let (device_results, mut results) = mpsc::channel(1);
+        let wait = self.configuration.device_wait;
         let device =
-            tokio::task::spawn_blocking(move || mock_gpu::run(job_mailbox, device_results));
+            tokio::task::spawn_blocking(move || mock_gpu::run(job_mailbox, device_results, wait));
         for _ in 0..self.configuration.calibration_samples {
             jobs.send(DeviceJob {
                 work: DeviceWork::Probe,
@@ -131,11 +132,9 @@ impl Worker {
             .await
             .expect("device is running");
             let result = results.recv().await.expect("probe result");
-            let elapsed = result.completed_at.duration_since(result.started_at);
+            let elapsed = result.observed_at.duration_since(result.started_at);
             self.estimator.observe(elapsed);
-            self.measurements
-                .calibration_latency
-                .record(result.completed_at.duration_since(result.started_at));
+            self.measurements.calibration_latency.record(elapsed);
         }
         self.epoch = Instant::now();
         self.refresh_capacity();
@@ -575,13 +574,11 @@ impl Worker {
     fn complete(&mut self, result: DeviceResult) {
         self.active_device = false;
         let inference_latency = result.completed_at.duration_since(result.started_at);
-        self.measurements
-            .profile
-            .sleep_overshoot
-            .record(inference_latency.saturating_sub(result.requested_latency));
+        let host_wait = result.observed_at.duration_since(result.completed_at);
+        self.measurements.profile.sleep_overshoot.record(host_wait);
         match result.work {
             DeviceWork::Probe => {
-                self.estimator.observe(inference_latency);
+                self.estimator.observe(inference_latency + host_wait);
                 self.refresh_capacity();
             }
             DeviceWork::Inference(items) => {
@@ -592,12 +589,13 @@ impl Worker {
                     .record(items.len() as u64)
                     .expect("bounded batch size");
                 self.measurements.busy_time += inference_latency;
+                self.measurements.occupied_time += inference_latency + host_wait;
                 self.measurements
                     .inference_latency
                     .record(inference_latency);
                 let replay: Duration = items.iter().map(|item| item.replay_duration).sum();
                 self.estimator
-                    .observe(inference_latency.saturating_sub(replay));
+                    .observe((inference_latency + host_wait).saturating_sub(replay));
                 for item in items {
                     let handled_at = Instant::now();
                     let timings = PacketTimings {
@@ -607,7 +605,8 @@ impl Worker {
                         batch_wait: result.submitted_at - item.queued_at,
                         device_dispatch: result.started_at - result.submitted_at,
                         device_execution: inference_latency,
-                        result_delivery: handled_at - result.completed_at,
+                        host_completion_delay: host_wait,
+                        result_delivery: handled_at - result.observed_at,
                         gateway_return: Duration::ZERO,
                     };
                     self.measurements.profile.record(SlowWorkerPacket {
@@ -660,7 +659,7 @@ impl Worker {
                     let output = InferenceOutput {
                         session_id: item.session_id,
                         input_timestamp: item.input.timestamp,
-                        completed_at: result.completed_at,
+                        completed_at: result.observed_at,
                         audio: AudioResult {
                             assignment: item.assignment,
                             sequence: item.input.packet.sequence,

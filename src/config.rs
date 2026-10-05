@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{str::FromStr, time::Duration};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -26,6 +26,7 @@ pub struct RuntimeConfig {
     pub packet_deadline: Duration,
     pub batch_size: usize,
     pub inference_latency: Duration,
+    pub device_wait: DeviceWait,
     pub max_batch_wait: Duration,
     pub max_sessions_per_worker: usize,
     pub cache_slots_per_worker: usize,
@@ -57,6 +58,7 @@ impl Default for RuntimeConfig {
             packet_deadline: Duration::from_millis(50),
             batch_size: 16,
             inference_latency: Duration::from_millis(12),
+            device_wait: DeviceWait::Sleep,
             max_batch_wait: Duration::from_millis(10),
             max_sessions_per_worker: 52,
             cache_slots_per_worker: 64,
@@ -80,8 +82,74 @@ impl Default for RuntimeConfig {
 #[derive(Debug, Error)]
 #[error("invalid configuration: {0}")]
 pub struct ConfigError(pub String);
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub enum DeviceWait {
+    #[default]
+    Sleep,
+    Hybrid {
+        spin_tail: Duration,
+    },
+    Poll {
+        sleep_interval: Duration,
+    },
+}
+impl FromStr for DeviceWait {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value == "sleep" {
+            return Ok(Self::Sleep);
+        }
+        let (kind, interval) = value.split_once(':').ok_or_else(|| {
+            ConfigError("device wait must be sleep, hybrid:200us or poll:500ns".into())
+        })?;
+        let duration = if let Some(amount) = interval.strip_suffix("ns") {
+            Duration::from_nanos(
+                amount
+                    .parse()
+                    .map_err(|_| ConfigError("invalid nanoseconds".into()))?,
+            )
+        } else if let Some(amount) = interval.strip_suffix("us") {
+            Duration::from_micros(
+                amount
+                    .parse()
+                    .map_err(|_| ConfigError("invalid microseconds".into()))?,
+            )
+        } else {
+            return Err(ConfigError("device wait interval requires ns or us".into()));
+        };
+        match kind {
+            "hybrid" if !duration.is_zero() && duration <= Duration::from_millis(1) => {
+                Ok(Self::Hybrid {
+                    spin_tail: duration,
+                })
+            }
+            "poll" if !duration.is_zero() && duration <= Duration::from_millis(1) => {
+                Ok(Self::Poll {
+                    sleep_interval: duration,
+                })
+            }
+            _ => Err(ConfigError(
+                "device wait interval must be in (0, 1 ms]".into(),
+            )),
+        }
+    }
+}
 impl RuntimeConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        let wait_interval = match self.device_wait {
+            DeviceWait::Sleep => Duration::ZERO,
+            DeviceWait::Hybrid { spin_tail } => spin_tail,
+            DeviceWait::Poll { sleep_interval } => sleep_interval,
+        };
+        if !matches!(self.device_wait, DeviceWait::Sleep)
+            && (wait_interval.is_zero() || wait_interval > Duration::from_millis(1))
+        {
+            return Err(ConfigError(
+                "device wait interval must be in (0, 1 ms]".into(),
+            ));
+        }
         for (name, size) in [
             ("workers", self.workers),
             ("batch_size", self.batch_size),
