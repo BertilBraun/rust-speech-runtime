@@ -117,25 +117,28 @@ pub(super) fn run(
 }
 
 fn wait_until(deadline: Instant, strategy: DeviceWait) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return;
+    }
     match strategy {
-        DeviceWait::Sleep => std::thread::sleep(deadline.saturating_duration_since(Instant::now())),
+        DeviceWait::Sleep => std::thread::sleep(remaining),
         DeviceWait::Hybrid { spin_tail } => {
-            std::thread::sleep(
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .saturating_sub(spin_tail),
-            );
+            let sleeping = remaining.saturating_sub(spin_tail);
+            if !sleeping.is_zero() {
+                std::thread::sleep(sleeping);
+            }
             while Instant::now() < deadline {
                 std::hint::spin_loop();
             }
         }
-        DeviceWait::Poll { sleep_interval } => {
-            while Instant::now() < deadline {
-                std::thread::sleep(
-                    sleep_interval.min(deadline.saturating_duration_since(Instant::now())),
-                );
+        DeviceWait::Poll { sleep_interval } => loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-        }
+            std::thread::sleep(sleep_interval.min(remaining));
+        },
     }
 }
 

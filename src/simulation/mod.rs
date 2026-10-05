@@ -228,7 +228,10 @@ fn pace(
         if scheduled >= stop || cancellation.is_cancelled() {
             break;
         }
-        std::thread::sleep(scheduled.saturating_duration_since(std::time::Instant::now()));
+        let remaining = scheduled.saturating_duration_since(std::time::Instant::now());
+        if !remaining.is_zero() {
+            std::thread::sleep(remaining);
+        }
         let captured = std::time::Instant::now();
         if captured >= stop {
             break;
