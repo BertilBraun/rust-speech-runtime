@@ -1,6 +1,9 @@
 use crate::config::{DeviceWait, ThreadWait};
 use crate::metrics::cpu::{CpuUsage, DeviceCpuUsage};
-use crate::protocol::{Assignment, CacheOutcome, InputFrame, InputOutcome, PrefixState, SessionId};
+use crate::protocol::{
+    Assignment, CacheOutcome, InputOutcome, PacketSequence, PrefixState, SessionId,
+};
+use bytes::Bytes;
 use cpu_time::ThreadTime;
 use std::{
     sync::{Arc, OnceLock},
@@ -29,7 +32,10 @@ impl SessionCancellation {
 pub(super) struct WorkItem {
     pub session_id: SessionId,
     pub assignment: Assignment,
-    pub input: InputFrame,
+    pub timestamp: Instant,
+    pub deadline: Instant,
+    pub sequence: PacketSequence,
+    pub payload: Bytes,
     pub prefix: PrefixState,
     pub cache: CacheOutcome,
     pub replay_duration: Duration,
@@ -171,8 +177,7 @@ mod tests {
     use crate::{
         config::{DeviceWait, ThreadWait},
         protocol::{
-            Assignment, AudioContext, AudioPacket, CacheOutcome, Generation, InputFrame,
-            PacketSequence, PrefixState, SessionId, WorkerId,
+            Assignment, CacheOutcome, Generation, PacketSequence, PrefixState, SessionId, WorkerId,
         },
     };
     use bytes::Bytes;
@@ -191,15 +196,10 @@ mod tests {
                 worker_id: WorkerId(0),
                 generation: Generation(1),
             },
-            input: InputFrame {
-                timestamp: now,
-                deadline: now + Duration::from_secs(1),
-                packet: AudioPacket {
-                    sequence: PacketSequence(0),
-                    payload: Bytes::from_static(b"audio"),
-                    context: AudioContext::Cached(PrefixState::default()),
-                },
-            },
+            timestamp: now,
+            deadline: now + Duration::from_secs(1),
+            sequence: PacketSequence(0),
+            payload: Bytes::from_static(b"audio"),
             prefix: PrefixState::default(),
             cache: CacheOutcome::Hit,
             replay_duration: Duration::ZERO,

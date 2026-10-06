@@ -1,19 +1,16 @@
 use super::{
     cache::{CacheHandle, CachePool},
-    mock_gpu::{self, DeviceJob, DeviceResult, DeviceWork, SessionCancellation, WorkItem},
+    mailbox::{WorkerCommand, WorkerHandle},
+    mock_gpu::{self, DeviceJob, DeviceResult, DeviceWork, SessionCancellation},
     session::{SessionWork, WorkerSession},
 };
 use crate::{
     config::RuntimeConfig,
     metrics::WorkerMeasurements,
-    metrics::profile::{PacketTimings, SlowWorkerPacket},
-    protocol::{
-        Assignment, AudioContext, AudioResult, CacheOutcome, FrameRejection, Generation,
-        InferenceOutput, InputFrame, InputOutcome, PrefixState, SessionId, SessionLease, WorkerId,
-    },
+    protocol::{FrameRejection, InputOutcome, PrefixState, SessionId, SessionLease, WorkerId},
     scheduler::{
-        admission::{ServiceEstimator, WorkerStatus, session_limit},
-        deadline::{ReadySession, construct_batch},
+        admission::{ServiceEstimator, WorkerStatus},
+        deadline::ReadySession,
     },
 };
 use std::{
@@ -23,40 +20,14 @@ use std::{
 };
 use tokio::{
     sync::{mpsc, oneshot, watch},
-    task::JoinHandle,
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
-pub(crate) enum WorkerCommand {
-    AddSession {
-        session_id: SessionId,
-        assignment: Assignment,
-        reply: oneshot::Sender<bool>,
-    },
-    InputReady {
-        session_id: SessionId,
-        generation: Generation,
-        input: InputFrame,
-        reply: oneshot::Sender<InputOutcome>,
-        routed_at: Instant,
-    },
-    RemoveSession {
-        session_id: SessionId,
-        generation: Generation,
-        reply: oneshot::Sender<()>,
-    },
-    EvictCache {
-        session_id: SessionId,
-        generation: Generation,
-        reply: oneshot::Sender<bool>,
-    },
-}
-pub(crate) struct WorkerHandle {
-    pub commands: mpsc::Sender<WorkerCommand>,
-    pub status: watch::Receiver<WorkerStatus>,
-    pub task: JoinHandle<WorkerMeasurements>,
-}
+mod admission;
+mod input;
+mod scheduling;
+
 struct SubmittedBatch {
     submitted_at: Instant,
     latency: Duration,
@@ -122,23 +93,7 @@ impl Worker {
             mpsc::channel(self.configuration.device_queue_capacity + 1);
         let wait = self.configuration.device_wait;
         let device = mock_gpu::spawn(job_mailbox, device_results, wait);
-        for _ in 0..self.configuration.calibration_samples {
-            jobs.send(DeviceJob {
-                work: DeviceWork::Probe,
-                latency: self.configuration.inference_latency,
-                submitted_at: Instant::now(),
-            })
-            .await
-            .expect("device is running");
-            let result = results.recv().await.expect("probe result");
-            let received_at = Instant::now();
-            let elapsed = received_at.duration_since(result.started_at);
-            self.estimator
-                .observe(result.completed_at - result.started_at);
-            self.estimator
-                .observe_host_delay(received_at - result.completed_at);
-            self.measurements.calibration_latency.record(elapsed);
-        }
+        self.calibrate(&jobs, &mut results).await;
         self.epoch = Instant::now();
         self.refresh_capacity();
         self.measurements.initial_session_limit = self.admission_limit();
@@ -169,10 +124,16 @@ impl Worker {
                 result = results.recv(), if !self.submitted.is_empty() => {
                     self.complete(result.expect("device returns active work"));
                 }
-                permit = jobs.reserve(), if can_dispatch => self.dispatch_batch(permit.expect("device is running")),
+                permit = jobs.reserve(), if can_dispatch => {
+                    self.dispatch_batch(permit.expect("device is running"));
+                }
                 command = commands.recv() => {
-                    let Some(command) = command else { break; };
-                    if matches!(&command, WorkerCommand::InputReady { .. }) && !self.configuration.worker_input_delay.is_zero() {
+                    let Some(command) = command else {
+                        break;
+                    };
+                    if matches!(&command, WorkerCommand::InputReady { .. })
+                        && !self.configuration.worker_input_delay.is_zero()
+                    {
                         tokio::select! {
                             _ = cancellation.cancelled() => break,
                             _ = tokio::time::sleep(self.configuration.worker_input_delay) => {}
@@ -184,12 +145,57 @@ impl Worker {
                 _ = tokio::time::sleep_until(next_probe), if self.submitted.is_empty() && self.sessions.is_empty() => {
                     let submitted_at = Instant::now();
                     let latency = self.base_latency();
-                    jobs.send(DeviceJob { work: DeviceWork::Probe, latency, submitted_at }).await.expect("device is running");
+                    jobs.send(DeviceJob {
+                        work: DeviceWork::Probe,
+                        latency,
+                        submitted_at,
+                    })
+                    .await
+                    .expect("device is running");
                     self.track_submission(submitted_at, latency);
                     next_probe = Instant::now() + self.configuration.probe_interval;
                 }
             }
         }
+        self.drain(&mut commands, &mut results).await;
+        drop(jobs);
+        self.measurements.device_cpu = device.await.expect("mock device does not panic");
+        self.measurements.elapsed = Instant::now().duration_since(self.epoch);
+        self.measurements.final_session_limit = self.admission_limit();
+        self.measurements.service_time = self.projected_service_time();
+        self.measurements.host_delay = self.estimator.host_delay();
+        self.measurements.host_reserve = self.estimator.host_reserve();
+        self.measurements
+    }
+    async fn calibrate(
+        &mut self,
+        jobs: &mpsc::Sender<DeviceJob>,
+        results: &mut mpsc::Receiver<DeviceResult>,
+    ) {
+        for _ in 0..self.configuration.calibration_samples {
+            jobs.send(DeviceJob {
+                work: DeviceWork::Probe,
+                latency: self.configuration.inference_latency,
+                submitted_at: Instant::now(),
+            })
+            .await
+            .expect("device is running");
+            let result = results.recv().await.expect("probe result");
+            let received_at = Instant::now();
+            let elapsed = received_at.duration_since(result.started_at);
+            self.estimator
+                .observe(result.completed_at - result.started_at);
+            self.estimator
+                .observe_host_delay(received_at - result.completed_at);
+            self.measurements.calibration_latency.record(elapsed);
+        }
+    }
+
+    async fn drain(
+        &mut self,
+        commands: &mut mpsc::Receiver<WorkerCommand>,
+        results: &mut mpsc::Receiver<DeviceResult>,
+    ) {
         let sessions: Vec<SessionId> = self.sessions.keys().copied().collect();
         for session_id in sessions {
             self.terminate(session_id, FrameRejection::Cancelled);
@@ -214,98 +220,6 @@ impl Worker {
                 }
             }
         }
-        drop(jobs);
-        self.measurements.device_cpu = device.await.expect("mock device does not panic");
-        self.measurements.elapsed = Instant::now().duration_since(self.epoch);
-        self.measurements.final_session_limit = self.admission_limit();
-        self.measurements.service_time = self.projected_service_time();
-        self.measurements.host_delay = self.estimator.host_delay();
-        self.measurements.host_reserve = self.estimator.host_reserve();
-        self.measurements
-    }
-    fn base_latency(&self) -> Duration {
-        match &self.configuration.slowdown {
-            Some(slowdown) if Instant::now().duration_since(self.epoch) >= slowdown.after => {
-                slowdown.inference_latency
-            }
-            _ => self.configuration.inference_latency,
-        }
-    }
-    fn publish(&self) {
-        let sessions: HashSet<SessionId> = self.sessions.keys().copied().collect();
-        self.status.send_replace(WorkerStatus {
-            worker_id: self.measurements.worker_id,
-            sessions,
-            session_limit: self.admission_limit(),
-            service_time: self.projected_service_time(),
-        });
-    }
-    fn projected_device_time(&self) -> Duration {
-        self.estimator.device_time().max(self.base_latency())
-    }
-    fn projected_service_time(&self) -> Duration {
-        self.estimator.service_time().max(
-            self.base_latency()
-                .mul_f64(self.configuration.latency_safety_factor),
-        )
-    }
-    fn input_has_time_for_compute(&self, deadline: Instant, replay: Duration) -> bool {
-        Instant::now()
-            + self.projected_device_time()
-            + replay
-            + self.configuration.scheduling_margin
-            <= deadline + self.configuration.packet_lateness_grace
-    }
-    fn recovery_deadline(&self, deadline: Instant) -> Instant {
-        deadline
-            + (self.configuration.packet_recovery_budget() - self.configuration.packet_deadline)
-    }
-    fn input_has_time_for_recovery(&self, deadline: Instant) -> bool {
-        self.projected_device_time() <= self.configuration.compute_budget()
-            && Instant::now() + self.projected_device_time() + self.configuration.scheduling_margin
-                <= self.recovery_deadline(deadline)
-    }
-    fn admission_limit(&self) -> usize {
-        let now = Instant::now();
-        let mut queued = Duration::ZERO;
-        let mut ready_count: usize = 0;
-        let mut replay = Duration::ZERO;
-        for pending in self
-            .sessions
-            .values()
-            .filter_map(|session| session.work.ready())
-        {
-            queued = queued.max(now.duration_since(pending.queued_at));
-            ready_count += 1;
-            replay += pending.replay_duration;
-        }
-        let device_queue = self.submitted.back().map_or(Duration::ZERO, |batch| {
-            batch.expected_completion.saturating_duration_since(now)
-        });
-        let ready_compute = self
-            .projected_device_time()
-            .mul_f64(ready_count.div_ceil(self.configuration.batch_size) as f64)
-            + replay;
-        self.estimator.available_limit(
-            &self.configuration,
-            self.session_limit,
-            self.sessions.len(),
-            queued.max(device_queue + ready_compute),
-            self.base_latency(),
-        )
-    }
-    fn refresh_capacity(&mut self) {
-        self.session_limit = session_limit(&self.configuration, self.projected_service_time());
-        let mut sessions: Vec<SessionId> = self.sessions.keys().copied().collect();
-        sessions.sort_unstable();
-        while self.sessions.len() > self.session_limit {
-            self.measurements.counters.capacity_terminations += 1;
-            self.terminate(
-                sessions.pop().expect("excess sessions exist"),
-                FrameRejection::WorkerCapacityLost,
-            );
-        }
-        self.publish();
     }
     fn terminate(&mut self, session_id: SessionId, reason: FrameRejection) {
         if let Some(session) = self.sessions.remove(&session_id) {
@@ -431,488 +345,5 @@ impl Worker {
         self.terminate(session_id, reason);
         self.publish();
         let _ = reply.send(InputOutcome::Rejected(reason));
-    }
-    async fn queue_input(
-        &mut self,
-        session_id: SessionId,
-        generation: Generation,
-        input: InputFrame,
-        reply: oneshot::Sender<InputOutcome>,
-        routed_at: Instant,
-    ) {
-        let received_at = Instant::now();
-        self.measurements
-            .profile
-            .mailbox
-            .record(received_at - routed_at);
-        let Some(session) = self.sessions.get(&session_id) else {
-            let _ = reply.send(InputOutcome::Rejected(FrameRejection::UnknownSession));
-            return;
-        };
-        if session.assignment.generation != generation {
-            let _ = reply.send(InputOutcome::Rejected(FrameRejection::Cancelled));
-            return;
-        }
-        if !matches!(session.work, SessionWork::Idle) {
-            self.reject(session_id, reply, FrameRejection::Overloaded);
-            return;
-        }
-        if self.recovery_deadline(input.deadline) <= Instant::now() {
-            self.reject(session_id, reply, FrameRejection::DeadlineExceeded);
-            return;
-        }
-        if input.packet.sequence.0 != session.prefix.packets {
-            self.reject(session_id, reply, FrameRejection::InvalidSequence);
-            return;
-        }
-        let prior_prefix = session.prefix;
-        if prior_prefix.packets >= self.configuration.audio_limits.max_prefix_packets as u64
-            || prior_prefix.bytes + input.packet.payload.len() as u64
-                > self.configuration.audio_limits.max_prefix_bytes as u64
-        {
-            self.reject(session_id, reply, FrameRejection::PrefixCapacity);
-            return;
-        }
-        let replay_cost = self
-            .configuration
-            .replay_latency_per_packet
-            .mul_f64(prior_prefix.packets as f64);
-        let recovery_rejection = if replay_cost.is_zero() {
-            FrameRejection::DeadlineExceeded
-        } else {
-            FrameRejection::ReplayTooExpensive
-        };
-        let cache = match &input.packet.context {
-            AudioContext::Cached(expected) => {
-                if *expected != prior_prefix {
-                    self.reject(session_id, reply, FrameRejection::InvalidPrefix);
-                    return;
-                }
-                if self.cache.lookup(session.cache) != Some(prior_prefix) {
-                    self.measurements.counters.cache_misses += 1;
-                    if !self.input_has_time_for_compute(input.deadline, replay_cost) {
-                        self.reject(session_id, reply, recovery_rejection);
-                        return;
-                    }
-                    let _ = reply.send(InputOutcome::CacheMiss);
-                    return;
-                }
-                CacheOutcome::Hit
-            }
-            AudioContext::Replay(prefix) => {
-                if !self.input_has_time_for_compute(input.deadline, replay_cost) {
-                    self.reject(session_id, reply, recovery_rejection);
-                    return;
-                }
-                if prefix.0.len() > self.configuration.audio_limits.max_prefix_packets
-                    || prefix.byte_len() > self.configuration.audio_limits.max_prefix_bytes
-                    || prefix
-                        .0
-                        .iter()
-                        .any(|frame| frame.len() > self.configuration.audio_limits.max_frame_bytes)
-                {
-                    self.reject(session_id, reply, FrameRejection::PrefixCapacity);
-                    return;
-                }
-                let prefix = prefix.clone();
-                let state = tokio::task::spawn_blocking(move || prefix.state())
-                    .await
-                    .expect("prefix hashing does not panic");
-                if state != prior_prefix {
-                    self.reject(session_id, reply, FrameRejection::InvalidPrefix);
-                    return;
-                }
-                CacheOutcome::Replayed {
-                    packets: state.packets,
-                    bytes: state.bytes,
-                }
-            }
-        };
-        let replay_duration = match cache {
-            CacheOutcome::Hit => Duration::ZERO,
-            CacheOutcome::Replayed { .. } => replay_cost,
-        };
-        let has_time = match cache {
-            CacheOutcome::Hit => self.input_has_time_for_recovery(input.deadline),
-            CacheOutcome::Replayed { .. } => {
-                self.input_has_time_for_compute(input.deadline, replay_duration)
-            }
-        };
-        if !has_time {
-            self.reject(
-                session_id,
-                reply,
-                if replay_duration.is_zero() {
-                    FrameRejection::DeadlineExceeded
-                } else {
-                    FrameRejection::ReplayTooExpensive
-                },
-            );
-            return;
-        }
-        let prefix = prior_prefix.append(&input.packet.payload);
-        let queued_at = Instant::now();
-        self.measurements
-            .profile
-            .validation
-            .record(queued_at - received_at);
-        let session = self
-            .sessions
-            .get_mut(&session_id)
-            .expect("session remains owned during validation");
-        session.work = SessionWork::Ready(WorkItem {
-            session_id,
-            assignment: session.assignment,
-            input,
-            prefix,
-            cache,
-            replay_duration,
-            reply,
-            routed_at,
-            received_at,
-            queued_at,
-            cancellation: session.cancellation.clone(),
-        });
-        self.refresh_prepared();
-        self.publish();
-    }
-    fn refresh_prepared(&mut self) {
-        let started = Instant::now();
-        self.prepared = construct_batch(
-            self.sessions
-                .iter()
-                .filter_map(|(session_id, session)| {
-                    session.work.ready().map(|pending| ReadySession {
-                        session_id: *session_id,
-                        deadline: pending.input.deadline,
-                    })
-                })
-                .collect(),
-            self.configuration.batch_size,
-        );
-        if self
-            .submitted
-            .back()
-            .is_some_and(|batch| batch.expected_completion > started)
-            && !self.prepared.is_empty()
-        {
-            self.measurements.counters.prepared_while_running += 1;
-        }
-        self.measurements
-            .profile
-            .batch_preparation
-            .record(started.elapsed());
-    }
-    fn track_submission(&mut self, submitted_at: Instant, latency: Duration) {
-        let start = self.submitted.back().map_or(submitted_at, |batch| {
-            batch.expected_completion.max(submitted_at)
-        });
-        self.submitted.push_back(SubmittedBatch {
-            submitted_at,
-            latency,
-            expected_completion: start + latency,
-        });
-        self.measurements.peak_device_jobs =
-            self.measurements.peak_device_jobs.max(self.submitted.len());
-    }
-    fn next_wakeup(&self) -> Instant {
-        let now = Instant::now();
-        if self.prepared.is_empty()
-            || self.submitted.len() > self.configuration.device_queue_capacity
-        {
-            return now + self.configuration.session_timeout;
-        }
-        let completion_pending = self
-            .submitted
-            .front()
-            .is_some_and(|batch| batch.expected_completion <= now);
-        if self.prepared.len() == self.configuration.batch_size
-            || (!completion_pending
-                && self
-                    .sessions
-                    .values()
-                    .all(|session| !matches!(session.work, SessionWork::Idle)))
-        {
-            return now;
-        }
-        if let Some(previous) = self
-            .submitted
-            .back()
-            .filter(|batch| batch.expected_completion > now)
-        {
-            return previous.expected_completion - self.configuration.launch_ahead;
-        }
-        let mut count = 0;
-        let mut wakeup = now + self.configuration.session_timeout;
-        for pending in self
-            .sessions
-            .values()
-            .filter_map(|session| session.work.ready())
-        {
-            count += 1;
-            let latest = pending.input.deadline
-                - self.projected_device_time()
-                - pending.replay_duration
-                - self.configuration.scheduling_margin;
-            wakeup =
-                wakeup.min((pending.queued_at + self.configuration.max_batch_wait).min(latest));
-        }
-        if count >= self.configuration.batch_size || (count > 0 && count == self.sessions.len()) {
-            now
-        } else {
-            wakeup
-        }
-    }
-    fn idle_collection_expired(&self) -> bool {
-        let now = Instant::now();
-        self.sessions
-            .values()
-            .filter_map(|session| session.work.ready())
-            .any(|pending| {
-                now >= pending.queued_at + self.configuration.max_batch_wait
-                    || now
-                        + self.projected_device_time()
-                        + pending.replay_duration
-                        + self.configuration.scheduling_margin
-                        >= pending.input.deadline
-            })
-    }
-    fn dispatch_batch(&mut self, permit: mpsc::Permit<'_, DeviceJob>) {
-        let assembly_started = Instant::now();
-        let device_time = self.projected_device_time();
-        let selected = std::mem::take(&mut self.prepared);
-        let predicted_start = self.submitted.back().map_or(Instant::now(), |batch| {
-            batch.expected_completion.max(Instant::now())
-        });
-        let mut items = Vec::new();
-        let mut replay = Duration::ZERO;
-        let mut earliest_deadline = None;
-        for selected in selected {
-            let session = self
-                .sessions
-                .get_mut(&selected.session_id)
-                .expect("selected session exists");
-            let pending = session.work.ready().expect("pending frame exists");
-            let projected = device_time
-                + replay
-                + pending.replay_duration
-                + self.configuration.scheduling_margin;
-            let completion_deadline = pending.input.deadline
-                + match pending.cache {
-                    CacheOutcome::Hit => {
-                        self.configuration.packet_recovery_budget()
-                            - self.configuration.packet_deadline
-                    }
-                    CacheOutcome::Replayed { .. } => self.configuration.packet_lateness_grace,
-                };
-            let batch_deadline = earliest_deadline
-                .unwrap_or(completion_deadline)
-                .min(completion_deadline);
-            let own_cost =
-                device_time + pending.replay_duration + self.configuration.scheduling_margin;
-            if predicted_start + own_cost > completion_deadline {
-                let pending = session.work.take_ready();
-                self.measurements
-                    .profile
-                    .rejected_queue_delay
-                    .record(pending.input.timestamp.elapsed());
-                self.reject(
-                    selected.session_id,
-                    pending.reply,
-                    if pending.replay_duration.is_zero() {
-                        FrameRejection::DeadlineExceeded
-                    } else {
-                        FrameRejection::ReplayTooExpensive
-                    },
-                );
-                continue;
-            }
-            if predicted_start + projected > batch_deadline {
-                continue;
-            }
-            let pending = session.work.take_ready();
-            replay += pending.replay_duration;
-            earliest_deadline = Some(batch_deadline);
-            self.sessions
-                .get_mut(&selected.session_id)
-                .expect("session exists")
-                .work = SessionWork::Submitted;
-            items.push(pending);
-        }
-        if items.is_empty() {
-            self.refresh_prepared();
-            return;
-        }
-        if self
-            .submitted
-            .back()
-            .is_some_and(|previous| previous.expected_completion > Instant::now())
-        {
-            self.measurements.counters.queued_batch_launches += 1;
-        }
-        let submitted_at = Instant::now();
-        let latency = self.base_latency() + replay;
-        self.measurements
-            .profile
-            .batch_assembly
-            .record(assembly_started.elapsed());
-        permit.send(DeviceJob {
-            latency,
-            work: DeviceWork::Inference(items),
-            submitted_at,
-        });
-        self.track_submission(submitted_at, latency);
-        self.refresh_prepared();
-        self.publish();
-    }
-    fn complete(&mut self, result: DeviceResult) {
-        self.submitted
-            .pop_front()
-            .expect("completion matches submitted work");
-        let mut completion = result.completed_at;
-        for batch in &mut self.submitted {
-            completion = completion.max(batch.submitted_at) + batch.latency;
-            batch.expected_completion = completion;
-        }
-        let inference_latency = result.completed_at.duration_since(result.started_at);
-        let host_wait = result.observed_at.duration_since(result.completed_at);
-        self.estimator
-            .observe_host_delay(Instant::now() - result.completed_at);
-        self.measurements
-            .profile
-            .host_completion_delay
-            .record(host_wait);
-        self.measurements.profile.host_device_wakeup.record(
-            result
-                .host_started_at
-                .saturating_duration_since(result.started_at),
-        );
-        match result.work {
-            DeviceWork::Probe => {
-                self.estimator.observe(inference_latency);
-                self.refresh_capacity();
-            }
-            DeviceWork::Inference(items) => {
-                if result.processed_frames > 0 {
-                    self.measurements.counters.batches += 1;
-                    self.measurements.counters.processed_frames += result.processed_frames as u64;
-                    self.measurements
-                        .batch_sizes
-                        .record(result.processed_frames as u64)
-                        .expect("bounded batch size");
-                }
-                self.measurements.busy_time += inference_latency;
-                let occupied_start = self
-                    .measurements
-                    .occupied_until
-                    .map_or(result.started_at, |previous| {
-                        previous.max(result.started_at)
-                    });
-                self.measurements.occupied_time +=
-                    result.observed_at.saturating_duration_since(occupied_start);
-                self.measurements.occupied_until = Some(result.observed_at);
-                if result.processed_frames > 0 {
-                    self.measurements
-                        .inference_latency
-                        .record(inference_latency);
-                }
-                if result.processed_frames > 0 {
-                    self.estimator
-                        .observe(inference_latency - result.replay_duration);
-                }
-                for item in items {
-                    if let Some(cache) = self.retired_cache.remove(&SessionLease {
-                        session_id: item.session_id,
-                        generation: item.assignment.generation,
-                    }) {
-                        self.cache.free(cache);
-                    }
-                    let handled_at = Instant::now();
-                    let timings = PacketTimings {
-                        ingress: item.routed_at - item.input.timestamp,
-                        worker_mailbox: item.received_at - item.routed_at,
-                        validation: item.queued_at - item.received_at,
-                        scheduler_queue: result.submitted_at - item.queued_at,
-                        device_queue: result.started_at - result.submitted_at,
-                        device_execution: inference_latency,
-                        host_completion_delay: host_wait,
-                        result_delivery: handled_at - result.observed_at,
-                        gateway_return: Duration::ZERO,
-                    };
-                    self.measurements.profile.record(SlowWorkerPacket {
-                        session_id: item.session_id,
-                        sequence: item.input.packet.sequence,
-                        elapsed_secs: handled_at.duration_since(self.epoch).as_secs_f64(),
-                        deadline_exceeded: handled_at > item.input.deadline,
-                        timings,
-                    });
-                    let Some(session) = self
-                        .sessions
-                        .get_mut(&item.session_id)
-                        .filter(|session| session.assignment == item.assignment)
-                    else {
-                        self.measurements.counters.stale_results += 1;
-                        self.measurements.counters.rejected_frames += 1;
-                        let _ = item
-                            .reply
-                            .send(InputOutcome::Rejected(FrameRejection::Cancelled));
-                        continue;
-                    };
-                    session.work = SessionWork::Idle;
-                    self.measurements
-                        .queue_delay
-                        .record(result.started_at.duration_since(item.input.timestamp));
-                    self.measurements
-                        .end_to_end_latency
-                        .record(Instant::now().duration_since(item.input.timestamp));
-                    if Instant::now() > item.input.deadline {
-                        self.measurements.counters.deadline_misses += 1;
-                        self.measurements
-                            .deadline_lateness
-                            .record(Instant::now().duration_since(item.input.deadline));
-                    }
-                    if Instant::now()
-                        > item.input.deadline
-                            + (self.configuration.packet_recovery_budget()
-                                - self.configuration.packet_deadline)
-                    {
-                        self.reject(
-                            item.session_id,
-                            item.reply,
-                            FrameRejection::DeadlineExceeded,
-                        );
-                        continue;
-                    }
-                    session.prefix = item.prefix;
-                    self.cache.update(session.cache, item.prefix);
-                    match item.cache {
-                        CacheOutcome::Hit => self.measurements.counters.cache_hits += 1,
-                        CacheOutcome::Replayed { packets, bytes } => {
-                            self.measurements.counters.replayed_packets += packets;
-                            self.measurements.counters.replayed_bytes += bytes;
-                        }
-                    }
-                    let output = InferenceOutput {
-                        session_id: item.session_id,
-                        input_timestamp: item.input.timestamp,
-                        completed_at: result.observed_at,
-                        audio: AudioResult {
-                            assignment: item.assignment,
-                            sequence: item.input.packet.sequence,
-                            payload: item.input.packet.payload,
-                            prefix: item.prefix,
-                            cache: item.cache,
-                            timings: Box::new(timings),
-                        },
-                    };
-                    if item.reply.send(InputOutcome::Processed(output)).is_ok() {
-                        self.measurements.counters.delivered_frames += 1;
-                    } else {
-                        self.terminate(item.session_id, FrameRejection::Cancelled);
-                    }
-                }
-                self.refresh_capacity();
-            }
-        }
     }
 }
