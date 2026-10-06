@@ -161,6 +161,67 @@ async fn websocket_multi_turn_preserves_assignment_and_exact_archive() {
 }
 
 #[tokio::test]
+async fn application_close_waits_only_for_bounded_peer_acknowledgement() {
+    let backend = Fixture::start(1).await;
+    let gateway = TestGateway::start(
+        backend.config(),
+        GatewayConfig {
+            write_timeout: Duration::from_millis(100),
+            ..gateway_config()
+        },
+    )
+    .await;
+    let (mut websocket, _) = connect_async(&gateway.url).await.expect("connected");
+    websocket
+        .send(Message::Text(
+            serde_json::to_string(&voice_scheduler::transport::wire::ClientControl::Open {
+                session_id: SessionId("unacknowledged-close".into()),
+            })
+            .expect("open JSON")
+            .into(),
+        ))
+        .await
+        .expect("open sent");
+    let opened = websocket
+        .next()
+        .await
+        .expect("opened frame")
+        .expect("opened message");
+    assert!(matches!(opened, Message::Text(_)));
+    websocket
+        .send(Message::Text(
+            serde_json::to_string(&voice_scheduler::transport::wire::ClientControl::Close)
+                .expect("close JSON")
+                .into(),
+        ))
+        .await
+        .expect("close sent");
+    let closed = websocket
+        .next()
+        .await
+        .expect("closed frame")
+        .expect("closed message");
+    assert!(matches!(closed, Message::Text(_)));
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let report = gateway.shutdown().await;
+    assert_eq!(report.failed_connections, 1);
+    assert_eq!(report.runtime.active_sessions, 0);
+}
+
+#[tokio::test]
+async fn peer_initiated_websocket_close_finishes_without_second_handshake() {
+    let backend = Fixture::start(1).await;
+    let gateway = TestGateway::start(backend.config(), gateway_config()).await;
+    let (mut websocket, _) = connect_async(&gateway.url).await.expect("connected");
+    websocket.close(None).await.expect("close sent");
+    timeout(Duration::from_secs(1), websocket.next())
+        .await
+        .expect("peer acknowledgement bounded");
+    let report = gateway.shutdown().await;
+    assert_eq!(report.failed_connections, 0);
+}
+
+#[tokio::test]
 async fn rejected_open_completes_websocket_close_without_connection_failure() {
     let backend = Fixture::start(1).await;
     let gateway = TestGateway::start(

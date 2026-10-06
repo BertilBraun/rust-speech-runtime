@@ -44,6 +44,7 @@ struct Connection {
     configuration: Arc<GatewayConfig>,
     cancellation: CancellationToken,
     created_unix_ms: u128,
+    application_close_requested: bool,
 }
 
 pub(crate) async fn run(
@@ -88,6 +89,7 @@ pub(crate) async fn run(
         configuration,
         cancellation,
         created_unix_ms: unix_milliseconds(),
+        application_close_requested: false,
     };
     let result = connection.serve().await;
     let mut report = ConnectionReport {
@@ -136,6 +138,16 @@ pub(crate) async fn run(
             eprintln!("WebSocket writer failed: {failure:?}");
         }
     }
+    if connection.application_close_requested
+        && let Err(error) = finish_close_handshake(
+            &mut connection.reader,
+            connection.configuration.write_timeout,
+        )
+        .await
+    {
+        report.failed = true;
+        eprintln!("WebSocket close handshake failed: {error}");
+    }
     report
 }
 
@@ -167,7 +179,10 @@ impl Connection {
         let result = match message {
             Message::Close(_) => return Ok(false),
             Message::Text(text) => match serde_json::from_str::<ClientControl>(&text) {
-                Ok(ClientControl::Close) => return Ok(false),
+                Ok(ClientControl::Close) => {
+                    self.application_close_requested = true;
+                    return Ok(false);
+                }
                 Ok(control) => self.control(control).await,
                 Err(error) => Err(error.into()),
             },
@@ -241,6 +256,23 @@ impl Connection {
         self.outbound
             .try_send(event)
             .map_err(|_| GatewayError::SlowConsumer)
+    }
+}
+
+async fn finish_close_handshake(
+    reader: &mut SplitStream<WebSocketStream<TcpStream>>,
+    write_timeout: std::time::Duration,
+) -> Result<(), GatewayError> {
+    let deadline = Instant::now() + write_timeout;
+    loop {
+        let incoming = tokio::time::timeout_at(deadline, reader.next())
+            .await
+            .map_err(|_| GatewayError::Timeout)?;
+        match incoming {
+            None | Some(Ok(Message::Close(_))) => return Ok(()),
+            Some(Err(error)) => return Err(error.into()),
+            Some(Ok(_)) => {}
+        }
     }
 }
 
