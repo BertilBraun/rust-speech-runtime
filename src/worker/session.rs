@@ -3,28 +3,22 @@ use super::{
     mock_gpu::{SessionCancellation, WorkItem},
 };
 use crate::protocol::{Assignment, PrefixState};
-use tokio::time::Instant;
-
-pub(super) struct PendingFrame {
-    pub item: WorkItem,
-    pub queued_at: Instant,
-}
 
 // One inline frame per bounded session avoids allocating a box on every audio packet.
 #[allow(clippy::large_enum_variant)]
 pub(super) enum SessionWork {
     Idle,
-    Ready(PendingFrame),
+    Ready(WorkItem),
     Submitted,
 }
 impl SessionWork {
-    pub(super) fn ready(&self) -> Option<&PendingFrame> {
+    pub(super) fn ready(&self) -> Option<&WorkItem> {
         match self {
             Self::Ready(frame) => Some(frame),
             Self::Idle | Self::Submitted => None,
         }
     }
-    pub(super) fn take_ready(&mut self) -> PendingFrame {
+    pub(super) fn take_ready(&mut self) -> WorkItem {
         let Self::Ready(frame) = std::mem::replace(self, Self::Idle) else {
             panic!("only selected ready frames are consumed");
         };

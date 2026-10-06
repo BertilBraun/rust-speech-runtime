@@ -1,7 +1,7 @@
 use super::{
     cache::{CacheHandle, CachePool},
     mock_gpu::{self, DeviceJob, DeviceResult, DeviceWork, SessionCancellation, WorkItem},
-    session::{PendingFrame, SessionWork, WorkerSession},
+    session::{SessionWork, WorkerSession},
 };
 use crate::{
     config::RuntimeConfig,
@@ -131,11 +131,12 @@ impl Worker {
             .await
             .expect("device is running");
             let result = results.recv().await.expect("probe result");
-            let elapsed = result.observed_at.duration_since(result.started_at);
+            let received_at = Instant::now();
+            let elapsed = received_at.duration_since(result.started_at);
             self.estimator
                 .observe(result.completed_at - result.started_at);
             self.estimator
-                .observe_host_delay(result.observed_at - result.completed_at);
+                .observe_host_delay(received_at - result.completed_at);
             self.measurements.calibration_latency.record(elapsed);
         }
         self.epoch = Instant::now();
@@ -209,6 +210,7 @@ impl Worker {
         self.measurements.final_session_limit = self.admission_limit();
         self.measurements.service_time = self.estimator.service_time();
         self.measurements.host_delay = self.estimator.host_delay();
+        self.measurements.host_reserve = self.estimator.host_reserve();
         self.measurements
     }
     fn base_latency(&self) -> Duration {
@@ -265,7 +267,7 @@ impl Worker {
             let submitted = matches!(session.work, SessionWork::Submitted);
             if let SessionWork::Ready(pending) = session.work {
                 self.measurements.counters.rejected_frames += 1;
-                let _ = pending.item.reply.send(InputOutcome::Rejected(reason));
+                let _ = pending.reply.send(InputOutcome::Rejected(reason));
             }
             if submitted {
                 let prior = self.retired_cache.insert(
@@ -497,21 +499,18 @@ impl Worker {
             .sessions
             .get_mut(&session_id)
             .expect("session remains owned during validation");
-        session.work = SessionWork::Ready(PendingFrame {
-            item: WorkItem {
-                session_id,
-                assignment: session.assignment,
-                input,
-                prefix,
-                cache,
-                replay_duration,
-                reply,
-                routed_at,
-                received_at,
-                queued_at,
-                cancellation: session.cancellation.clone(),
-            },
-            queued_at: Instant::now(),
+        session.work = SessionWork::Ready(WorkItem {
+            session_id,
+            assignment: session.assignment,
+            input,
+            prefix,
+            cache,
+            replay_duration,
+            reply,
+            routed_at,
+            received_at,
+            queued_at,
+            cancellation: session.cancellation.clone(),
         });
         self.refresh_prepared();
         self.publish();
@@ -524,13 +523,18 @@ impl Worker {
                 .filter_map(|(session_id, session)| {
                     session.work.ready().map(|pending| ReadySession {
                         session_id: *session_id,
-                        deadline: pending.item.input.deadline,
+                        deadline: pending.input.deadline,
                     })
                 })
                 .collect(),
             self.configuration.batch_size,
         );
-        if !self.submitted.is_empty() && !self.prepared.is_empty() {
+        if self
+            .submitted
+            .back()
+            .is_some_and(|batch| batch.expected_completion > started)
+            && !self.prepared.is_empty()
+        {
             self.measurements.counters.prepared_while_running += 1;
         }
         self.measurements
@@ -585,9 +589,9 @@ impl Worker {
             .filter_map(|session| session.work.ready())
         {
             count += 1;
-            let latest = pending.item.input.deadline
+            let latest = pending.input.deadline
                 - self.projected_device_time()
-                - pending.item.replay_duration
+                - pending.replay_duration
                 - self.configuration.scheduling_margin;
             wakeup =
                 wakeup.min((pending.queued_at + self.configuration.max_batch_wait).min(latest));
@@ -607,9 +611,9 @@ impl Worker {
                 now >= pending.queued_at + self.configuration.max_batch_wait
                     || now
                         + self.projected_device_time()
-                        + pending.item.replay_duration
+                        + pending.replay_duration
                         + self.configuration.scheduling_margin
-                        >= pending.item.input.deadline
+                        >= pending.input.deadline
             })
     }
     fn dispatch_batch(&mut self, permit: mpsc::Permit<'_, DeviceJob>) {
@@ -630,23 +634,23 @@ impl Worker {
             let pending = session.work.ready().expect("pending frame exists");
             let projected = device_time
                 + replay
-                + pending.item.replay_duration
+                + pending.replay_duration
                 + self.configuration.scheduling_margin;
             let batch_deadline = earliest_deadline
-                .unwrap_or(pending.item.input.deadline)
-                .min(pending.item.input.deadline);
+                .unwrap_or(pending.input.deadline)
+                .min(pending.input.deadline);
             let own_cost =
-                device_time + pending.item.replay_duration + self.configuration.scheduling_margin;
-            if predicted_start + own_cost > pending.item.input.deadline {
+                device_time + pending.replay_duration + self.configuration.scheduling_margin;
+            if predicted_start + own_cost > pending.input.deadline {
                 let pending = session.work.take_ready();
                 self.measurements
                     .profile
                     .rejected_queue_delay
-                    .record(pending.item.input.timestamp.elapsed());
+                    .record(pending.input.timestamp.elapsed());
                 self.reject(
                     selected.session_id,
-                    pending.item.reply,
-                    if pending.item.replay_duration.is_zero() {
+                    pending.reply,
+                    if pending.replay_duration.is_zero() {
                         FrameRejection::DeadlineExceeded
                     } else {
                         FrameRejection::ReplayTooExpensive
@@ -658,13 +662,13 @@ impl Worker {
                 continue;
             }
             let pending = session.work.take_ready();
-            replay += pending.item.replay_duration;
+            replay += pending.replay_duration;
             earliest_deadline = Some(batch_deadline);
             self.sessions
                 .get_mut(&selected.session_id)
                 .expect("session exists")
                 .work = SessionWork::Submitted;
-            items.push(pending.item);
+            items.push(pending);
         }
         if items.is_empty() {
             self.refresh_prepared();
@@ -702,7 +706,8 @@ impl Worker {
         }
         let inference_latency = result.completed_at.duration_since(result.started_at);
         let host_wait = result.observed_at.duration_since(result.completed_at);
-        self.estimator.observe_host_delay(host_wait);
+        self.estimator
+            .observe_host_delay(Instant::now() - result.completed_at);
         self.measurements
             .profile
             .host_completion_delay

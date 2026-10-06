@@ -53,6 +53,13 @@ impl ServiceEstimator {
         samples.sort_unstable();
         samples[(samples.len() * 95).div_ceil(100) - 1]
     }
+    pub(crate) fn host_reserve(&self) -> Duration {
+        self.host_samples
+            .iter()
+            .copied()
+            .max()
+            .expect("admission waits for host calibration")
+    }
     pub(crate) fn available_limit(
         &self,
         configuration: &RuntimeConfig,
@@ -60,7 +67,7 @@ impl ServiceEstimator {
         active_sessions: usize,
         queue_delay: Duration,
     ) -> usize {
-        let host_delay = self.host_delay();
+        let host_delay = self.host_reserve();
         let available = capacity.min(session_limit_for_budget(
             configuration,
             configuration.compute_budget().saturating_sub(host_delay),
@@ -139,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn sustained_host_delay_pauses_admission_without_changing_device_capacity() {
+    fn host_spikes_pause_admission_without_changing_device_capacity() {
         let configuration = RuntimeConfig {
             max_sessions_per_worker: 48,
             ..RuntimeConfig::default()
@@ -152,7 +159,7 @@ mod tests {
         estimator.observe_host_delay(Duration::from_millis(20));
         assert_eq!(
             estimator.available_limit(&configuration, 48, 32, Duration::ZERO),
-            48
+            16
         );
         for _ in 0..3 {
             estimator.observe_host_delay(Duration::from_millis(20));
