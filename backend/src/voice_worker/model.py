@@ -147,13 +147,14 @@ class SpeechModel:
 
     def encode_audio(self, audio: Sequence[bytes]) -> tuple[tuple[Tensor, ...], StageTimer]:
         waveforms = [pcm_waveform(packet) for packet in audio]
-        timer = StageTimer(self.device)
         extracted = self.extractor(
             waveforms, sampling_rate=16000, return_tensors="pt", padding="max_length"
         )
-        timer.start()
         # BatchFeature's tensor map is the only SDK dictionary boundary in the serving path.
-        features = cast(Tensor, extracted["input_features"]).to(self.device, dtype=torch.bfloat16)
+        input_features = cast(Tensor, extracted["input_features"])
+        timer = StageTimer(self.device)
+        timer.start()
+        features = input_features.to(self.device, dtype=torch.bfloat16)
         output: BaseModelOutput = self.encoder(features, return_dict=True)
         projected = tuple(
             self.projector(

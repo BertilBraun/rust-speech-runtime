@@ -68,7 +68,7 @@ Session admission reserves the estimated maximum configured context's attention 
 
 ## Measurement and tomorrow's assumptions
 
-Forward timings use CUDA events on the device stream, including cache join/split. Returning scalar proposed token IDs already synchronizes the completed batch, so timing does not add another per-token device synchronization. Total elapsed time includes Python/CPU overhead. Encoding timing covers the encoder/projector stage; CPU feature extraction and host work are also included in total elapsed. Responses report actual CUDA allocated and allocator-reserved bytes.
+Forward timings use CUDA events on the device stream, including cache join/split. Returning scalar proposed token IDs already synchronizes the completed batch, so timing does not add another per-token device synchronization. These are completed device-stream elapsed times, including host launch gaps, rather than SM busy time. `encode_ms` starts after CPU Whisper feature extraction and includes host-to-device transfer, encoder and projector execution. CPU PCM conversion and mel preprocessing are included in the RPC's total `elapsed_ms`; the wire protocol does not expose a separate CPU preprocessing phase. Responses report actual CUDA allocated and allocator-reserved bytes.
 
 The implementation currently copies hybrid tensors when joining and splitting dynamic batches. This provides simple ownership and isolation, but its allocation/bandwidth overhead must be profiled on the rented node. Left-padding very unequal contexts also adds attention work. Neither cost has a hardware performance claim. Equal-new-length prefill grouping may reduce fill for irregular audio durations; report both Rust-selected and actual model-group batch sizes when profiling.
 
