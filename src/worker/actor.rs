@@ -208,7 +208,7 @@ impl Worker {
         self.measurements.device_cpu = device.await.expect("mock device does not panic");
         self.measurements.elapsed = Instant::now().duration_since(self.epoch);
         self.measurements.final_session_limit = self.admission_limit();
-        self.measurements.service_time = self.estimator.service_time();
+        self.measurements.service_time = self.projected_service_time();
         self.measurements.host_delay = self.estimator.host_delay();
         self.measurements.host_reserve = self.estimator.host_reserve();
         self.measurements
@@ -227,11 +227,17 @@ impl Worker {
             worker_id: self.measurements.worker_id,
             sessions,
             session_limit: self.admission_limit(),
-            service_time: self.estimator.service_time(),
+            service_time: self.projected_service_time(),
         });
     }
     fn projected_device_time(&self) -> Duration {
         self.estimator.device_time().max(self.base_latency())
+    }
+    fn projected_service_time(&self) -> Duration {
+        self.estimator.service_time().max(
+            self.base_latency()
+                .mul_f64(self.configuration.latency_safety_factor),
+        )
     }
     fn input_has_time_for_compute(&self, deadline: Instant, replay: Duration) -> bool {
         Instant::now()
@@ -266,10 +272,11 @@ impl Worker {
             self.session_limit,
             self.sessions.len(),
             queued.max(device_queue + ready_compute),
+            self.base_latency(),
         )
     }
     fn refresh_capacity(&mut self) {
-        self.session_limit = session_limit(&self.configuration, self.estimator.service_time());
+        self.session_limit = session_limit(&self.configuration, self.projected_service_time());
         let mut sessions: Vec<SessionId> = self.sessions.keys().copied().collect();
         sessions.sort_unstable();
         while self.sessions.len() > self.session_limit {

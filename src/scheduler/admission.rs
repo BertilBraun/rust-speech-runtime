@@ -66,14 +66,16 @@ impl ServiceEstimator {
         capacity: usize,
         active_sessions: usize,
         queue_delay: Duration,
+        known_device_time: Duration,
     ) -> usize {
         let host_delay = self.host_reserve();
+        let device_time = self.device_time().max(known_device_time);
         let available = capacity.min(session_limit_for_budget(
             configuration,
             configuration.compute_budget().saturating_sub(host_delay),
-            self.service_time(),
+            device_time.mul_f64(self.safety_factor),
         ));
-        if queue_delay + self.device_time() + host_delay > configuration.compute_budget() {
+        if queue_delay + device_time + host_delay > configuration.compute_budget() {
             available.min(active_sessions)
         } else {
             available
@@ -158,14 +160,26 @@ mod tests {
         }
         estimator.observe_host_delay(Duration::from_millis(20));
         assert_eq!(
-            estimator.available_limit(&configuration, 48, 32, Duration::ZERO),
+            estimator.available_limit(
+                &configuration,
+                48,
+                32,
+                Duration::ZERO,
+                Duration::from_millis(12)
+            ),
             16
         );
         for _ in 0..3 {
             estimator.observe_host_delay(Duration::from_millis(20));
         }
         assert_eq!(
-            estimator.available_limit(&configuration, 48, 32, Duration::ZERO),
+            estimator.available_limit(
+                &configuration,
+                48,
+                32,
+                Duration::ZERO,
+                Duration::from_millis(12)
+            ),
             16
         );
         assert_eq!(estimator.device_time(), Duration::from_millis(12));
@@ -173,11 +187,23 @@ mod tests {
             estimator.observe_host_delay(Duration::from_millis(1));
         }
         assert_eq!(
-            estimator.available_limit(&configuration, 48, 32, Duration::ZERO),
+            estimator.available_limit(
+                &configuration,
+                48,
+                32,
+                Duration::ZERO,
+                Duration::from_millis(12)
+            ),
             48
         );
         assert_eq!(
-            estimator.available_limit(&configuration, 48, 32, Duration::from_millis(40)),
+            estimator.available_limit(
+                &configuration,
+                48,
+                32,
+                Duration::from_millis(40),
+                Duration::from_millis(12)
+            ),
             32
         );
     }
@@ -196,8 +222,46 @@ mod tests {
         estimator.observe(Duration::from_millis(3));
         estimator.observe_host_delay(Duration::from_millis(10));
         assert_eq!(
-            estimator.available_limit(&configuration, 4, 0, Duration::ZERO),
+            estimator.available_limit(
+                &configuration,
+                4,
+                0,
+                Duration::ZERO,
+                Duration::from_millis(3)
+            ),
             4
         );
+    }
+
+    #[test]
+    fn known_device_cost_reserves_host_slack_before_slow_results_are_observed() {
+        let configuration = RuntimeConfig {
+            max_sessions_per_worker: 48,
+            ..RuntimeConfig::default()
+        };
+        let mut estimator = ServiceEstimator::new(&configuration);
+        estimator.observe(Duration::from_millis(12));
+        estimator.observe_host_delay(Duration::from_millis(5));
+        assert_eq!(
+            estimator.available_limit(
+                &configuration,
+                48,
+                0,
+                Duration::ZERO,
+                Duration::from_millis(12),
+            ),
+            32
+        );
+        assert_eq!(
+            estimator.available_limit(
+                &configuration,
+                48,
+                0,
+                Duration::ZERO,
+                Duration::from_millis(18),
+            ),
+            16
+        );
+        assert_eq!(estimator.device_time(), Duration::from_millis(12));
     }
 }

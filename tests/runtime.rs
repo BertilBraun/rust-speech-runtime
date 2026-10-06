@@ -845,6 +845,30 @@ async fn configured_slow_work_is_rejected_before_launch_if_it_cannot_meet_the_pa
     assert_eq!(report.inference.rejected_frames, 1);
 }
 
+#[tokio::test(start_paused = true)]
+async fn known_slowdown_rejects_admission_before_the_first_slow_result() {
+    let node = Node::start(RuntimeConfig {
+        slowdown: Some(WorkerSlowdown {
+            after: Duration::from_millis(30),
+            inference_latency: Duration::from_millis(300),
+        }),
+        ..configuration()
+    })
+    .await
+    .unwrap();
+    admit(&node, 1).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        node.ingress.create_session(SessionId(2)).await.unwrap(),
+        CreateOutcome::Rejected(CreateRejection::Capacity),
+    );
+    let report = node.shutdown().await.unwrap();
+    assert_eq!(report.admitted_sessions, 1);
+    assert_eq!(report.rejected_sessions, 1);
+    assert_eq!(report.inference.processed_frames, 0);
+    assert_eq!(report.workers[0].final_session_limit, 0);
+}
+
 #[tokio::test]
 async fn observed_slowdown_reduces_admission_and_sheds_unsustainable_sessions() {
     let node = Node::start(RuntimeConfig {
