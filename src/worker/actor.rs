@@ -149,7 +149,8 @@ impl Worker {
                 && self.submitted.len() < self.configuration.device_queue_capacity + 1
                 && (self.prepared.len() == self.configuration.batch_size
                     || !self.submitted.is_empty()
-                    || commands.is_empty())
+                    || commands.is_empty()
+                    || self.idle_collection_expired())
                 && wakeup <= Instant::now();
             tokio::select! {
                 biased;
@@ -579,6 +580,20 @@ impl Worker {
         } else {
             wakeup
         }
+    }
+    fn idle_collection_expired(&self) -> bool {
+        let now = Instant::now();
+        self.sessions
+            .values()
+            .filter_map(|session| session.work.ready())
+            .any(|pending| {
+                now >= pending.queued_at + self.configuration.max_batch_wait
+                    || now
+                        + self.estimator.device_time()
+                        + pending.item.replay_duration
+                        + self.configuration.scheduling_margin
+                        >= pending.item.input.deadline
+            })
     }
     fn dispatch_batch(&mut self, permit: mpsc::Permit<'_, DeviceJob>) {
         let assembly_started = Instant::now();
