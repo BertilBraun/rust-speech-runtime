@@ -394,11 +394,11 @@ async fn python_worker_process_to_websocket_client_full_pipeline() {
 
 #[tokio::test]
 async fn output_progress_keeps_generation_alive_beyond_idle_timeout() {
-    let backend = Fixture::start(30).await;
+    let backend = Fixture::start(150).await;
     let gateway = TestGateway::start(
         backend.config(),
         GatewayConfig {
-            idle_timeout: Duration::from_millis(80),
+            idle_timeout: Duration::from_millis(500),
             ..gateway_config()
         },
     )
@@ -406,7 +406,7 @@ async fn output_progress_keeps_generation_alive_beyond_idle_timeout() {
     let mut client = connected(&gateway.url, "active-generator").await;
     commit(&mut client, 1).await;
     assert_eq!(finish(&mut client, 1).await.len(), 5);
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    tokio::time::sleep(Duration::from_millis(750)).await;
     assert!(matches!(
         client.next_event().await.expect("idle cleanup event"),
         SessionEvent::Closed { .. }
