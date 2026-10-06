@@ -4,6 +4,16 @@ A Tokio gateway schedules persistent audio conversations across a configurable l
 
 The model is Whisper Small, a speech projection layer and Qwen3.5-2B. Complete utterances are encoded at commit because Whisper is bidirectional. Prior audio embeddings and accepted assistant tokens stay in the worker's cache across turns. The initial deployment may have two GPUs; the endpoint list controls GPU count.
 
+Start with the **[visual architecture guide](docs/ARCHITECTURE.md)** for seven Mermaid diagrams covering the system, one turn, computation, cache/storage ownership, batching, interruption and shutdown. Each diagram links to the code that implements it.
+
+```mermaid
+flowchart LR
+    client["WebSocket client"] <-->|"Audio and text"| gateway["Rust gateway"]
+    gateway <-->|"Bounded messages"| scheduler["Assigned worker actor<br/>Scheduling and RAM record"]
+    scheduler <-->|"Persistent TCP"| model["Python / GPU worker<br/>Model and conversation cache"]
+    gateway -->|"Final record on close"| archive[("Session archive files")]
+```
+
 The agreed design is in [PLAN.md](PLAN.md), implementation decisions in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md), measured local results in [docs/LOCAL_VALIDATION.md](docs/LOCAL_VALIDATION.md), and tomorrow's checks in [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md). [PERFORMANCE.md](PERFORMANCE.md) preserves measurements of the superseded periodic audio-echo workload; those results do not establish this model's capacity. The old TCP echo transport and simulator have been replaced.
 
 ## Run the pipeline
