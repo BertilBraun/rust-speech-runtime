@@ -69,13 +69,18 @@ impl ServiceEstimator {
         known_device_time: Duration,
     ) -> usize {
         let host_delay = self.host_reserve();
+        let host_compute_reserve = host_delay.saturating_sub(configuration.packet_lateness_grace);
         let device_time = self.device_time().max(known_device_time);
         let available = capacity.min(session_limit_for_budget(
             configuration,
-            configuration.compute_budget().saturating_sub(host_delay),
+            configuration
+                .compute_budget()
+                .saturating_sub(host_compute_reserve),
             device_time.mul_f64(self.safety_factor),
         ));
-        if queue_delay + device_time + host_delay > configuration.compute_budget() {
+        if queue_delay + device_time + host_delay
+            > configuration.compute_budget() + configuration.packet_lateness_grace
+        {
             available.min(active_sessions)
         } else {
             available
@@ -151,6 +156,7 @@ mod tests {
     fn host_spikes_pause_admission_without_changing_device_capacity() {
         let configuration = RuntimeConfig {
             max_sessions_per_worker: 48,
+            packet_lateness_grace: Duration::ZERO,
             ..RuntimeConfig::default()
         };
         let mut estimator = ServiceEstimator::new(&configuration);
@@ -237,6 +243,7 @@ mod tests {
     fn known_device_cost_reserves_host_slack_before_slow_results_are_observed() {
         let configuration = RuntimeConfig {
             max_sessions_per_worker: 48,
+            packet_lateness_grace: Duration::ZERO,
             ..RuntimeConfig::default()
         };
         let mut estimator = ServiceEstimator::new(&configuration);
@@ -263,5 +270,55 @@ mod tests {
             16
         );
         assert_eq!(estimator.device_time(), Duration::from_millis(12));
+    }
+
+    #[test]
+    fn recovery_grace_absorbs_host_reserve_without_increasing_compute_capacity() {
+        let mut configuration = RuntimeConfig {
+            max_sessions_per_worker: 64,
+            packet_lateness_grace: Duration::ZERO,
+            ..RuntimeConfig::default()
+        };
+        let mut estimator = ServiceEstimator::new(&configuration);
+        estimator.observe(Duration::from_millis(12));
+        estimator.observe_host_delay(Duration::from_millis(5));
+        let capacity = session_limit(&configuration, Duration::from_millis(12));
+        assert_eq!(capacity, 48);
+        assert_eq!(
+            estimator.available_limit(
+                &configuration,
+                capacity,
+                0,
+                Duration::ZERO,
+                Duration::from_millis(12)
+            ),
+            32
+        );
+        configuration.packet_lateness_grace = Duration::from_millis(10);
+        assert_eq!(
+            session_limit(&configuration, Duration::from_millis(12)),
+            capacity
+        );
+        assert_eq!(
+            estimator.available_limit(
+                &configuration,
+                capacity,
+                0,
+                Duration::ZERO,
+                Duration::from_millis(12)
+            ),
+            48
+        );
+        estimator.observe_host_delay(Duration::from_millis(20));
+        assert_eq!(
+            estimator.available_limit(
+                &configuration,
+                capacity,
+                0,
+                Duration::ZERO,
+                Duration::from_millis(12)
+            ),
+            32
+        );
     }
 }
