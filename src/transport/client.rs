@@ -15,6 +15,8 @@ pub enum ClientError {
     Wire(#[from] WireError),
     #[error("end-to-end packet deadline exceeded")]
     DeadlineExceeded,
+    #[error("audio echo arrived after its end-to-end packet deadline")]
+    LateEcho(Box<AudioResult>),
     #[error("server rejected packet: {0:?}")]
     Rejected(FrameRejection),
     #[error("invalid server response: {0}")]
@@ -127,9 +129,6 @@ impl AudioSession {
         }
         match reply {
             ServerReply::Audio(audio) => {
-                if Instant::now() > deadline {
-                    return Err(ClientError::DeadlineExceeded);
-                }
                 let expected = self.prefix.append(&payload);
                 if audio.assignment != self.admission.assignment
                     || audio.sequence != sequence
@@ -137,6 +136,9 @@ impl AudioSession {
                     || audio.prefix != expected
                 {
                     return Err(ClientError::EchoMismatch);
+                }
+                if Instant::now() > deadline {
+                    return Err(ClientError::LateEcho(Box::new(audio)));
                 }
                 self.history.0.push(payload);
                 self.prefix = expected;
@@ -161,5 +163,89 @@ impl AudioSession {
             Some(ServerReply::Closed(closed)) => Ok(closed),
             _ => Err(ClientError::Protocol("expected close reply")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClientError, ConnectOutcome, connect_session};
+    use crate::{
+        config::AudioLimits,
+        metrics::profile::PacketTimings,
+        protocol::{
+            Assignment, AudioResult, CacheOutcome, CreateOutcome, Generation, PrefixState,
+            SessionAdmission, SessionId, WorkerId,
+        },
+        transport::wire::{ClientRequest, MAX_MESSAGE_BYTES, ServerPeer, ServerReply},
+    };
+    use bytes::Bytes;
+    use std::time::Duration;
+    use tokio::{net::TcpListener, time::Instant};
+
+    #[tokio::test]
+    async fn received_late_echo_preserves_profile_without_advancing_audio_history() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let assignment = Assignment {
+            worker_id: WorkerId(0),
+            generation: Generation(1),
+        };
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut peer = ServerPeer::new(socket, MAX_MESSAGE_BYTES).unwrap();
+            assert!(matches!(
+                peer.receive().await.unwrap(),
+                Some(ClientRequest::Open(_))
+            ));
+            peer.send(ServerReply::Opened(CreateOutcome::Admitted(
+                SessionAdmission {
+                    assignment,
+                    audio_limits: AudioLimits::default(),
+                    packet_deadline: Duration::from_millis(50),
+                },
+            )))
+            .await
+            .unwrap();
+            let Some(ClientRequest::Audio { packet, .. }) = peer.receive().await.unwrap() else {
+                panic!("expected audio request");
+            };
+            tokio::time::advance(Duration::from_millis(60)).await;
+            peer.send(ServerReply::Audio(AudioResult {
+                assignment,
+                sequence: packet.sequence,
+                prefix: PrefixState::default().append(&packet.payload),
+                payload: packet.payload,
+                cache: CacheOutcome::Hit,
+                timings: Box::new(PacketTimings {
+                    device_execution: Duration::from_millis(12),
+                    ..PacketTimings::default()
+                }),
+            }))
+            .await
+            .unwrap();
+        });
+        let ConnectOutcome::Admitted(mut session) =
+            connect_session(address, SessionId(1), Duration::from_secs(2))
+                .await
+                .unwrap()
+        else {
+            panic!("expected admission");
+        };
+        tokio::time::pause();
+        let error = session
+            .exchange_audio(
+                Bytes::from_static(b"audio"),
+                Instant::now() + Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+        let ClientError::LateEcho(audio) = error else {
+            panic!("received late audio must retain its profile");
+        };
+        assert_eq!(audio.payload, Bytes::from_static(b"audio"));
+        assert_eq!(audio.timings.device_execution, Duration::from_millis(12));
+        assert_eq!(session.prefix, PrefixState::default());
+        assert!(session.history.0.is_empty());
+        server.await.unwrap();
     }
 }

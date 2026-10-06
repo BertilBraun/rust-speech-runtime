@@ -4,22 +4,43 @@ use crate::{
         LatencyHistogram,
         profile::{PacketTimings, RETAINED_TRACES},
     },
-    protocol::{PacketSequence, SessionId},
+    protocol::{AudioResult, PacketSequence, SessionId},
 };
 use serde::{Deserialize, Serialize};
 use std::{cmp::Reverse, time::Duration};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum ClientPacketTrace {
-    Echo {
+pub struct ClientEchoTrace {
+    pub session_id: SessionId,
+    pub sequence: PacketSequence,
+    pub round_trip: Duration,
+    pub client_start_delay: Duration,
+    pub outside_server: Duration,
+    pub server: PacketTimings,
+}
+impl ClientEchoTrace {
+    pub(super) fn new(
         session_id: SessionId,
-        sequence: PacketSequence,
+        audio: &AudioResult,
         round_trip: Duration,
         client_start_delay: Duration,
-        outside_server: Duration,
-        server: PacketTimings,
-    },
+    ) -> Self {
+        Self {
+            session_id,
+            sequence: audio.sequence,
+            round_trip,
+            client_start_delay,
+            outside_server: round_trip.saturating_sub(client_start_delay + audio.timings.total()),
+            server: *audio.timings,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ClientPacketTrace {
+    Echo(ClientEchoTrace),
+    LateEcho(ClientEchoTrace),
     Failure {
         session_id: SessionId,
         sequence: PacketSequence,
@@ -31,7 +52,8 @@ pub enum ClientPacketTrace {
 impl ClientPacketTrace {
     fn round_trip(&self) -> Duration {
         match self {
-            Self::Echo { round_trip, .. } | Self::Failure { round_trip, .. } => *round_trip,
+            Self::Echo(echo) | Self::LateEcho(echo) => echo.round_trip,
+            Self::Failure { round_trip, .. } => *round_trip,
         }
     }
 }
@@ -48,15 +70,14 @@ impl PacketMeasurements {
     pub(super) async fn collect(mut self, mut events: mpsc::Receiver<ClientPacketTrace>) -> Self {
         while let Some(packet) = events.recv().await {
             match &packet {
-                ClientPacketTrace::Echo {
-                    round_trip,
-                    client_start_delay,
-                    outside_server,
-                    ..
-                } => {
-                    self.round_trip.record(*round_trip);
-                    self.client_start_delay.record(*client_start_delay);
-                    self.outside_server.record(*outside_server);
+                ClientPacketTrace::Echo(echo) => {
+                    self.round_trip.record(echo.round_trip);
+                    self.client_start_delay.record(echo.client_start_delay);
+                    self.outside_server.record(echo.outside_server);
+                }
+                ClientPacketTrace::LateEcho(echo) => {
+                    self.failed_round_trip.record(echo.round_trip);
+                    self.client_start_delay.record(echo.client_start_delay);
                 }
                 ClientPacketTrace::Failure {
                     round_trip,
@@ -73,5 +94,54 @@ impl PacketMeasurements {
             self.slowest_packets.truncate(RETAINED_TRACES);
         }
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClientEchoTrace, ClientPacketTrace, PacketMeasurements};
+    use crate::{
+        metrics::profile::PacketTimings,
+        protocol::{PacketSequence, SessionId},
+    };
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    fn echo(round_trip_ms: u64) -> ClientEchoTrace {
+        ClientEchoTrace {
+            session_id: SessionId(1),
+            sequence: PacketSequence(0),
+            round_trip: Duration::from_millis(round_trip_ms),
+            client_start_delay: Duration::from_millis(1),
+            outside_server: Duration::from_millis(round_trip_ms - 13),
+            server: PacketTimings {
+                device_execution: Duration::from_millis(12),
+                ..PacketTimings::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn late_echo_retains_stages_without_entering_successful_latency_statistics() {
+        let (events, mailbox) = mpsc::channel(2);
+        events
+            .send(ClientPacketTrace::Echo(echo(20)))
+            .await
+            .unwrap();
+        events
+            .send(ClientPacketTrace::LateEcho(echo(51)))
+            .await
+            .unwrap();
+        drop(events);
+        let measurements = PacketMeasurements::default().collect(mailbox).await;
+        assert_eq!(measurements.round_trip.summary().samples, 1);
+        assert_eq!(measurements.failed_round_trip.summary().samples, 1);
+        assert_eq!(measurements.client_start_delay.summary().samples, 2);
+        assert_eq!(measurements.outside_server.summary().samples, 1);
+        let ClientPacketTrace::LateEcho(trace) = &measurements.slowest_packets[0] else {
+            panic!("late echo must remain the slowest trace");
+        };
+        assert_eq!(trace.server.device_execution, Duration::from_millis(12));
+        assert_eq!(trace.outside_server, Duration::from_millis(38));
     }
 }

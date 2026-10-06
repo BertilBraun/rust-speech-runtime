@@ -1,8 +1,8 @@
 use std::{cmp::Reverse, collections::BinaryHeap, net::SocketAddr, time::Duration};
 
 mod measurements;
-pub use measurements::ClientPacketTrace;
 use measurements::PacketMeasurements;
+pub use measurements::{ClientEchoTrace, ClientPacketTrace};
 
 use bytes::Bytes;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
@@ -282,7 +282,7 @@ fn pace(
 
 fn classify(error: ClientError) -> FailureReason {
     match error {
-        ClientError::DeadlineExceeded => FailureReason::DeadlineExceeded,
+        ClientError::DeadlineExceeded | ClientError::LateEcho(_) => FailureReason::DeadlineExceeded,
         ClientError::Rejected(reason) => FailureReason::ServerRejected(reason),
         ClientError::Wire(_) => FailureReason::Connection,
         ClientError::Protocol(_) => FailureReason::Protocol,
@@ -325,20 +325,23 @@ async fn run_session(
         counters.attempted_frames += 1;
         let sequence = session.next_sequence();
         let client_start_delay = captured_at.elapsed();
-        match session.infer_audio(payload.clone(), captured_at).await {
+        let outcome = session.infer_audio(payload.clone(), captured_at).await;
+        let round_trip = captured_at.elapsed();
+        let outcome = match outcome {
+            Ok(audio) if round_trip > session.packet_deadline() => {
+                Err(ClientError::LateEcho(Box::new(audio)))
+            }
+            outcome => outcome,
+        };
+        match outcome {
             Ok(audio) => {
-                let round_trip = captured_at.elapsed();
-                let outside_server =
-                    round_trip.saturating_sub(client_start_delay + audio.timings.total());
                 if metrics
-                    .try_send(ClientPacketTrace::Echo {
+                    .try_send(ClientPacketTrace::Echo(ClientEchoTrace::new(
                         session_id,
-                        sequence: audio.sequence,
+                        &audio,
                         round_trip,
                         client_start_delay,
-                        outside_server,
-                        server: *audio.timings,
-                    })
+                    )))
                     .is_err()
                 {
                     counters.metric_samples_dropped += 1;
@@ -372,18 +375,31 @@ async fn run_session(
                 }
             }
             Err(error) => {
-                let round_trip = captured_at.elapsed();
-                let reason = classify(error);
-                if metrics
-                    .try_send(ClientPacketTrace::Failure {
-                        session_id,
-                        sequence,
-                        round_trip,
-                        client_start_delay,
-                        reason,
-                    })
-                    .is_err()
-                {
+                let (reason, trace) = match error {
+                    ClientError::LateEcho(audio) => (
+                        FailureReason::DeadlineExceeded,
+                        ClientPacketTrace::LateEcho(ClientEchoTrace::new(
+                            session_id,
+                            &audio,
+                            round_trip,
+                            client_start_delay,
+                        )),
+                    ),
+                    error => {
+                        let reason = classify(error);
+                        (
+                            reason,
+                            ClientPacketTrace::Failure {
+                                session_id,
+                                sequence,
+                                round_trip,
+                                client_start_delay,
+                                reason,
+                            },
+                        )
+                    }
+                };
+                if metrics.try_send(trace).is_err() {
                     counters.metric_samples_dropped += 1;
                 }
                 counters.failure(reason);
