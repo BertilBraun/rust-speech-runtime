@@ -1,242 +1,100 @@
-use std::{marker::PhantomData, net::SocketAddr, time::Duration};
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
 
-use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::net::{
-    TcpStream,
-    tcp::{OwnedReadHalf, OwnedWriteHalf},
-};
-use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
+use crate::protocol::{SessionId, TurnId};
 
-use crate::protocol::{AudioPacket, AudioResult, CreateOutcome, FrameRejection, SessionId};
+use super::GatewayError;
 
-pub(crate) const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
-const INLINE_MESSAGE_BYTES: usize = 8192;
+pub const AUDIO_HEADER_BYTES: usize = 12;
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) enum ClientRequest {
-    Open(SessionId),
-    Audio {
-        packet: AudioPacket,
-        remaining_budget: Duration,
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ClientControl {
+    Open {
+        session_id: SessionId,
     },
-    EvictCache,
+    StartTurn {
+        turn_id: TurnId,
+    },
+    Commit {
+        turn_id: TurnId,
+        chunk_count: u32,
+        sample_count: usize,
+    },
+    Cancel {
+        turn_id: TurnId,
+    },
     Close,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) enum ServerReply {
-    Opened(CreateOutcome),
-    Audio(AudioResult),
-    CacheMiss,
-    Rejected(FrameRejection),
-    CacheEvicted(bool),
-    Closed(bool),
+#[derive(Debug)]
+pub struct AudioChunk {
+    pub turn_id: TurnId,
+    pub chunk_index: u32,
+    pub pcm16: Bytes,
 }
 
-pub(crate) trait WireMessage: Serialize + Send + 'static {
-    fn size_upper_bound(&self) -> usize;
-}
-impl WireMessage for ClientRequest {
-    fn size_upper_bound(&self) -> usize {
-        match self {
-            Self::Audio { packet, .. } => {
-                let context = match &packet.context {
-                    crate::protocol::AudioContext::Cached(_) => 0,
-                    crate::protocol::AudioContext::Replay(prefix) => {
-                        prefix.byte_len() + prefix.0.len() * 10
-                    }
-                };
-                1024 + packet.payload.len() + context
-            }
-            _ => 1024,
+impl AudioChunk {
+    pub fn decode(bytes: Bytes) -> Result<Self, GatewayError> {
+        if bytes.len() <= AUDIO_HEADER_BYTES
+            || !(bytes.len() - AUDIO_HEADER_BYTES).is_multiple_of(2)
+        {
+            return Err(GatewayError::Protocol(
+                "audio must contain a 12-byte header and nonempty PCM16",
+            ));
         }
-    }
-}
-impl WireMessage for ServerReply {
-    fn size_upper_bound(&self) -> usize {
-        match self {
-            Self::Audio(audio) => 1024 + audio.payload.len(),
-            _ => 1024,
-        }
-    }
-}
-fn encode<Outgoing: Serialize>(message: Outgoing) -> Result<Vec<u8>, bincode::error::EncodeError> {
-    bincode::serde::encode_to_vec(
-        message,
-        bincode::config::standard().with_limit::<MAX_MESSAGE_BYTES>(),
-    )
-}
-fn decode<Incoming: DeserializeOwned>(bytes: &[u8]) -> Result<Incoming, WireError> {
-    let (message, consumed) = bincode::serde::decode_from_slice::<Incoming, _>(
-        bytes,
-        bincode::config::standard().with_limit::<MAX_MESSAGE_BYTES>(),
-    )?;
-    if consumed != bytes.len() {
-        return Err(WireError::InvalidMessage("trailing bytes"));
-    }
-    Ok(message)
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum WireError {
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Encode(#[from] bincode::error::EncodeError),
-    #[error(transparent)]
-    Decode(#[from] bincode::error::DecodeError),
-    #[error(transparent)]
-    Task(#[from] tokio::task::JoinError),
-    #[error("connection closed")]
-    Closed,
-    #[error("invalid wire message: {0}")]
-    InvalidMessage(&'static str),
-    #[error("network operation timed out")]
-    Timeout,
-}
-
-pub(crate) type ClientPeer = WirePeer<ServerReply, ClientRequest>;
-pub(crate) type ServerPeer = WirePeer<ClientRequest, ServerReply>;
-
-pub(crate) struct WirePeer<Incoming, Outgoing> {
-    reader: FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
-    writer: FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
-    message_limit: usize,
-    pending_decode: Option<tokio::task::JoinHandle<Result<Incoming, WireError>>>,
-    outgoing: PhantomData<Outgoing>,
-}
-
-impl<Incoming: DeserializeOwned + Send + 'static, Outgoing: WireMessage>
-    WirePeer<Incoming, Outgoing>
-{
-    pub(crate) fn new(stream: TcpStream, message_limit: usize) -> Result<Self, WireError> {
-        stream.set_nodelay(true)?;
-        let (reader, writer) = stream.into_split();
-        let codec = || {
-            LengthDelimitedCodec::builder()
-                .max_frame_length(message_limit)
-                .new_codec()
-        };
+        let turn_id = TurnId(u64::from_le_bytes(
+            bytes[..8].try_into().expect("header length validated"),
+        ));
+        let chunk_index =
+            u32::from_le_bytes(bytes[8..12].try_into().expect("header length validated"));
         Ok(Self {
-            reader: FramedRead::new(reader, codec()),
-            writer: FramedWrite::new(writer, codec()),
-            message_limit,
-            pending_decode: None,
-            outgoing: PhantomData,
+            turn_id,
+            chunk_index,
+            pcm16: bytes.slice(AUDIO_HEADER_BYTES..),
         })
     }
 
-    pub(crate) async fn connect(address: SocketAddr) -> Result<Self, WireError> {
-        Self::new(TcpStream::connect(address).await?, MAX_MESSAGE_BYTES)
-    }
-
-    pub(crate) async fn send(&mut self, message: Outgoing) -> Result<(), WireError> {
-        let bytes = if message.size_upper_bound() <= INLINE_MESSAGE_BYTES {
-            encode(message)?
-        } else {
-            tokio::task::spawn_blocking(move || encode(message)).await??
-        };
-        if bytes.len() > self.message_limit {
-            return Err(WireError::InvalidMessage("encoded message exceeds limit"));
-        }
-        self.writer.send(Bytes::from(bytes)).await?;
-        Ok(())
-    }
-
-    pub(crate) async fn receive(&mut self) -> Result<Option<Incoming>, WireError> {
-        if self.pending_decode.is_none() {
-            let Some(frame) = self.reader.next().await else {
-                return Ok(None);
-            };
-            let bytes = frame?;
-            if bytes.len() <= INLINE_MESSAGE_BYTES {
-                return decode(&bytes).map(Some);
-            }
-            self.pending_decode = Some(tokio::task::spawn_blocking(move || decode(&bytes)));
-        }
-        let result = self
-            .pending_decode
-            .as_mut()
-            .expect("decode is pending")
-            .await;
-        self.pending_decode = None;
-        let message = result??;
-        Ok(Some(message))
+    pub fn encode(&self) -> Bytes {
+        let mut encoded = BytesMut::with_capacity(AUDIO_HEADER_BYTES + self.pcm16.len());
+        encoded.put_u64_le(self.turn_id.0);
+        encoded.put_u32_le(self.chunk_index);
+        encoded.extend_from_slice(&self.pcm16);
+        encoded.freeze()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientRequest, MAX_MESSAGE_BYTES, ServerPeer};
-    use crate::protocol::SessionId;
-    use std::time::Duration;
-    use tokio::{
-        io::AsyncWriteExt,
-        net::{TcpListener, TcpStream},
-    };
+    use super::*;
 
-    #[tokio::test]
-    async fn cancelled_receive_keeps_partially_received_message() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (socket, _) = listener.accept().await.unwrap();
-        let mut server = ServerPeer::new(socket, MAX_MESSAGE_BYTES).unwrap();
-        let message = bincode::serde::encode_to_vec(
-            ClientRequest::Open(SessionId(42)),
-            bincode::config::standard(),
-        )
-        .unwrap();
-        client
-            .write_all(&(message.len() as u32).to_be_bytes())
-            .await
-            .unwrap();
-        client.write_all(&message[..1]).await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(5), server.receive())
-                .await
-                .is_err()
-        );
-        client.write_all(&message[1..]).await.unwrap();
-        assert!(matches!(
-            server.receive().await.unwrap(),
-            Some(ClientRequest::Open(SessionId(42)))
-        ));
+    #[test]
+    fn binary_audio_round_trips() {
+        let chunk = AudioChunk {
+            turn_id: TurnId(9),
+            chunk_index: 3,
+            pcm16: Bytes::from_static(&[1, 2, 3, 4]),
+        };
+        let decoded = AudioChunk::decode(chunk.encode()).expect("valid packet");
+        assert_eq!(decoded.turn_id, chunk.turn_id);
+        assert_eq!(decoded.chunk_index, chunk.chunk_index);
+        assert_eq!(decoded.pcm16, chunk.pcm16);
     }
 
-    #[tokio::test]
-    async fn cancelled_receive_keeps_pending_decode() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (socket, _) = listener.accept().await.unwrap();
-        let mut server = ServerPeer::new(socket, MAX_MESSAGE_BYTES).unwrap();
-        let message = bincode::serde::encode_to_vec(
-            ClientRequest::Open(SessionId(7)),
-            bincode::config::standard(),
-        )
-        .unwrap();
-        server.pending_decode = Some(tokio::task::spawn_blocking(move || {
-            std::thread::sleep(Duration::from_millis(40));
-            Ok(
-                bincode::serde::decode_from_slice(&message, bincode::config::standard())
-                    .unwrap()
-                    .0,
-            )
-        }));
+    #[test]
+    fn rejects_unknown_control_fields() {
         assert!(
-            tokio::time::timeout(Duration::from_millis(5), server.receive())
-                .await
-                .is_err()
+            serde_json::from_str::<ClientControl>(
+                r#"{"type":"open","session_id":"s","authentication":"unused"}"#
+            )
+            .is_err()
         );
-        assert!(matches!(
-            server.receive().await.unwrap(),
-            Some(ClientRequest::Open(SessionId(7)))
-        ));
-        drop(client);
+    }
+
+    #[test]
+    fn rejects_empty_and_incomplete_pcm() {
+        for length in [0, 11, 12, 13, 15] {
+            assert!(AudioChunk::decode(Bytes::from(vec![0; length])).is_err());
+        }
     }
 }

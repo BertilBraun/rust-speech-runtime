@@ -1,22 +1,16 @@
-use std::{
-    net::SocketAddr,
-    path::PathBuf,
-    process::{ExitStatus, Stdio},
-    time::Duration,
-};
+use std::{path::Path, process::ExitCode};
 
 use clap::Parser;
 use serde::Serialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use voice_scheduler::{
-    config::{RuntimeConfig, WorkerSlowdown},
-    simulation::{self, ArrivalPhase, SimulationConfig, SimulationError, SimulationReport},
-    transport::{Gateway, GatewayConfig, GatewayError, GatewayReport},
+    config::RuntimeConfig,
+    simulation::{self, SimulationError, SimulationReport},
+    transport::{Gateway, GatewayError},
 };
 
 mod cli;
-use cli::{BenchmarkArguments, Cli, Command};
+use cli::{BenchmarkArguments, Cli, Command, ServeArguments, SuiteArguments};
 
 #[derive(Debug, thiserror::Error)]
 enum ApplicationError {
@@ -27,266 +21,159 @@ enum ApplicationError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
-    Report(#[from] serde_json::Error),
+    Json(#[from] serde_json::Error),
     #[error(transparent)]
     Task(#[from] tokio::task::JoinError),
-    #[error("external simulator exited with {0}")]
-    SimulatorExited(ExitStatus),
-    #[error("calibration found no realtime capacity")]
-    NoCapacity,
+    #[error("configuration file must be at most 64 KiB")]
+    ConfigurationTooLarge,
 }
 
-type ApplicationResult<T> = Result<T, ApplicationError>;
-
-#[derive(Serialize)]
-struct BenchmarkReport {
-    client: SimulationReport,
-    gateway: GatewayReport,
-}
-#[derive(Serialize)]
-struct ScenarioReport {
-    scenario: Scenario,
-    result: BenchmarkReport,
-}
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Scenario {
-    LowLoad,
-    HalfCapacity,
-    EightyPercentCapacity,
-    NinetyFivePercentCapacity,
-    Overload,
-    Aligned,
-    Random,
-    Jitter,
-    Churn,
-    CacheReplay,
-    Slowdown,
-    ChannelSaturation,
-}
-
-async fn benchmark(
-    runtime: RuntimeConfig,
-    workload: SimulationConfig,
-) -> ApplicationResult<BenchmarkReport> {
-    workload.validate()?;
-    let gateway = Gateway::bind(
-        runtime,
-        GatewayConfig {
-            listen_address: SocketAddr::from(([127, 0, 0, 1], 0)),
-            ..GatewayConfig::default()
-        },
-    )
-    .await?;
-    let address = gateway.local_address()?;
-    let cancellation = CancellationToken::new();
-    let _server_cleanup = cancellation.clone().drop_guard();
-    let signal = cancellation.clone();
-    let server = tokio::spawn(gateway.serve(signal));
-    let client = run_external_simulator(address, &workload).await;
-    cancellation.cancel();
-    let gateway = server.await??;
-    let client = client?;
-    print_benchmark(&client, &gateway);
-    Ok(BenchmarkReport { client, gateway })
-}
-
-async fn run_external_simulator(
-    address: SocketAddr,
-    workload: &SimulationConfig,
-) -> ApplicationResult<SimulationReport> {
-    let mut child = tokio::process::Command::new(std::env::current_exe()?)
-        .args(["simulate-stdin", "--address", &address.to_string()])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()?;
-    let mut input = child.stdin.take().expect("piped stdin");
-    input.write_all(&serde_json::to_vec(workload)?).await?;
-    drop(input);
-    let output = child.wait_with_output().await?;
-    if !output.status.success() {
-        return Err(ApplicationError::SimulatorExited(output.status));
-    }
-    Ok(serde_json::from_slice(&output.stdout)?)
-}
-
-fn print_benchmark(client: &SimulationReport, gateway: &GatewayReport) {
-    eprintln!(
-        "admitted={} rejected={} failed={} echoed={} late={} discarded={} bursts={} RTT p50/p95/p99/max={:.1}/{:.1}/{:.1}/{:.1}ms batch fill={:.1}%",
-        client.counters.admitted_sessions,
-        client.counters.rejected_capacity,
-        client.counters.failed_sessions,
-        client.counters.echoed_frames,
-        client.counters.late_frames,
-        client.counters.discarded_output_frames,
-        client.counters.quality_failed_sessions,
-        client.round_trip_latency.p50_ms,
-        client.round_trip_latency.p95_ms,
-        client.round_trip_latency.p99_ms,
-        client.round_trip_latency.max_ms,
-        gateway.runtime.batch_fill_ratio * 100.0
-    );
-}
-
-async fn suite(arguments: BenchmarkArguments) -> ApplicationResult<Vec<ScenarioReport>> {
-    let runtime = arguments.runtime.configuration();
-    let workload = arguments.workload.configuration();
-    let mut reports = Vec::new();
-    let mut low = workload.clone();
-    low.sessions = runtime.workers;
-    let baseline = benchmark(runtime.clone(), low).await?;
-    let capacity = baseline
-        .gateway
-        .runtime
-        .workers
-        .iter()
-        .map(|worker| worker.initial_session_limit)
-        .sum::<usize>();
-    if capacity == 0 {
-        return Err(ApplicationError::NoCapacity);
-    }
-    reports.push(ScenarioReport {
-        scenario: Scenario::LowLoad,
-        result: baseline,
-    });
-    for (name, sessions) in [
-        (Scenario::HalfCapacity, capacity / 2),
-        (Scenario::EightyPercentCapacity, capacity * 8 / 10),
-        (Scenario::NinetyFivePercentCapacity, capacity * 95 / 100),
-        (Scenario::Overload, capacity * 2),
-    ] {
-        let mut scenario = workload.clone();
-        scenario.sessions = sessions.max(1);
-        reports.push(ScenarioReport {
-            scenario: name,
-            result: benchmark(runtime.clone(), scenario).await?,
-        });
-    }
-    for name in [
-        Scenario::Aligned,
-        Scenario::Random,
-        Scenario::Jitter,
-        Scenario::Churn,
-        Scenario::CacheReplay,
-        Scenario::Slowdown,
-        Scenario::ChannelSaturation,
-    ] {
-        let mut scenario = workload.clone();
-        scenario.sessions = (capacity / 2).max(1);
-        let mut node = runtime.clone();
-        match name {
-            Scenario::Aligned => {
-                scenario.phase = ArrivalPhase::Aligned;
-                scenario.minimum_interval = Duration::from_millis(50);
-                scenario.maximum_interval = scenario.minimum_interval;
-            }
-            Scenario::Random => {
-                scenario.phase = ArrivalPhase::Random;
-                scenario.minimum_interval = Duration::from_millis(50);
-                scenario.maximum_interval = scenario.minimum_interval;
-            }
-            Scenario::Jitter => {
-                scenario.minimum_interval = Duration::from_millis(48);
-                scenario.maximum_interval = Duration::from_millis(55);
-            }
-            Scenario::Churn => scenario.churn_after = Some(Duration::from_secs(1)),
-            Scenario::CacheReplay => scenario.evict_every = Some(10),
-            Scenario::Slowdown => {
-                node.slowdown = Some(WorkerSlowdown {
-                    after: workload.duration / 2,
-                    inference_latency: Duration::from_millis(30),
-                })
-            }
-            Scenario::ChannelSaturation => {
-                node.worker_channel_capacity = 1;
-                node.worker_input_delay = Duration::from_millis(20);
-            }
-            _ => unreachable!("fixed scenario list"),
+#[tokio::main]
+async fn main() -> ExitCode {
+    match run(Cli::parse()).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
         }
-        reports.push(ScenarioReport {
-            scenario: name,
-            result: benchmark(node, scenario).await?,
-        });
     }
-    Ok(reports)
 }
 
-async fn write_report<T: Serialize>(report: &T, output: Option<PathBuf>) -> ApplicationResult<()> {
-    let data = serde_json::to_string_pretty(report)?;
-    if let Some(path) = output {
-        tokio::fs::write(path, data).await?;
-    } else {
-        println!("{data}");
+async fn run(cli: Cli) -> Result<(), ApplicationError> {
+    match cli.command {
+        Command::Serve(arguments) => serve(arguments).await,
+        Command::Benchmark(arguments) => benchmark(arguments).await,
+        Command::Suite(arguments) => suite(arguments).await,
+    }
+}
+
+async fn serve(arguments: ServeArguments) -> Result<(), ApplicationError> {
+    let metadata = tokio::fs::metadata(&arguments.runtime_config).await?;
+    if metadata.len() > 64 * 1024 {
+        return Err(ApplicationError::ConfigurationTooLarge);
+    }
+    let runtime: RuntimeConfig =
+        serde_json::from_slice(&tokio::fs::read(&arguments.runtime_config).await?)?;
+    let gateway = Gateway::bind(runtime, arguments.gateway_config()).await?;
+    println!(
+        "WebSocket gateway listening on ws://{}/v1",
+        gateway.local_address()?
+    );
+    let cancellation = CancellationToken::new();
+    let _cleanup = cancellation.clone().drop_guard();
+    let mut server = tokio::spawn(gateway.serve(cancellation.clone()));
+    let report = tokio::select! {
+        result = &mut server => result??,
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            cancellation.cancel();
+            server.await??
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+async fn benchmark(arguments: BenchmarkArguments) -> Result<(), ApplicationError> {
+    let report = simulation::run(&arguments.url, arguments.workload()).await?;
+    print_summary(&report);
+    if let Some(path) = arguments.report {
+        save_report(&path, &report).await?;
     }
     Ok(())
 }
 
-async fn serve_gateway(gateway: Gateway) -> ApplicationResult<GatewayReport> {
-    let cancellation = CancellationToken::new();
-    let serving = gateway.serve(cancellation.clone());
-    tokio::pin!(serving);
-    tokio::select! {
-        report = &mut serving => Ok(report?),
-        interrupt = tokio::signal::ctrl_c() => {
-            cancellation.cancel();
-            let report = serving.await?;
-            interrupt?;
-            Ok(report)
-        }
-    }
+#[derive(Serialize)]
+struct ScenarioReport {
+    scenario: &'static str,
+    result: SimulationReport,
 }
 
-async fn read_workload() -> ApplicationResult<SimulationConfig> {
-    let mut data = Vec::new();
-    tokio::io::stdin()
-        .take(1024 * 1024)
-        .read_to_end(&mut data)
-        .await?;
-    Ok(serde_json::from_slice(&data)?)
+async fn suite(arguments: SuiteArguments) -> Result<(), ApplicationError> {
+    let mut reports = Vec::new();
+    for (name, fraction) in [
+        ("low_load", 0.10),
+        ("half_capacity", 0.50),
+        ("eighty_percent", 0.80),
+        ("ninety_five_percent", 0.95),
+        ("overload", 1.20),
+    ] {
+        let mut workload = arguments.benchmark.workload();
+        workload.sessions = (arguments.session_budget as f64 * fraction).ceil().max(1.0) as usize;
+        let result = simulation::run(&arguments.benchmark.url, workload).await?;
+        println!("scenario: {name}");
+        print_summary(&result);
+        reports.push(ScenarioReport {
+            scenario: name,
+            result,
+        });
+    }
+    for name in ["aligned", "jitter", "churn", "interruption"] {
+        let mut workload = arguments.benchmark.workload();
+        match name {
+            "aligned" => {
+                workload.start_spread_ms = 0;
+                workload.minimum_packet_ms = 50;
+                workload.maximum_packet_ms = 50;
+            }
+            "jitter" => {
+                workload.minimum_packet_ms = 48;
+                workload.maximum_packet_ms = 55;
+            }
+            "churn" => workload.churn_rounds = 3,
+            "interruption" => workload.interrupt_after_tokens = Some(2),
+            _ => unreachable!("scenario list is fixed"),
+        }
+        let result = simulation::run(&arguments.benchmark.url, workload).await?;
+        println!("scenario: {name}");
+        print_summary(&result);
+        reports.push(ScenarioReport {
+            scenario: name,
+            result,
+        });
+    }
+    if let Some(path) = arguments.benchmark.report {
+        save_report(&path, &reports).await?;
+    }
+    Ok(())
 }
 
-#[tokio::main]
-async fn main() -> ApplicationResult<()> {
-    let cli = Cli::parse();
-    match cli.command {
-        Command::Serve { listen, runtime } => {
-            let gateway = Gateway::bind(
-                runtime.configuration(),
-                GatewayConfig {
-                    listen_address: listen,
-                    ..GatewayConfig::default()
-                },
-            )
-            .await?;
-            eprintln!(
-                "ready: {} (Ctrl+C to stop and write metrics)",
-                gateway.local_address()?
-            );
-            let report = serve_gateway(gateway).await?;
-            write_report(&report, cli.output).await
-        }
-        Command::Simulate { address, workload } => {
-            let configuration = workload.configuration();
-            let report = simulation::run(address, configuration).await?;
-            write_report(&report, cli.output).await
-        }
-        Command::SimulateFromStdin { address } => {
-            let report = simulation::run(address, read_workload().await?).await?;
-            write_report(&report, cli.output).await
-        }
-        Command::Benchmark(arguments) => {
-            write_report(
-                &benchmark(
-                    arguments.runtime.configuration(),
-                    arguments.workload.configuration(),
-                )
-                .await?,
-                cli.output,
-            )
-            .await
-        }
-        Command::Suite(arguments) => write_report(&suite(arguments).await?, cli.output).await,
+fn print_summary(report: &SimulationReport) {
+    println!(
+        "sessions: {} admitted, {} rejected, {} failed; {} completed turns, {} rejected turns, {} tokens ({:.1} aggregate tokens/s)",
+        report.admitted_sessions,
+        report.rejected_sessions,
+        report.failed_sessions,
+        report.completed_turns,
+        report.rejected_turns,
+        report.received_tokens,
+        report.aggregate_tokens_per_second
+    );
+    println!(
+        "TTFT p50/p95/p99/max: {:.1}/{:.1}/{:.1}/{:.1} ms",
+        report.time_to_first_token_ms.p50_ms,
+        report.time_to_first_token_ms.p95_ms,
+        report.time_to_first_token_ms.p99_ms,
+        report.time_to_first_token_ms.max_ms
+    );
+    println!(
+        "token gap p50/p95/p99/max: {:.1}/{:.1}/{:.1}/{:.1} ms; {} gaps above target; {} sessions below rolling rate",
+        report.token_gap_ms.p50_ms,
+        report.token_gap_ms.p95_ms,
+        report.token_gap_ms.p99_ms,
+        report.token_gap_ms.max_ms,
+        report.token_gaps_over_target,
+        report.sessions_with_rolling_rate_violations
+    );
+}
+
+async fn save_report<T: Serialize + Sync>(path: &Path, report: &T) -> Result<(), ApplicationError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        tokio::fs::create_dir_all(parent).await?;
     }
+    tokio::fs::write(path, serde_json::to_vec_pretty(report)?).await?;
+    Ok(())
 }

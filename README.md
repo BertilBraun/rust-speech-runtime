@@ -1,140 +1,82 @@
-# Realtime voice inference runtime
+# Turn-based Rust speech inference scheduler
 
-The TCP gateway admits persistent sessions onto sticky GPU-like workers, batches sequenced audio, and echoes the exact input bytes. An external simulator sends 50 ms audio packets every 48–55 ms. GPU inference and KV state are simulated; socket transfer, serialization, scheduling and round-trip measurements are real.
+A Tokio gateway schedules persistent audio conversations across a configurable list of GPU workers. Ordinary WebSocket clients send user audio, commit the turn and receive streamed text tokens. Rust owns admission, sticky placement, turn state, dynamic batching, interruption and output acceptance. A persistent Python process per GPU owns the PyTorch model and complete hybrid conversation cache. There is no authentication, database, frontend or text-to-speech stage.
+
+The model is Whisper Small, a speech projection layer and Qwen3.5-2B. Complete utterances are encoded at commit because Whisper is bidirectional. Prior audio embeddings and accepted assistant tokens stay in the worker's cache across turns. The initial deployment may have two GPUs; the endpoint list controls GPU count.
+
+The agreed design is in [PLAN.md](PLAN.md), implementation evidence in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md), and tomorrow's checks in [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md). [PERFORMANCE.md](PERFORMANCE.md) preserves measurements of the superseded periodic audio-echo workload; those results do not establish this model's capacity. The old TCP echo transport and simulator have been replaced.
+
+## Run the pipeline
+
+Start actual model workers using [backend/README.md](backend/README.md). For local orchestration measurements, the separate test fixture implements the same worker protocol without loading a model:
 
 ```powershell
-cargo run --release -- benchmark --workers 8 --sessions 400 --batch-size 16 --inference-ms 12 --duration-secs 60 --output network-benchmark.json
-cargo run --release -- suite --duration-secs 5 --output scenarios.json
+# Terminal 1, from backend/.
+uv run python tests/fixture_worker.py --port 9100 --response-tokens 12 --prefill-ms 20 --decode-ms 12
+
+# Terminal 2, from the repository root.
+cargo run --release -- serve --runtime-config examples/runtime.json
+
+# Terminal 3: ordinary clients, random starts and 48–55 ms packets.
+cargo run --release -- benchmark --sessions 1 --turns 3
+cargo run --release -- benchmark --sessions 16 --turns 3 --report benchmark-results/turns.json
+cargo run --release -- benchmark --sessions 16 --turns 4 --interrupt-after-tokens 3 --churn-rounds 3 --report benchmark-results/interruption.json
+cargo run --release -- suite --session-budget 16 --sessions 8 --turns 2 --report benchmark-results/suite.json
+cargo run --example session
+```
+
+The fixture charges its full configured duration for every nonempty batch. Its response has 12 ordinary tokens followed by an accepted EOS token. This exercises transport, cache and scheduling; it does not measure GPU performance. `benchmark` connects to an independently running gateway and never bypasses the network. `suite` offers low/50%/80%/95%/120% of the explicit session budget, then aligned starts, jitter, churn and interruption. The budget is an offered-load reference rather than measured hardware capacity.
+
+Run the one-session warmup first so reactive estimates have observations. The example starts with a conservative 100 ms unknown-forward estimate; it can reject turns until it learns the active batch/context shapes. Warmup does not establish every future shape's cost or guarantee that all offered sessions will be accepted. Inspect reported rejections and measured hardware results before raising capacity.
+
+Use `--audio-file path/to/audio.pcm` for real speech. It must contain raw little-endian signed PCM16, mono, 16 kHz, up to 30 seconds. The benchmark sends silence when omitted. Use `--url ws://host:8080/v1` for another machine. Packet length follows the sampled 48–55 ms interval, keeping sample accounting consistent with capture time.
+
+`examples/runtime.json` is the canonical runtime configuration. Add or remove worker endpoints to change GPU count. Each endpoint refers to a ready, warmed worker exclusively owned by this gateway. Runtime JSON is strict: important fields are explicit and unknown fields fail. Tune session/cache limits, active-turn reservations, batch limits and reactive timing headroom on actual hardware. CLI `--listen`, `--max-connections`, `--archive-directory` and `--no-archive` concern only the gateway.
+
+## Public WebSocket protocol, version 1
+
+Connect to `/v1`; other paths receive an HTTP rejection. One connection owns one session. Controls and events are strict JSON tagged by `type`; unknown fields are rejected. Session IDs contain 1–128 bytes; turn IDs are unique within a session. This protocol version fixes audio to signed PCM16, mono, 16 kHz.
+
+```json
+{"type":"open","session_id":"conversation-123"}
+{"type":"start_turn","turn_id":1}
+{"type":"commit","turn_id":1,"chunk_count":20,"sample_count":16000}
+{"type":"cancel","turn_id":1}
+{"type":"close"}
+```
+
+After `start_turn` and before `commit`, send binary messages: eight bytes of little-endian `turn_id`, four bytes of little-endian zero-based `chunk_index`, then nonempty PCM16 samples. Indices must be contiguous; commit chunk/sample counts must match exactly. Duplicate commits with identical counts are idempotent. Post-commit audio needs a new turn. `start_turn` interrupts active generation and obtains the new capture reservation; rejected turns never accept audio.
+
+Events are `opened {session_id,worker_id}`, `accepted {turn_id}`, `text_delta {turn_id,generation,sequence,token_id,text}`, `finished {turn_id,generation,reason,generated_tokens}`, `failed {turn_id,code,message}` and `closed {session_id}`. EOS is an accepted model token and may have an empty text delta. A delta is not necessarily a word or character. Counts include EOS and empty deltas. Stable enum failure codes identify rejected work.
+
+The worker actor defines acceptance order. Interruption prevents further proposals from being accepted or consumed into cache. Already accepted events retain FIFO stream order before the next turn's acceptance, even when network delivery lags. Archives record accepted output rather than a delivery acknowledgement; a broken connection can retain committed tokens the client never received.
+
+Connection count, frame/message sizes, outbound queues and handshake/write/idle waits are bounded. The default incoming message limit is 16 KiB. A slow writer closes only its own connection. Audio/history limits belong to the runtime. Explicit close drains accepted events before `closed`; disconnect and shutdown also release backend state. Output activity keeps an active generator alive without requiring incoming audio.
+
+## Measurements and admission
+
+The objective is at least four accepted model tokens per second per generating session after its first token. The 250 ms next-token target is separate from end-of-turn-to-first-token latency. Reactive admission uses observed forward durations, batch shapes and context, reserves headroom and rejects turns when the budget is exhausted. It never assumes half-full batches take half the time.
+
+Client reports include TTFT and token-gap p50/p95/p99/max, aggregate throughput, per-session rates, rejections, failures and interruptions. Rolling throughput defaults to a two-second window sampled every 100 ms, including stalls without new output. Gaps above target are reported separately. Short responses have no rolling sample if they never span the window; token gaps and complete-turn rates remain visible. The response timeout bounds a whole generation. Aggregate wall throughput includes capture/thinking time; per-turn token rates exclude those phases. Churn closes conversations between rounds and creates fresh sessions.
+
+On Ctrl+C, the gateway closes sessions, drains archive work and prints admissions/rejections, stale proposals, saturation, queue/forward/stage distributions, batch fill, worker utilization and backend memory observations. Speech quality, GPU cache parity, VRAM limits and sustainable concurrency require the trained checkpoint and hardware validation.
+
+## Session records
+
+Closed conversations are archived under `session-archives/` by default. Records contain timestamps, session/worker IDs, backend model/manifest identity, original PCM16, turn commit/finish state, exact accepted token IDs/text and token timing. Audio is currently represented as JSON integer arrays: inspectable but less compact than binary sidecars. History is bounded and never silently truncated.
+
+Archival has a bounded queue and one blocking file writer outside Tokio async workers. Files are flushed, synced and atomically renamed from a temporary file. Queue rejection and disk errors are logged and counted. Archive overload can explicitly fail a record rather than consume unlimited memory; configure capacity and disk throughput for expected churn.
+
+## Code and validation
+
+`runtime.rs` exposes `Node`, `Ingress` and session handles. `session/` owns placement/lifecycle and records; `worker/` owns scheduling/execution; `scheduler/` owns fairness/cost estimates. `protocol/` defines canonical public models and the typed backend boundary. `transport/` separates connection control, bounded writing, client/codec and archives. `simulation/` contains ordinary network workloads and client measurements. Model-specific code lives under `backend/src/voice_worker/`.
+
+```powershell
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+# After installing the backend uv environment:
+cargo test --locked --test transport python_worker_process_to_websocket_client_full_pipeline -- --ignored --nocapture
 ```
 
-`benchmark` starts the gateway in its process and launches the simulator as a separate executable. It uses loopback TCP rather than calling the runtime directly. `suite` measures capacity first, then exercises low/50%/80%/95% load, excess session attempts, aligned arrivals, random phases, 48–55 ms jitter, churn, cache replay, slowdown and channel saturation. Stress scenarios intentionally cause explicit failures; they are reported alongside healthy scenarios.
-
-For an independently running gateway and simulator, use two terminals:
-
-```powershell
-# Terminal 1; Ctrl+C drains the runtime and writes server metrics.
-cargo run --release -- serve --listen 127.0.0.1:9000 --output gateway.json
-
-# Terminal 2; can also run on another machine using the gateway's address.
-cargo run --release -- simulate --address 127.0.0.1:9000 --sessions 400 --duration-secs 60 --output client.json
-```
-
-Each TCP connection owns a generation-scoped session lease. Old connections cannot send into, evict the cache of, or close a recreated session with the same ID. The in-process control API can target either a current session ID or a specific lease; the network gateway always uses its lease. Messages use a four-byte big-endian length prefix and bincode 2 serialization, with a 32 MiB maximum frame. The negotiated admission response carries assignment, deadline and audio limits. Connections use TCP_NODELAY; connection count, channel capacities, packet size and prefix size are bounded. This is a trusted gateway/runtime interface, with authentication handled upstream as specified in the project scope.
-
-`Node::start` is async: each worker calibrates its device before admission opens. Capacity uses rolling p95 modeled device duration, a safety factor, the packet deadline and minimum arrival interval, compute headroom, a batch-fill reserve, and cache slots. Current configured device cost is also a lower bound, so a known slowdown affects admission before its first result arrives. Host delay is measured through scheduler result handling. Admission reserves the largest delay in its bounded rolling window; recovery grace absorbs this host reserve before any excess is subtracted from compute budget. Reports expose both host p95 and the full measured `admission_host_reserve_ms`. A timing spike can reduce new admissions without becoming fictitious GPU compute or triggering mass capacity shedding. Admission also considers the completion horizon of submitted device jobs and the fixed-cost batches and cache replays still awaiting submission. A large replay can therefore pause new sessions even when session slots remain free. If estimated device capacity falls below existing load, excess sessions are explicitly terminated. Reported initial/final session limits include host budget; a hard session cap is only an upper bound.
-
-The default contract is one packet every 48 ms or more, with a 50 ms per-packet deadline. The simulator generates 1,600-byte PCM-sized packets (50 ms of mono 16-bit audio at 16 kHz). Sessions have random initial capture phases and independently chosen 48–55 ms intervals. A shared pacing thread generates intervals independently of response completion; each session has four bounded queued captures and one active exchange. Each capture schedules the next 48–55 ms later, so a delayed timer never emits a catch-up burst. Actual capture intervals and timer delays are measured, including OS-induced gaps. Queue overflow explicitly fails the session. An idle device uses a 5 ms collection window by default; full batches and batches covering all assigned sessions launch immediately. Timer wakeups can exceed the configured window. Already-queued input commands join an idle partial batch before submission. While the device is occupied, the scheduler collects and prepares its successor batch without adding this idle collection window. `--batch-wait-ms` controls the idle window. Deadlines belong to packets, rather than advancing on a session clock. One scheduler exclusively owns each worker's state.
-
-The simulator waits until every session task has initialized its input loop before starting audio capture. Admission and setup durations are reported separately. Packet deadlines begin at capture; this readiness barrier keeps benchmark initialization outside the audio stream while retaining real pacing, socket and scheduler delays.
-
-A single simulator metrics task owns packet histograms and its eight worst traces, receiving samples through a bounded channel. Session tasks retain lightweight counters, rather than duplicating every histogram per session. `SimulationConfig::metric_channel_capacity` controls this mailbox; saturation drops diagnostic samples and increments `metric_samples_dropped`, while audio continues. Nonzero sample loss means latency distributions are incomplete and must be considered alongside that counter.
-
-Each simulated device owns a serialized, bounded command queue. The default `--device-wait tokio` runs its mock completion loop as a separate Tokio task; native wait diagnostics run that same loop on a dedicated blocking-pool thread. Every nonempty ordinary batch has the configured compute duration, independent of how many slots are filled. Device completion on the simulated timeline is separate from when the host observes it. Host notification delay remains part of packet latency and deadline checks. Reports distinguish modeled device utilization from observed worker occupancy. GPU kernels are mocked: these executor choices compare host completion mechanisms, rather than executing real GPU instructions. There is never one OS thread per session.
-
-Native wait diagnostics include `--device-wait sleep`, `--device-wait hybrid:200us` (sleep followed by at most a 200 microsecond spin), and `--device-wait poll:500ns` (repeated short sleeps until absolute completion). All use the same fixed batch cost, queue limits, cancellation and deadline checks as the Tokio mode. The requested polling interval is not a guarantee that the OS wakes the thread every 500 ns. Compare host completion delay and CPU usage before selecting a wait strategy.
-
-Expired device completions and overdue pacer events bypass sleeping. The hybrid strategy also skips its sleep when already inside the spin tail. This matters because [Rust 1.99's Windows implementation](https://github.com/rust-lang/rust/blob/1.99.0/library/std/src/sys/thread/windows.rs) maps `sleep(Duration::ZERO)` to `Sleep(0)`, which yields the thread rather than performing a free no-op. Positive sleeps attempt a high-resolution waitable timer; a timing spike alone does not prove a coarse timer fallback or a particular interrupt cause.
-
-Reports measure process CPU seconds and average logical cores for both the gateway and external simulator. A device's `device_cpu` distinguishes a measured dedicated thread from the shared Tokio runtime; shared task CPU is included in process usage, and is not reported as zero device CPU. Process measurements cover serving/simulation through shutdown; dedicated-thread measurements also include calibration and idle time. CPU usage is distinct from simulated device utilization: a waiting mock device can be 100% occupied while consuming very little CPU.
-
-The scheduler maintains an EDF selection while device work is running. Full batches can be submitted immediately; partial successors are submitted shortly before the preceding device completion. The bounded device command queue defaults to two waiting jobs in addition to one running job. When every assigned session already has an input outstanding, its final partial batch is prequeued immediately. Work awaiting a delayed host notification is distinguished from modeled computation still in progress, allowing the idle collection rule to apply to a new audio wave. Result handling does not gate the start of already-submitted work. Modeled batches execute serially, each for its full configured duration, on an autonomous device timeline; the host still waits for and observes every result. A host stall cannot retroactively delay an already-enqueued GPU kernel in this model, but it can still make its network result late. Closed sessions carry cancellation timestamps: work cancelled before its modeled start skips compute, while cancellation after start only invalidates its result. Queues and retained traces remain bounded.
-
-`--device-queue-capacity 2` and `--launch-ahead-us 2000` expose device pipelining controls. Profiles time the EDF preparation and job assembly scopes separately from `scheduler_queue` residence before submission and `device_queue` residence after submission. These scope measurements use elapsed wall time and can include preemption; process and dedicated-thread CPU measurements are separate. Queue delays are not CPU time spent constructing a batch. Histograms preserve nanosecond samples and report milliseconds. Reports also count preparation updates during outstanding inference, batches submitted before their predecessor completes and the maximum number of outstanding device jobs. `--latency-safety-factor` exposes the admission service-time reserve for capacity experiments.
-
-Audio packets carry a sequence and the fingerprint of their preceding prefix. Each worker owns a bounded cache pool containing fake KV-prefix fingerprints. Inference updates the entire logical prefix and returns the original audio bytes. Cache eviction preserves logical session history but invalidates GPU-local KV state. A subsequent cache miss requests replay of all preceding audio; replay is verified and contributes proportional simulated compute cost.
-
-Closing a session releases its admission slot immediately, but a cache slot referenced by submitted device work remains retired until that work completes. A replacement can be rejected temporarily when all cache slots are still in use. Reports expose peak retired cache slots, and a test verifies that cancelled inference cannot reuse a replacement's cache memory.
-
-Cache contents are also pinned while an input is pending or submitted. Explicit eviction returns false during that interval; once inference finishes, eviction invalidates the cache and the next input must replay its preceding audio. This avoids invalidating cache data still needed by an outstanding kernel.
-
-A worker retains at most one pending or running packet per session. Audio is never coalesced or silently replaced. The simulator has a bounded four-packet capture queue so a delayed response can be recovered without dropping input history. A sequencing error, queue overflow, prefix limit, impossible replay or stalled session recovery explicitly fails the session. Cache misses are retryable without advancing the prefix. The external client retains the original audio history and automatically replays it after a cache miss. Closing/recreating a session assigns a new generation; old physical results cannot reach its replacement.
-
-An otherwise viable cache replay is deferred to a successor batch when adding it would make an earlier packet late. It is rejected only when its own projected completion cannot meet its deadline, rather than merely because it cannot join the current batch. On a cache miss, the worker checks its known prefix length against the minimum recovery compute cost before requesting an upload. Impossible recovery is rejected immediately; a submitted replay is checked before hashing, and again after validation and before device launch.
-
-Admission protects against predictable overload, not arbitrary OS stalls or unforeseen hardware failures. The 50 ms target and `--lateness-grace-ms 10` define the playback budget. Output beyond 60 ms is counted as discarded audio, while its input still advances both prefixes and the next packet uses the same cache. A separate negotiated progress budget bounds session recovery: playback budget plus three minimum input intervals, or 204 ms by default. This recovery time does not increase admission capacity. Stalled recovery, invalid input and queue overflow end the session. A known unsustainable worker slowdown revokes sessions on its configured timer, without waiting to launch another batch.
-
-Defaults cap admission at 56 sessions per worker, or 448 across eight workers. Admission reserves a 5 ms scheduling margin: `(48 - 5) * 1.0 = 43 ms`. Its steady packet-rate estimate is `floor(43 * 16 / 12) = 57` sessions before the hard cap. A separate burst check counts only whole fixed-cost batches that fit the playback budget and host reserve; a partly filled batch still costs 12 ms. Cache capacity and queue/host pressure can lower actual admission. `--scheduling-margin-ms`, `--admission-headroom` and `--batch-fill-reserve` expose additional reserves. The default service safety factor is 1 because this mock has a known fixed cost. `--lateness-grace-ms 0` removes playback grace; `--quality-miss-limit 1` ends a simulated session on its first missed target. Playback cutoff alone does not invalidate the input cache. These are model-based admission estimates with host slack, rather than hard realtime guarantees against arbitrary OS stalls.
-
-Before the Rust cleanup, the random-arrival policy passed a five-minute Windows run at 408 admissions: 2.36 million echoes, 781 packets over 50 ms including 161 discarded outputs over 60 ms, no session failures and no four-miss clusters. Maximum misses in any ten-packet window were two. RTT p99/max were 30.0/75.1 ms. A minute run sustained 440 admissions without session or quality failures. Admission calibration explains the different admitted counts; 448 is an upper bound. Modeled GPU utilization was about 99% despite roughly 21 ms mean RTT, so increasing capacity depends on fuller batches rather than treating remaining RTT budget as idle device time. Synchronized arrivals are a separate stress scenario. Read [PERFORMANCE.md](PERFORMANCE.md) for current and historical results, including the failed post-refactor smoke and passing short control repeat.
-
-Reports include admission rejections, failed sessions by reason, RTT for all received echoes within session recovery (including discarded output), missed-target latency, lateness, offered/echoed frames, pacing delay and cache replay work. `late_frames` counts every echo beyond the 50 ms target; `discarded_output_frames` counts its subset beyond the playback budget. `unrecovered_deadline_frames` counts timeout/deadline rejections that end a session. Maximum consecutive misses, maximum misses in a sliding packet window and quality-failed sessions expose clustered losses. Gateway metrics include queue delay, inference latency, scheduling latency, deadline misses, stale results, capacity terminations, channel saturation, batch fill and worker utilization. Every latency distribution includes p50/p95/p99/max. Client RTT starts at original capture; gateway latency starts at ingress.
-
-Latency profiles separate ingress, worker mailbox, prefix validation, waiting before submission, waiting in the device queue, modeled device execution, host completion delay, result delivery and gateway return. Host device-thread wakeup delay is a separate diagnostic that can overlap modeled execution and is not added again to packet latency. Audio replies carry duration measurements, allowing the external client to measure capture-to-task delay and the remaining round-trip time outside the instrumented server. That remainder includes socket transfer, encoding/decoding and client echo verification; it is not a measurement of network transit alone. Cache replay retries also contribute to the remainder. Percentiles from different stages cannot be added to obtain a round-trip percentile.
-
-Each worker and the client retain only their eight slowest packet traces. Server and simulator runtime monitors measure lateness of a five-millisecond timer without busy waiting or catch-up bursts. Device profiles separately measure `host_completion_delay`, the time between modeled completion and its observation by the device executor. This can include delayed wakeups and result-channel backpressure, so it does not identify a specific OS cause. Profiles have fixed-size histograms and bounded trace storage, and add clock reads, histogram updates and a small diagnostic payload to each echo.
-
-An echo received or observed after the original target is a miss for quality accounting, including outputs discarded after the grace period. `LateEcho`, `ExpiredEcho` and `UnrecoveredEcho` traces preserve measured server stages and lateness. A validated output within bounded recovery advances input history even when its playback deadline expired. By default, four misses in any ten-packet window (approximately half a second) produce `DeadlineMissBurst` and end that session; isolated misses and discarded outputs continue. Configure this with `--quality-window-packets` and `--quality-miss-limit`; a four-packet window and limit four checks consecutive misses only. Hard failures remain separate. These are serving-quality proxies; mock audio does not establish perceptual quality or implement concealment of missing output audio. Timeouts without an echo retain a failure trace without inventing unavailable stages.
-
-The TCP client's `infer_audio` returns `Result<AudioDelivery, ClientError>`. `AudioDelivery::OnTime`, `Late` and `Discarded` carry validated echoes and preserve the input prefix; the caller decides how to play or discard the output. Errors represent terminal exchange failures. The simulator checks delivery timing again when it observes the result, so delayed task scheduling cannot hide a missed target.
-
-Try `--phase aligned --min-interval-ms 50 --max-interval-ms 50`, `--evict-every 10`, or `--churn-secs 10`. Worker stress controls include `--slowdown-after-secs 3 --slowdown-ms 30` and `--worker-channel-capacity 1 --worker-input-delay-ms 20`. `RuntimeConfig`, `GatewayConfig` and `SimulationConfig` are the canonical configuration types; the CLI exposes common overrides. `examples/session.rs` demonstrates the direct library API.
-
-Aligned sessions with a fixed interval share a capture clock on every wave, rather than accumulating separate timer drift after an aligned start. Jitter gives sessions independent next intervals; random phases start independently. Delayed capture schedules the next wave from its actual timestamp, preserving the no-catch-up policy. Client start delay includes the time required to distribute a simultaneous capture wave to session tasks.
-
-Tests cover calibration/admission, EDF batching, sticky echoing, prefix continuity, cache miss/replay and replay cost, prefix limits, cancellation during inference, generation reuse, bounded mailbox overload, worker slowdown, timeouts and 2,000 concurrent sessions on eight device workers. TCP tests verify exact payloads, reclaimed admission slots, prefix replay, disconnects during physical inference, oversized frames, churn, and cancellation-safe message reception.
-
-The current profiling results and their limits are documented in [PERFORMANCE.md](PERFORMANCE.md). Batch preparation takes microseconds; time spent waiting for input or a queued device job is reported separately. Sustained runs have exposed host timing spikes on both Windows and WSL, so the default admission ceiling is not a certified zero-failure capacity.
-
-## Rust code guide
-
-| Responsibility | Code |
-| --- | --- |
-| Public runtime API and shutdown | [runtime.rs](src/runtime.rs) |
-| Session routing, leases and admission coordination | [session/manager.rs](src/session/manager.rs) |
-| Owned worker state and control loop | [worker/actor.rs](src/worker/actor.rs) |
-| Worker admission and deadline budgets | [actor/admission.rs](src/worker/actor/admission.rs) |
-| Input validation and cache replay | [actor/input.rs](src/worker/actor/input.rs) |
-| EDF preparation, device submission and completion | [actor/scheduling.rs](src/worker/actor/scheduling.rs) |
-| Bounded worker messages and mock device execution | [mailbox.rs](src/worker/mailbox.rs), [mock_gpu.rs](src/worker/mock_gpu.rs) |
-| TCP accept loop and bounded connection tasks | [gateway.rs](src/transport/gateway.rs) |
-| Owned connection lifecycle and audio exchanges | [connection.rs](src/transport/connection.rs) |
-| Cancellation-safe framing | [wire.rs](src/transport/wire.rs) |
-| Simulated capture, session behavior and reporting | [pacing.rs](src/simulation/pacing.rs), [session.rs](src/simulation/session.rs), [report.rs](src/simulation/report.rs) |
-| CLI argument overrides and process orchestration | [cli.rs](src/cli.rs), [main.rs](src/main.rs) |
-
-The private `Worker` owns scheduling and cache state. Its child modules implement focused methods on that same owner. Messages transfer work by ownership, and `Bytes` shares audio buffers cheaply. Cache replay consumes the uploaded history during validation; device jobs retain the current packet and verified prefix. A cancelled session's cache slot remains pinned until its submitted work physically completes.
-
-Dependencies follow the serving flow: TCP connections use the public ingress API, the session manager routes to workers, and workers use deadline/admission policies, cache state and the mock device. Worker code has no dependency on TCP or the simulator. Each connection owns its peer and generation-scoped lease; its request loop delegates opening, audio exchange, interruption and closing to focused methods. Packet invariants and replay validation are separate from worker queue mutation. Simulator lifecycle helpers consume closed audio connections explicitly.
-
-Functions should perform one operation at one level of abstraction. Modules group a cohesive responsibility, configuration has one typed owner per component, and protocol alternatives use enums. Pure scheduling policies are tested without a transport; integration tests exercise the runtime and TCP contracts, including cancellation and bounded overload. Keep ownership and dependency direction explicit when extending the prototype.
-
-Explicit shutdown cancels sessions and awaits submitted device work. Dropping the node requests cancellation, and scoped cancellation guards cover startup failures and early returns in serving, benchmarking and simulation. Calibration stops submitting probes after cancellation; its running probe finishes. The serving task handles Ctrl+C directly. The client models recoverable audio delivery with enum variants, while terminal failures use typed errors.
-
-Configuration defaults and validation belong to `RuntimeConfig`, `GatewayConfig` and `SimulationConfig`. Scheduler internals stay private to the library. Tokio's paused-clock support is a development dependency. Cargo forbids unsafe code and denies ignored must-use results, locks held across awaits, debug macros and unfinished implementations. Validate changes with `cargo test --locked`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo fmt --check`, and `cargo doc --no-deps --locked` with `RUSTDOCFLAGS=-D warnings`.
-
-## Historical baseline, 2026-10-05
-
-On this Windows machine, the 2026-10-05 release benchmark with eight 12 ms mock devices, 400 attempted sessions and 60 seconds of 48–55 ms packet arrivals admitted 64 sessions and rejected 336 before any audio processing. All 73,965 attempted packets were echoed: no failed sessions, deadline misses, capacity terminations or channel saturation. Round-trip p50/p95/p99/max were 22.4/25.6/26.2/39.1 ms. Batch fill was 16.3%, device utilization 72.8%, and node throughput about 1,221 packets/second. These are measured prototype results, rather than a universal capacity claim.
-
-The three-second-per-case suite also completed low/50%/80%/95% load, capacity overload, aligned/random arrivals, jitter, churn and forced cache replay without session failures or physical deadline misses. Intentional worker slowdown and channel saturation explicitly failed affected sessions and exposed their causes in metrics. Local reports are in `benchmark-results/network-verified-400.json` and `benchmark-results/network-suite-final.json`. All 31 tests, strict Clippy and formatting checks passed. These results describe the earlier implementation, before the changes and longer experiments below.
-
-## Historical latency profiling before device pipelining, 2026-10-06
-
-Three sequential release runs used eight workers, batches of up to 16, requested 12 ms inference, a 50 ms capture-to-echo deadline, 1,600-byte packets, random phases and 48–55 ms arrivals. Each attempted 400 sessions and ran for 60 seconds. These diagnostic runs raised admission headroom and batch-fill reserve to 1; the normal admission defaults were not raised.
-
-| Per-worker session cap | Batch wait | Admitted | Failed sessions | Successful RTT p99 | Mean batch size | Device busy fraction |
-| --- | --- | --- | --- | --- | --- | --- |
-| 24 | 10 ms | 192 | 0 | 25.4 ms | 6.13 / 16 | 92.0% |
-| 32 | 10 ms | 256 | 0 | 25.4 ms | 7.96 / 16 | 95.4% |
-| 32 | 20 ms | 256 | 38 | 33.9 ms | 12.60 / 16 | 56.1% |
-
-The last row includes time after 38 sessions failed, so its utilization is not a measurement at a sustained 256 active sessions. The zero-failure rows are observations from individual runs; earlier minute-long runs at 128 and 192 sessions failed, and none of these establish a reliable admission ceiling. Changes in host scheduling conditions and profiling instrumentation can affect timing.
-
-At 256 sessions with a 10 ms batch window, mean ingress delay was 0.007 ms, worker mailbox and prefix validation each took about 0.004 ms, batch waiting about 6.7 ms, device dispatch about 0.05 ms, and result delivery about 0.035 ms. Mean physical inference was 12.34 ms per batch. The client measured 0.052 ms mean capture-to-task delay and 0.163 ms mean remaining round-trip time outside the instrumented server, including serialization, both socket directions and client processing. A two-second CPU sample during this run measured approximately one logical core combined for the gateway and simulator on this eight-logical-processor machine. Normal CPU/routing work was not the dominant latency source.
-
-The tail traces expose a different problem. A 43.3 ms successful packet spent 18.8 ms waiting for a batch, 12.1 ms waiting for the device thread to begin, and 12.1 ms executing. In the 20 ms batch-window run, session 282 packet 675 spent 21.072 ms waiting, 0.006 ms in device dispatch, **37.879 ms inside the requested 12 ms blocking sleep**, and 0.518 ms in result delivery. Ingress, mailbox and prefix validation together took only 0.013 ms. Its client received a deadline rejection after 61.03 ms. The run recorded 25 server completion overruns, four stale results and 38 failed client sessions; the pacer also measured a 47.5 ms wakeup delay.
-
-The measured failure path is delayed blocking-sleep completion plus existing batch wait. A device-dispatch interval contains channel handoff and thread scheduling, so a long dispatch does not by itself identify a Windows scheduler or Tokio defect. The CPU work inside routing is small, and the mock execution interval contains only `std::thread::sleep`; further system-level tracing would be needed to attribute that sleep overshoot to a particular OS mechanism. Increasing batch wait improves throughput efficiency but consumes deadline slack and did not meet the zero-failure requirement in this experiment. The next scheduling change should explicitly balance batch fill against the measured wakeup tail, rather than assuming GPU utilization alone predicts deadline safety.
-
-Reproduce the comparisons with:
-
-```powershell
-cargo run --release -- benchmark --sessions 400 --duration-secs 60 --admission-headroom 1 --batch-fill-reserve 1 --max-sessions-per-worker 24 --output benchmark-results/profile-192.json
-cargo run --release -- benchmark --sessions 400 --duration-secs 60 --admission-headroom 1 --batch-fill-reserve 1 --max-sessions-per-worker 32 --output benchmark-results/profile-256.json
-cargo run --release -- benchmark --sessions 400 --duration-secs 60 --admission-headroom 1 --batch-fill-reserve 1 --max-sessions-per-worker 32 --batch-wait-ms 20 --output benchmark-results/profile-256-wait20.json
-```
-
-The profiles and bounded slow traces are included in each JSON report. Profiling validation covers injected ingress/mailbox/batching delay, complete stage accounting, TCP timing bounds and retention of the eight worst traces. All 33 tests, strict Clippy and formatting checks passed.
+Ordinary Rust tests use test-local workers over real framed TCP. The explicit cross-language test starts a Python fixture process and exercises IPC, Rust scheduling and ordinary WebSocket clients together. Python and GPU test instructions are in the backend README.

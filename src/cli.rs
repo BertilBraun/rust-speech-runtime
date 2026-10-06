@@ -1,203 +1,114 @@
-use clap::{Args, Parser, Subcommand};
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
-use voice_scheduler::{
-    config::{DeviceWait, RuntimeConfig, WorkerSlowdown},
-    simulation::{ArrivalPhase, SimulationConfig},
-};
+
+use clap::{Args, Parser, Subcommand};
+use voice_scheduler::{simulation::SimulationConfig, transport::GatewayConfig};
 
 #[derive(Parser)]
-#[command(about = "Realtime audio echo gateway and external TCP benchmark")]
-pub(super) struct Cli {
-    #[arg(long, global = true)]
-    pub(super) output: Option<PathBuf>,
+#[command(
+    version,
+    about = "Turn-based speech gateway with sticky GPU workers and bounded scheduling"
+)]
+pub struct Cli {
     #[command(subcommand)]
-    pub(super) command: Command,
+    pub command: Command,
 }
+
 #[derive(Subcommand)]
-pub(super) enum Command {
-    Serve {
-        #[arg(long, default_value = "127.0.0.1:9000")]
-        listen: SocketAddr,
-        #[command(flatten)]
-        runtime: RuntimeArguments,
-    },
-    Simulate {
-        #[arg(long, default_value = "127.0.0.1:9000")]
-        address: SocketAddr,
-        #[command(flatten)]
-        workload: WorkloadArguments,
-    },
-    #[command(name = "simulate-stdin", hide = true)]
-    SimulateFromStdin {
-        #[arg(long)]
-        address: SocketAddr,
-    },
+pub enum Command {
+    Serve(ServeArguments),
     Benchmark(BenchmarkArguments),
-    Suite(BenchmarkArguments),
+    Suite(SuiteArguments),
 }
-#[derive(Clone, Default, Args)]
-pub(super) struct RuntimeArguments {
+
+#[derive(Args)]
+pub struct ServeArguments {
+    /// Canonical RuntimeConfig JSON with an arbitrary list of GPU worker endpoints.
     #[arg(long)]
-    workers: Option<usize>,
+    pub runtime_config: PathBuf,
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    pub listen: SocketAddr,
+    #[arg(long, default_value = "session-archives")]
+    pub archive_directory: PathBuf,
     #[arg(long)]
-    batch_size: Option<usize>,
-    #[arg(long)]
-    inference_ms: Option<u64>,
-    #[arg(long)]
-    device_wait: Option<DeviceWait>,
-    #[arg(long)]
-    device_queue_capacity: Option<usize>,
-    #[arg(long)]
-    launch_ahead_us: Option<u64>,
-    #[arg(long)]
-    deadline_ms: Option<u64>,
-    #[arg(long)]
-    lateness_grace_ms: Option<u64>,
-    #[arg(long)]
-    batch_wait_ms: Option<u64>,
-    #[arg(long)]
-    max_sessions_per_worker: Option<usize>,
-    #[arg(long)]
-    admission_headroom: Option<f64>,
-    #[arg(long)]
-    scheduling_margin_ms: Option<u64>,
-    #[arg(long)]
-    batch_fill_reserve: Option<f64>,
-    #[arg(long)]
-    latency_safety_factor: Option<f64>,
-    #[arg(long)]
-    worker_channel_capacity: Option<usize>,
-    #[arg(long)]
-    worker_input_delay_ms: Option<u64>,
-    #[arg(long, requires = "slowdown_ms")]
-    slowdown_after_secs: Option<u64>,
-    #[arg(long, requires = "slowdown_after_secs")]
-    slowdown_ms: Option<u64>,
+    pub no_archive: bool,
+    #[arg(long, default_value_t = 4096)]
+    pub max_connections: usize,
 }
-impl RuntimeArguments {
-    pub(super) fn configuration(&self) -> RuntimeConfig {
-        let mut configuration = RuntimeConfig::default();
-        if let Some(value) = self.workers {
-            configuration.workers = value;
+
+impl ServeArguments {
+    pub fn gateway_config(&self) -> GatewayConfig {
+        GatewayConfig {
+            listen_address: self.listen,
+            archive_directory: (!self.no_archive).then(|| self.archive_directory.clone()),
+            max_connections: self.max_connections,
+            ..GatewayConfig::default()
         }
-        if let Some(value) = self.batch_size {
-            configuration.batch_size = value;
-        }
-        if let Some(value) = self.inference_ms {
-            configuration.inference_latency = Duration::from_millis(value);
-        }
-        if let Some(value) = self.device_wait {
-            configuration.device_wait = value;
-        }
-        if let Some(value) = self.device_queue_capacity {
-            configuration.device_queue_capacity = value;
-        }
-        if let Some(value) = self.launch_ahead_us {
-            configuration.launch_ahead = Duration::from_micros(value);
-        }
-        if let Some(value) = self.deadline_ms {
-            configuration.packet_deadline = Duration::from_millis(value);
-        }
-        if let Some(value) = self.lateness_grace_ms {
-            configuration.packet_lateness_grace = Duration::from_millis(value);
-        }
-        if let Some(value) = self.batch_wait_ms {
-            configuration.max_batch_wait = Duration::from_millis(value);
-        }
-        if let Some(value) = self.max_sessions_per_worker {
-            configuration.max_sessions_per_worker = value;
-        }
-        if let Some(value) = self.admission_headroom {
-            configuration.admission_headroom = value;
-        }
-        if let Some(value) = self.scheduling_margin_ms {
-            configuration.scheduling_margin = Duration::from_millis(value);
-        }
-        if let Some(value) = self.batch_fill_reserve {
-            configuration.batch_fill_reserve = value;
-        }
-        if let Some(value) = self.latency_safety_factor {
-            configuration.latency_safety_factor = value;
-        }
-        if let Some(value) = self.worker_channel_capacity {
-            configuration.worker_channel_capacity = value;
-        }
-        if let Some(value) = self.worker_input_delay_ms {
-            configuration.worker_input_delay = Duration::from_millis(value);
-        }
-        if let (Some(after), Some(latency)) = (self.slowdown_after_secs, self.slowdown_ms) {
-            configuration.slowdown = Some(WorkerSlowdown {
-                after: Duration::from_secs(after),
-                inference_latency: Duration::from_millis(latency),
-            });
-        }
-        configuration
     }
 }
-#[derive(Clone, Default, Args)]
-pub(super) struct WorkloadArguments {
+
+#[derive(Args, Clone)]
+pub struct BenchmarkArguments {
+    #[arg(long, default_value = "ws://127.0.0.1:8080/v1")]
+    pub url: String,
+    #[arg(long, default_value_t = 8)]
+    pub sessions: usize,
+    #[arg(long, default_value_t = 2)]
+    pub turns: usize,
+    #[arg(long, default_value_t = 1000)]
+    pub utterance_ms: u64,
+    #[arg(long, default_value_t = 48)]
+    pub minimum_packet_ms: u64,
+    #[arg(long, default_value_t = 55)]
+    pub maximum_packet_ms: u64,
+    #[arg(long, default_value_t = 500)]
+    pub start_spread_ms: u64,
+    #[arg(long, default_value_t = 250)]
+    pub think_ms: u64,
+    #[arg(long, default_value_t = 4.0)]
+    pub target_tokens_per_second: f64,
+    #[arg(long, default_value_t = 2000)]
+    pub throughput_window_ms: u64,
+    #[arg(long, default_value_t = 120)]
+    pub timeout_secs: u64,
     #[arg(long)]
-    sessions: Option<usize>,
+    pub interrupt_after_tokens: Option<usize>,
+    #[arg(long, default_value_t = 1)]
+    pub churn_rounds: usize,
+    /// Raw signed little-endian PCM16, mono, 16 kHz; silence is used when omitted.
     #[arg(long)]
-    duration_secs: Option<u64>,
+    pub audio_file: Option<PathBuf>,
+    #[arg(long, default_value_t = 7)]
+    pub seed: u64,
     #[arg(long)]
-    min_interval_ms: Option<u64>,
-    #[arg(long)]
-    max_interval_ms: Option<u64>,
-    #[arg(long)]
-    payload_bytes: Option<usize>,
-    #[arg(long, value_enum)]
-    phase: Option<ArrivalPhase>,
-    #[arg(long)]
-    seed: Option<u64>,
-    #[arg(long)]
-    evict_every: Option<u64>,
-    #[arg(long)]
-    churn_secs: Option<u64>,
-    #[arg(long)]
-    quality_window_packets: Option<usize>,
-    #[arg(long)]
-    quality_miss_limit: Option<usize>,
+    pub report: Option<PathBuf>,
 }
-impl WorkloadArguments {
-    pub(super) fn configuration(&self) -> SimulationConfig {
-        let mut configuration = SimulationConfig::default();
-        if let Some(value) = self.sessions {
-            configuration.sessions = value;
+
+impl BenchmarkArguments {
+    pub fn workload(&self) -> SimulationConfig {
+        SimulationConfig {
+            sessions: self.sessions,
+            turns_per_session: self.turns,
+            utterance_ms: self.utterance_ms,
+            minimum_packet_ms: self.minimum_packet_ms,
+            maximum_packet_ms: self.maximum_packet_ms,
+            start_spread_ms: self.start_spread_ms,
+            think_ms: self.think_ms,
+            target_tokens_per_second: self.target_tokens_per_second,
+            throughput_window_ms: self.throughput_window_ms,
+            response_timeout: Duration::from_secs(self.timeout_secs),
+            interrupt_after_tokens: self.interrupt_after_tokens,
+            churn_rounds: self.churn_rounds,
+            audio_file: self.audio_file.clone(),
+            seed: self.seed,
         }
-        if let Some(value) = self.duration_secs {
-            configuration.duration = Duration::from_secs(value);
-        }
-        if let Some(value) = self.min_interval_ms {
-            configuration.minimum_interval = Duration::from_millis(value);
-        }
-        if let Some(value) = self.max_interval_ms {
-            configuration.maximum_interval = Duration::from_millis(value);
-        }
-        if let Some(value) = self.payload_bytes {
-            configuration.payload_bytes = value;
-        }
-        if let Some(value) = self.phase {
-            configuration.phase = value;
-        }
-        if let Some(value) = self.seed {
-            configuration.seed = value;
-        }
-        configuration.evict_every = self.evict_every;
-        configuration.churn_after = self.churn_secs.map(Duration::from_secs);
-        if let Some(value) = self.quality_window_packets {
-            configuration.quality.window_packets = value;
-        }
-        if let Some(value) = self.quality_miss_limit {
-            configuration.quality.miss_limit = value;
-        }
-        configuration
     }
 }
-#[derive(Clone, Args)]
-pub(super) struct BenchmarkArguments {
+
+#[derive(Args)]
+pub struct SuiteArguments {
     #[command(flatten)]
-    pub(super) runtime: RuntimeArguments,
-    #[command(flatten)]
-    pub(super) workload: WorkloadArguments,
+    pub benchmark: BenchmarkArguments,
+    /// Offered concurrency used as the reference capacity for the load sweep.
+    #[arg(long)]
+    pub session_budget: usize,
 }

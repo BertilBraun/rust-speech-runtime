@@ -1,306 +1,180 @@
-use super::{
-    ClientCounters, ClientEchoTrace, ClientPacketTrace, FailureReason, SimulationConfig,
-    quality::PacketQuality,
-};
-use crate::{
-    protocol::{CacheOutcome, PacketSequence, SessionId},
-    transport::{AudioDelivery, AudioSession, ClientError, ConnectOutcome, connect_session},
-};
+use std::{sync::Arc, time::Duration};
+
 use bytes::Bytes;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
-use std::{net::SocketAddr, time::Duration};
-use tokio::{
-    sync::{mpsc, oneshot},
-    time::Instant,
+use tokio::time::Instant;
+
+use crate::{
+    protocol::{ErrorCode, SessionEvent, SessionId, TurnId},
+    transport::{GatewayError, VoiceClient},
 };
-use tokio_util::sync::CancellationToken;
 
-pub(super) struct SessionInput {
-    pub(super) ticks: mpsc::Receiver<Instant>,
-    pub(super) cancellation: CancellationToken,
-    pub(super) ready: oneshot::Sender<()>,
-}
+use super::{
+    SimulationConfig,
+    measurements::{Measurements, TurnTiming},
+};
 
-pub(super) fn classify(error: ClientError) -> FailureReason {
-    match error {
-        ClientError::DeadlineExceeded | ClientError::RecoveryExceeded(_) => {
-            FailureReason::DeadlineExceeded
-        }
-        ClientError::Rejected(reason) => FailureReason::ServerRejected(reason),
-        ClientError::Wire(_) => FailureReason::Connection,
-        ClientError::Protocol(_) => FailureReason::Protocol,
-        ClientError::PrefixCapacity => FailureReason::PrefixCapacity,
-        ClientError::EchoMismatch => FailureReason::InvalidEcho,
-    }
-}
-
-pub(super) struct SimulatedSession {
-    session: Box<AudioSession>,
-    session_id: SessionId,
-    address: SocketAddr,
-    configuration: SimulationConfig,
-    metrics: mpsc::Sender<ClientPacketTrace>,
-    payload: Bytes,
-    counters: ClientCounters,
-    quality: PacketQuality,
-    random: SmallRng,
-    created_at: Instant,
-    lifetime: Option<Duration>,
-}
-
-impl SimulatedSession {
-    pub(super) fn new(
-        session: Box<AudioSession>,
-        session_id: SessionId,
-        address: SocketAddr,
-        configuration: SimulationConfig,
-        metrics: mpsc::Sender<ClientPacketTrace>,
-    ) -> Self {
-        let mut random = SmallRng::seed_from_u64(configuration.seed.wrapping_add(session_id.0));
-        let lifetime = configuration
-            .churn_after
-            .map(|duration| duration.mul_f64(random.random_range(0.5..=1.0)));
-        Self {
-            session,
-            session_id,
-            address,
-            metrics,
-            payload: Bytes::from(vec![42; configuration.payload_bytes]),
-            counters: ClientCounters {
-                admitted_sessions: 1,
-                ..ClientCounters::default()
-            },
-            quality: PacketQuality::new(configuration.quality),
-            configuration,
-            random,
-            created_at: Instant::now(),
-            lifetime,
-        }
-    }
-
-    pub(super) async fn run(mut self, input: SessionInput) -> ClientCounters {
-        let SessionInput {
-            mut ticks,
-            cancellation,
-            ready,
-        } = input;
-        self.created_at = Instant::now();
-        let _ = ready.send(());
-        loop {
-            let captured_at = tokio::select! {
-                _ = cancellation.cancelled() => {
-                    self.counters.failure(FailureReason::GeneratorOverrun);
-                    return self.counters;
-                }
-                tick = ticks.recv() => match tick {
-                    Some(tick) => tick,
-                    None => break,
-                },
-            };
-            if let Err(reason) = self.process_capture(captured_at).await {
-                self.counters.failure(reason);
-                if reason == FailureReason::DeadlineMissBurst {
-                    let _ =
-                        close_session(*self.session, &self.configuration, &mut self.counters).await;
-                }
-                return self.counters;
-            }
-            if self
-                .lifetime
-                .is_some_and(|duration| self.created_at.elapsed() >= duration)
-            {
-                match reopen_session(
-                    *self.session,
-                    self.address,
-                    self.session_id,
-                    &self.configuration,
-                    &mut self.counters,
-                )
-                .await
-                {
-                    Ok(ConnectOutcome::Admitted(session)) => {
-                        self.session = session;
-                        self.counters.admitted_sessions += 1;
-                        self.quality = PacketQuality::new(self.configuration.quality);
-                    }
-                    Ok(ConnectOutcome::Rejected(reason)) => {
-                        self.counters.admission(reason);
-                        return self.counters;
-                    }
-                    Err(reason) => {
-                        self.counters.failure(reason);
-                        return self.counters;
-                    }
-                }
-                self.created_at = Instant::now();
-                self.lifetime = self
-                    .configuration
-                    .churn_after
-                    .map(|duration| duration.mul_f64(self.random.random_range(0.5..=1.0)));
-            }
-        }
-        if let Err(reason) =
-            close_session(*self.session, &self.configuration, &mut self.counters).await
-        {
-            self.counters.failure(reason);
-        }
-        self.counters
-    }
-
-    async fn process_capture(&mut self, captured_at: Instant) -> Result<(), FailureReason> {
-        let sequence = self.infer_packet(captured_at).await?;
-        self.evict_if_due(sequence).await
-    }
-
-    async fn infer_packet(
-        &mut self,
-        captured_at: Instant,
-    ) -> Result<PacketSequence, FailureReason> {
-        self.counters.attempted_frames += 1;
-        let sequence = self.session.next_sequence();
-        let client_start_delay = captured_at.elapsed();
-        let outcome = self
-            .session
-            .infer_audio(self.payload.clone(), captured_at)
-            .await;
-        let round_trip = captured_at.elapsed();
-        let outcome = outcome.and_then(|delivery| {
-            self.session
-                .classify_echo(delivery.into_audio(), round_trip)
-        });
-        let delivery = match outcome {
-            Ok(delivery) => delivery,
-            Err(error) => {
-                let (reason, trace) = match error {
-                    ClientError::RecoveryExceeded(audio) => (
-                        FailureReason::DeadlineExceeded,
-                        ClientPacketTrace::UnrecoveredEcho(ClientEchoTrace::new(
-                            self.session_id,
-                            &audio,
-                            round_trip,
-                            client_start_delay,
-                            self.session.packet_deadline(),
-                        )),
-                    ),
-                    error => {
-                        let reason = classify(error);
-                        (
-                            reason,
-                            ClientPacketTrace::Failure {
-                                session_id: self.session_id,
-                                sequence,
-                                round_trip,
-                                client_start_delay,
-                                reason,
-                            },
-                        )
-                    }
-                };
-                self.emit(trace);
-                return Err(reason);
-            }
-        };
-        self.record_delivery(delivery, round_trip, client_start_delay)
-    }
-
-    fn record_delivery(
-        &mut self,
-        delivery: AudioDelivery,
-        round_trip: Duration,
-        client_start_delay: Duration,
-    ) -> Result<PacketSequence, FailureReason> {
-        let late = !matches!(delivery, AudioDelivery::OnTime(_));
-        let discarded = matches!(delivery, AudioDelivery::Discarded(_));
-        let audio = delivery.into_audio();
-        let trace = ClientEchoTrace::new(
-            self.session_id,
-            &audio,
-            round_trip,
-            client_start_delay,
-            self.session.packet_deadline(),
+pub(crate) async fn run(
+    url: Arc<str>,
+    configuration: Arc<SimulationConfig>,
+    audio: Bytes,
+    index: usize,
+    round: usize,
+) -> Measurements {
+    let session_id = format!("benchmark-{round}-{index}");
+    let mut measurements = Measurements::new(session_id.clone());
+    let mut random = SmallRng::seed_from_u64(
+        configuration
+            .seed
+            .wrapping_add((round * configuration.sessions + index) as u64),
+    );
+    let delay = random.random_range(0..=configuration.start_spread_ms);
+    tokio::time::sleep(Duration::from_millis(delay)).await;
+    if let Err(error) = conversation(
+        &url,
+        &configuration,
+        audio,
+        session_id,
+        &mut random,
+        &mut measurements,
+    )
+    .await
+    {
+        let capacity_rejection = matches!(
+            error,
+            GatewayError::Rejected(ErrorCode::CapacityExceeded, _)
         );
-        let trace = if discarded {
-            self.counters.discarded_output_frames += 1;
-            ClientPacketTrace::ExpiredEcho(trace)
-        } else if late {
-            ClientPacketTrace::LateEcho(trace)
+        if capacity_rejection && measurements.summary.admitted {
+            measurements.summary.rejected_turns += 1;
         } else {
-            ClientPacketTrace::Echo(trace)
-        };
-        self.emit(trace);
-        self.counters.echoed_frames += 1;
-        self.counters.late_frames += u64::from(late);
-        let burst = self.quality.observe(late);
-        self.counters.maximum_consecutive_misses = self
-            .counters
-            .maximum_consecutive_misses
-            .max(self.quality.consecutive_misses);
-        self.counters.maximum_window_misses = self
-            .counters
-            .maximum_window_misses
-            .max(self.quality.window_misses);
-        match audio.cache {
-            CacheOutcome::Hit => self.counters.cache_hits += 1,
-            CacheOutcome::Replayed { packets, bytes } => {
-                self.counters.replayed_frames += 1;
-                self.counters.replayed_packets += packets;
-                self.counters.replayed_bytes += bytes;
+            measurements.summary.rejected = capacity_rejection;
+        }
+        measurements.summary.failed = !capacity_rejection;
+        measurements.summary.error = Some(error.to_string());
+    }
+    measurements
+}
+
+async fn conversation(
+    url: &str,
+    configuration: &SimulationConfig,
+    audio: Bytes,
+    session_id: String,
+    random: &mut SmallRng,
+    measurements: &mut Measurements,
+) -> Result<(), GatewayError> {
+    let mut client = VoiceClient::connect(url, configuration.response_timeout).await?;
+    let worker_id = client.open(SessionId(session_id)).await?;
+    measurements.summary.worker_id = Some(worker_id);
+    measurements.summary.admitted = true;
+    let result = turns(&mut client, configuration, audio, random, measurements).await;
+    let cleanup = client.close().await;
+    result?;
+    cleanup
+}
+
+async fn turns(
+    client: &mut VoiceClient,
+    configuration: &SimulationConfig,
+    audio: Bytes,
+    random: &mut SmallRng,
+    measurements: &mut Measurements,
+) -> Result<(), GatewayError> {
+    for index in 0..configuration.turns_per_session {
+        let turn_id = TurnId(index as u64 + 1);
+        client.begin_turn(turn_id).await?;
+        let chunks = send_audio(client, turn_id, audio.clone(), configuration, random).await?;
+        let committed = Instant::now();
+        client.commit(turn_id, chunks, audio.len() / 2).await?;
+        generate(client, turn_id, committed, configuration, measurements).await?;
+        if index + 1 < configuration.turns_per_session {
+            tokio::time::sleep(Duration::from_millis(configuration.think_ms)).await;
+        }
+    }
+    Ok(())
+}
+
+async fn send_audio(
+    client: &mut VoiceClient,
+    turn_id: TurnId,
+    audio: Bytes,
+    configuration: &SimulationConfig,
+    random: &mut SmallRng,
+) -> Result<u32, GatewayError> {
+    let mut offset = 0;
+    let mut index = 0;
+    while offset < audio.len() {
+        let interval =
+            random.random_range(configuration.minimum_packet_ms..=configuration.maximum_packet_ms);
+        let packet_bytes = (interval as usize * 16 * 2).min(audio.len() - offset);
+        tokio::time::sleep(Duration::from_millis(packet_bytes as u64 / 32)).await;
+        client
+            .audio(turn_id, index, audio.slice(offset..offset + packet_bytes))
+            .await?;
+        offset += packet_bytes;
+        index += 1;
+    }
+    Ok(index)
+}
+
+async fn generate(
+    client: &mut VoiceClient,
+    turn_id: TurnId,
+    committed: Instant,
+    configuration: &SimulationConfig,
+    measurements: &mut Measurements,
+) -> Result<(), GatewayError> {
+    let mut timing = TurnTiming::new(committed);
+    let mut received = 0;
+    let mut previous_sequence = None;
+    let mut interrupted = false;
+    let mut observations = tokio::time::interval(Duration::from_millis(100));
+    observations.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let event = tokio::select! {
+            _ = tokio::time::sleep_until(committed + configuration.response_timeout) => return Err(GatewayError::Timeout),
+            _ = observations.tick() => {
+                timing.observe_rate(Instant::now(), measurements, configuration.target_tokens_per_second, Duration::from_millis(configuration.throughput_window_ms));
+                continue;
             }
-        }
-        if burst {
-            self.counters.quality_failed_sessions += 1;
-            Err(FailureReason::DeadlineMissBurst)
-        } else {
-            Ok(audio.sequence)
+            event = client.next_event() => event?,
+        };
+        match event {
+            SessionEvent::TextDelta {
+                turn_id: observed,
+                sequence,
+                ..
+            } if observed == turn_id => {
+                if previous_sequence.is_some_and(|previous| sequence != previous + 1) {
+                    return Err(GatewayError::Protocol("token sequence has a gap"));
+                }
+                previous_sequence = Some(sequence);
+                received += 1;
+                timing.token(
+                    Instant::now(),
+                    measurements,
+                    configuration.target_tokens_per_second,
+                );
+                if !interrupted && configuration.interrupt_after_tokens == Some(received) {
+                    client.cancel(turn_id).await?;
+                    interrupted = true;
+                }
+            }
+            SessionEvent::Finished {
+                turn_id: observed, ..
+            } if observed == turn_id => {
+                timing.finish(measurements);
+                if interrupted {
+                    measurements.summary.interrupted_turns += 1;
+                } else {
+                    measurements.summary.completed_turns += 1;
+                }
+                return Ok(());
+            }
+            SessionEvent::Failed { code, message, .. } => {
+                return Err(GatewayError::Rejected(code, message));
+            }
+            _ => {}
         }
     }
-
-    async fn evict_if_due(&mut self, sequence: PacketSequence) -> Result<(), FailureReason> {
-        if !self
-            .configuration
-            .evict_every
-            .is_some_and(|period| (sequence.0 + 1).is_multiple_of(period))
-        {
-            return Ok(());
-        }
-        match tokio::time::timeout(self.configuration.io_timeout, self.session.evict_cache()).await
-        {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(error)) => Err(classify(error)),
-            Err(_) => Err(FailureReason::Connection),
-        }
-    }
-
-    fn emit(&mut self, trace: ClientPacketTrace) {
-        if self.metrics.try_send(trace).is_err() {
-            self.counters.metric_samples_dropped += 1;
-        }
-    }
-}
-
-async fn close_session(
-    session: AudioSession,
-    configuration: &SimulationConfig,
-    counters: &mut ClientCounters,
-) -> Result<(), FailureReason> {
-    match tokio::time::timeout(configuration.io_timeout, session.close()).await {
-        Ok(Ok(_)) => {
-            counters.closed_sessions += 1;
-            Ok(())
-        }
-        _ => Err(FailureReason::Connection),
-    }
-}
-
-async fn reopen_session(
-    session: AudioSession,
-    address: SocketAddr,
-    session_id: SessionId,
-    configuration: &SimulationConfig,
-    counters: &mut ClientCounters,
-) -> Result<ConnectOutcome, FailureReason> {
-    close_session(session, configuration, counters).await?;
-    connect_session(address, session_id, configuration.io_timeout)
-        .await
-        .map_err(classify)
 }

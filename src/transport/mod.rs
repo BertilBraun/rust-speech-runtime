@@ -1,9 +1,13 @@
+//! Bounded public WebSocket transport and asynchronous session archives.
+
+mod archive;
 mod client;
+mod config;
 mod connection;
 mod gateway;
-mod wire;
+pub mod wire;
+mod writer;
 
-pub use client::{AudioDelivery, AudioSession, ClientError, ConnectOutcome, connect_session};
-pub use gateway::{Gateway, GatewayConfig, GatewayError, GatewayReport};
-
-pub use wire::WireError;
+pub use client::VoiceClient;
+pub use config::GatewayConfig;
+pub use gateway::{Gateway, GatewayError, GatewayReport};

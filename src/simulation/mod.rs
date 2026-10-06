@@ -1,134 +1,103 @@
-use crate::{
-    metrics::profile::monitor_runtime,
-    protocol::SessionId,
-    transport::{ConnectOutcome, connect_session},
-};
-use std::net::SocketAddr;
-use tokio::{sync::mpsc, task::JoinSet, time::Instant};
-use tokio_util::sync::CancellationToken;
+//! Ordinary WebSocket clients exercising capture, multi-turn generation and churn.
 
 mod config;
 mod measurements;
-mod pacing;
-mod quality;
 mod report;
 mod session;
 
-pub use config::{ArrivalPhase, SimulationConfig};
-use measurements::PacketMeasurements;
-pub use measurements::{ClientEchoTrace, ClientPacketTrace};
-use pacing::{PacerSlot, pace};
-pub use quality::PacketQualityPolicy;
-pub use report::{ClientCounters, FailureCount, FailureReason, SimulationReport};
-use session::{SessionInput, SimulatedSession, classify};
+use std::sync::Arc;
 
-const CAPTURE_QUEUE_CAPACITY: usize = 4;
+use bytes::Bytes;
+use tokio::{task::JoinSet, time::Instant};
+
+pub use config::SimulationConfig;
+pub use report::{SessionSummary, SimulationReport};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SimulationError {
-    #[error("session task exited before the workload was ready: {0}")]
-    Startup(#[from] tokio::sync::oneshot::error::RecvError),
-    #[error("CPU measurement failed: {0}")]
-    CpuClock(#[from] std::io::Error),
-    #[error("invalid simulation configuration: {0}")]
+    #[error("invalid workload configuration: {0}")]
     Configuration(&'static str),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     #[error(transparent)]
     Task(#[from] tokio::task::JoinError),
 }
+
 pub async fn run(
-    address: SocketAddr,
+    url: &str,
     configuration: SimulationConfig,
 ) -> Result<SimulationReport, SimulationError> {
     configuration.validate()?;
-    let cancellation = CancellationToken::new();
-    let _workload_cleanup = cancellation.clone().drop_guard();
-    let cpu = crate::metrics::cpu::ProcessCpuMeasurement::start()?;
-    let admission_start = Instant::now();
-    let mut connections = JoinSet::new();
-    for index in 0..configuration.sessions {
-        let timeout = configuration.io_timeout;
-        connections.spawn(async move {
-            (
-                SessionId(index as u64),
-                connect_session(address, SessionId(index as u64), timeout).await,
-            )
-        });
-    }
-    let mut admitted = Vec::new();
-    let mut counters = ClientCounters::default();
-    while let Some(result) = connections.join_next().await {
-        let (session_id, outcome) = result?;
-        match outcome {
-            Ok(ConnectOutcome::Admitted(session)) => admitted.push((session_id, session)),
-            Ok(ConnectOutcome::Rejected(reason)) => counters.admission(reason),
-            Err(error) => counters.failure(classify(error)),
+    let audio = load_audio(&configuration).await?;
+    let configuration = Arc::new(configuration);
+    let url: Arc<str> = Arc::from(url);
+    let started = Instant::now();
+    let mut ttft = measurements::histogram();
+    let mut gaps = measurements::histogram();
+    let mut sessions = Vec::with_capacity(configuration.sessions * configuration.churn_rounds);
+    for round in 0..configuration.churn_rounds {
+        let mut clients = JoinSet::new();
+        for index in 0..configuration.sessions {
+            clients.spawn(session::run(
+                url.clone(),
+                configuration.clone(),
+                audio.clone(),
+                index,
+                round,
+            ));
+        }
+        while let Some(result) = clients.join_next().await {
+            let measurement = result?;
+            ttft.add(&measurement.ttft)
+                .expect("matching histogram precision");
+            gaps.add(&measurement.token_gaps)
+                .expect("matching histogram precision");
+            sessions.push(measurement.summary);
         }
     }
-    let admission_secs = admission_start.elapsed().as_secs_f64();
-    let setup_start = Instant::now();
-    let mut tasks = JoinSet::new();
-    let mut slots = Vec::new();
-    let mut readiness = Vec::new();
-    let (metrics, packet_mailbox) = mpsc::channel(configuration.metric_channel_capacity);
-    let collector = tokio::spawn(PacketMeasurements::default().collect(packet_mailbox));
-    for (session_id, session) in admitted {
-        let (sender, receiver) = mpsc::channel(CAPTURE_QUEUE_CAPACITY);
-        let session_cancellation = cancellation.child_token();
-        let (ready, initialized) = tokio::sync::oneshot::channel();
-        readiness.push(initialized);
-        slots.push(PacerSlot {
-            sender,
-            cancellation: session_cancellation.clone(),
-        });
-        let workload = SimulatedSession::new(
-            session,
-            session_id,
-            address,
-            configuration.clone(),
-            metrics.clone(),
-        );
-        tasks.spawn(workload.run(SessionInput {
-            ticks: receiver,
-            cancellation: session_cancellation,
-            ready,
-        }));
-    }
-    drop(metrics);
-    for initialized in readiness {
-        initialized.await?;
-    }
-    let setup_secs = setup_start.elapsed().as_secs_f64();
-    let started = Instant::now();
-    let monitor_cancellation = cancellation.child_token();
-    let monitor = monitor_runtime(monitor_cancellation.clone());
-    let pacing_configuration = configuration.clone();
-    let pacer =
-        tokio::task::spawn_blocking(move || pace(slots, pacing_configuration, cancellation));
-    while let Some(result) = tasks.join_next().await {
-        counters.merge(result?);
-    }
-    let pacing = pacer.await?;
-    let elapsed_secs = started.elapsed().as_secs_f64();
-    monitor_cancellation.cancel();
-    let runtime_lag = monitor.await?;
-    let totals = collector.await?;
+    sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+    let elapsed_seconds = started.elapsed().as_secs_f64();
+    let received_tokens = sessions.iter().map(|session| session.received_tokens).sum();
     Ok(SimulationReport {
-        process_cpu: cpu.finish()?,
-        throughput_frames_per_sec: counters.echoed_frames as f64 / elapsed_secs.max(f64::EPSILON),
-        configuration,
-        elapsed_secs,
-        admission_secs,
-        setup_secs,
-        counters,
-        round_trip_latency: totals.round_trip.summary(),
-        failed_round_trip_latency: totals.failed_round_trip.summary(),
-        deadline_lateness: totals.deadline_lateness.summary(),
-        generator_delay: pacing.delay.summary(),
-        generated_intervals: pacing.intervals.summary(),
-        generator_overruns: pacing.overruns,
-        client_start_delay: totals.client_start_delay.summary(),
-        outside_server_latency: totals.outside_server.summary(),
-        slowest_packets: totals.slowest_packets,
-        runtime_lag,
+        elapsed_seconds,
+        offered_sessions: sessions.len(),
+        admitted_sessions: sessions.iter().filter(|session| session.admitted).count(),
+        rejected_sessions: sessions.iter().filter(|session| session.rejected).count(),
+        failed_sessions: sessions.iter().filter(|session| session.failed).count(),
+        completed_turns: sessions.iter().map(|session| session.completed_turns).sum(),
+        rejected_turns: sessions.iter().map(|session| session.rejected_turns).sum(),
+        interrupted_turns: sessions
+            .iter()
+            .map(|session| session.interrupted_turns)
+            .sum(),
+        received_tokens,
+        aggregate_tokens_per_second: received_tokens as f64 / elapsed_seconds,
+        sessions_with_rolling_rate_violations: sessions
+            .iter()
+            .filter(|session| session.rolling_rate_violations > 0)
+            .count(),
+        token_gaps_over_target: sessions
+            .iter()
+            .map(|session| session.token_gaps_over_target)
+            .sum(),
+        time_to_first_token_ms: measurements::distribution(&ttft),
+        token_gap_ms: measurements::distribution(&gaps),
+        sessions,
     })
+}
+
+async fn load_audio(configuration: &SimulationConfig) -> Result<Bytes, SimulationError> {
+    if let Some(path) = &configuration.audio_file {
+        let metadata = tokio::fs::metadata(path).await?;
+        if metadata.len() == 0 || metadata.len() > 960_000 || metadata.len() % 2 != 0 {
+            return Err(SimulationError::Configuration(
+                "audio file must contain at most 30 s of nonempty mono PCM16 at 16 kHz",
+            ));
+        }
+        return Ok(Bytes::from(tokio::fs::read(path).await?));
+    }
+    Ok(Bytes::from(vec![
+        0;
+        configuration.utterance_ms as usize * 32
+    ]))
 }

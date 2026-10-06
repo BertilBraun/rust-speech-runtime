@@ -1,182 +1,146 @@
-use super::FailureReason;
-use crate::{
-    metrics::{
-        LatencyHistogram,
-        profile::{PacketTimings, RETAINED_TRACES},
-    },
-    protocol::{AudioResult, PacketSequence, SessionId},
-};
-use serde::{Deserialize, Serialize};
-use std::{cmp::Reverse, time::Duration};
-use tokio::sync::mpsc;
+use std::{collections::VecDeque, time::Duration};
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ClientEchoTrace {
-    pub session_id: SessionId,
-    pub sequence: PacketSequence,
-    pub round_trip: Duration,
-    pub lateness: Duration,
-    pub client_start_delay: Duration,
-    pub outside_server: Duration,
-    pub server: PacketTimings,
+use hdrhistogram::Histogram;
+use tokio::time::Instant;
+
+use super::report::SessionSummary;
+use crate::metrics::LatencyDistribution;
+
+pub(crate) struct Measurements {
+    pub summary: SessionSummary,
+    pub ttft: Histogram<u64>,
+    pub token_gaps: Histogram<u64>,
 }
-impl ClientEchoTrace {
-    pub(super) fn new(
-        session_id: SessionId,
-        audio: &AudioResult,
-        round_trip: Duration,
-        client_start_delay: Duration,
-        packet_deadline: Duration,
-    ) -> Self {
+
+impl Measurements {
+    pub fn new(session_id: String) -> Self {
         Self {
-            session_id,
-            sequence: audio.sequence,
-            round_trip,
-            lateness: round_trip.saturating_sub(packet_deadline),
-            client_start_delay,
-            outside_server: round_trip.saturating_sub(client_start_delay + audio.timings.total()),
-            server: *audio.timings,
+            summary: SessionSummary::new(session_id),
+            ttft: histogram(),
+            token_gaps: histogram(),
         }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub enum ClientPacketTrace {
-    Echo(ClientEchoTrace),
-    LateEcho(ClientEchoTrace),
-    ExpiredEcho(ClientEchoTrace),
-    UnrecoveredEcho(ClientEchoTrace),
-    Failure {
-        session_id: SessionId,
-        sequence: PacketSequence,
-        round_trip: Duration,
-        client_start_delay: Duration,
-        reason: FailureReason,
-    },
+pub(crate) fn histogram() -> Histogram<u64> {
+    Histogram::new(3).expect("valid histogram precision")
 }
-impl ClientPacketTrace {
-    fn round_trip(&self) -> Duration {
-        match self {
-            Self::Echo(echo)
-            | Self::LateEcho(echo)
-            | Self::ExpiredEcho(echo)
-            | Self::UnrecoveredEcho(echo) => echo.round_trip,
-            Self::Failure { round_trip, .. } => *round_trip,
-        }
+
+pub(crate) fn record(histogram: &mut Histogram<u64>, duration: Duration) {
+    histogram
+        .record(duration.as_micros().clamp(1, 3_600_000_000) as u64)
+        .expect("duration clamped to histogram bounds");
+}
+
+pub(crate) fn distribution(histogram: &Histogram<u64>) -> LatencyDistribution {
+    LatencyDistribution {
+        count: histogram.len(),
+        p50_ms: histogram.value_at_quantile(0.50) as f64 / 1000.0,
+        p95_ms: histogram.value_at_quantile(0.95) as f64 / 1000.0,
+        p99_ms: histogram.value_at_quantile(0.99) as f64 / 1000.0,
+        max_ms: histogram.max() as f64 / 1000.0,
     }
 }
 
-#[derive(Default)]
-pub(super) struct PacketMeasurements {
-    pub round_trip: LatencyHistogram,
-    pub failed_round_trip: LatencyHistogram,
-    pub deadline_lateness: LatencyHistogram,
-    pub client_start_delay: LatencyHistogram,
-    pub outside_server: LatencyHistogram,
-    pub slowest_packets: Vec<ClientPacketTrace>,
+pub(crate) struct TurnTiming {
+    committed: Instant,
+    first_token: Option<Instant>,
+    previous_token: Option<Instant>,
+    arrivals: VecDeque<Instant>,
+    tokens: usize,
 }
-impl PacketMeasurements {
-    pub(super) async fn collect(mut self, mut events: mpsc::Receiver<ClientPacketTrace>) -> Self {
-        while let Some(packet) = events.recv().await {
-            match &packet {
-                ClientPacketTrace::Echo(echo) => {
-                    self.round_trip.record(echo.round_trip);
-                    self.client_start_delay.record(echo.client_start_delay);
-                    self.outside_server.record(echo.outside_server);
-                }
-                ClientPacketTrace::LateEcho(echo) => {
-                    self.round_trip.record(echo.round_trip);
-                    self.failed_round_trip.record(echo.round_trip);
-                    self.deadline_lateness.record(echo.lateness);
-                    self.client_start_delay.record(echo.client_start_delay);
-                    self.outside_server.record(echo.outside_server);
-                }
-                ClientPacketTrace::ExpiredEcho(echo) => {
-                    self.round_trip.record(echo.round_trip);
-                    self.failed_round_trip.record(echo.round_trip);
-                    self.deadline_lateness.record(echo.lateness);
-                    self.client_start_delay.record(echo.client_start_delay);
-                    self.outside_server.record(echo.outside_server);
-                }
-                ClientPacketTrace::UnrecoveredEcho(echo) => {
-                    self.failed_round_trip.record(echo.round_trip);
-                    self.deadline_lateness.record(echo.lateness);
-                    self.client_start_delay.record(echo.client_start_delay);
-                    self.outside_server.record(echo.outside_server);
-                }
-                ClientPacketTrace::Failure {
-                    round_trip,
-                    client_start_delay,
-                    ..
-                } => {
-                    self.failed_round_trip.record(*round_trip);
-                    self.client_start_delay.record(*client_start_delay);
-                }
+
+impl TurnTiming {
+    pub fn new(committed: Instant) -> Self {
+        Self {
+            committed,
+            first_token: None,
+            previous_token: None,
+            arrivals: VecDeque::new(),
+            tokens: 0,
+        }
+    }
+
+    pub fn token(&mut self, now: Instant, measurements: &mut Measurements, target: f64) {
+        if let Some(previous) = self.previous_token {
+            let gap = now - previous;
+            record(&mut measurements.token_gaps, gap);
+            if gap.as_secs_f64() > 1.0 / target {
+                measurements.summary.token_gaps_over_target += 1;
             }
-            self.slowest_packets.push(packet);
-            self.slowest_packets
-                .sort_unstable_by_key(|packet| Reverse(packet.round_trip()));
-            self.slowest_packets.truncate(RETAINED_TRACES);
+        } else {
+            record(&mut measurements.ttft, now - self.committed);
+            self.first_token = Some(now);
         }
-        self
+        self.previous_token = Some(now);
+        self.tokens += 1;
+        measurements.summary.received_tokens += 1;
+        self.arrivals.push_back(now);
+    }
+
+    pub fn observe_rate(
+        &mut self,
+        now: Instant,
+        measurements: &mut Measurements,
+        target: f64,
+        window: Duration,
+    ) {
+        while self
+            .arrivals
+            .front()
+            .is_some_and(|arrival| now - *arrival >= window)
+        {
+            self.arrivals.pop_front();
+        }
+        if self.first_token.is_some_and(|first| now - first >= window) {
+            let rate = self.arrivals.len() as f64 / window.as_secs_f64();
+            if rate < target {
+                measurements.summary.rolling_rate_violations += 1;
+            }
+            measurements.summary.minimum_rolling_tokens_per_second = Some(
+                measurements
+                    .summary
+                    .minimum_rolling_tokens_per_second
+                    .map_or(rate, |previous| previous.min(rate)),
+            );
+        }
+    }
+
+    pub fn finish(&self, measurements: &mut Measurements) {
+        if self.tokens > 1 {
+            let duration = self.previous_token.expect("tokens observed")
+                - self.first_token.expect("tokens observed");
+            let rate = (self.tokens - 1) as f64 / duration.as_secs_f64().max(f64::EPSILON);
+            measurements.summary.minimum_turn_tokens_per_second = Some(
+                measurements
+                    .summary
+                    .minimum_turn_tokens_per_second
+                    .map_or(rate, |previous| previous.min(rate)),
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientEchoTrace, ClientPacketTrace, PacketMeasurements};
-    use crate::{
-        metrics::profile::PacketTimings,
-        protocol::{PacketSequence, SessionId},
-    };
-    use std::time::Duration;
-    use tokio::sync::mpsc;
+    use super::*;
 
-    fn echo(round_trip_ms: u64) -> ClientEchoTrace {
-        ClientEchoTrace {
-            session_id: SessionId(1),
-            sequence: PacketSequence(0),
-            round_trip: Duration::from_millis(round_trip_ms),
-            lateness: Duration::from_millis(round_trip_ms.saturating_sub(50)),
-            client_start_delay: Duration::from_millis(1),
-            outside_server: Duration::from_millis(round_trip_ms - 13),
-            server: PacketTimings {
-                device_execution: Duration::from_millis(12),
-                ..PacketTimings::default()
-            },
-        }
-    }
-
-    #[tokio::test]
-    async fn late_echo_is_counted_in_latency_and_lateness_statistics() {
-        let (events, mailbox) = mpsc::channel(4);
-        events
-            .send(ClientPacketTrace::Echo(echo(20)))
-            .await
-            .unwrap();
-        events
-            .send(ClientPacketTrace::LateEcho(echo(51)))
-            .await
-            .unwrap();
-        events
-            .send(ClientPacketTrace::ExpiredEcho(echo(70)))
-            .await
-            .unwrap();
-        events
-            .send(ClientPacketTrace::UnrecoveredEcho(echo(230)))
-            .await
-            .unwrap();
-        drop(events);
-        let measurements = PacketMeasurements::default().collect(mailbox).await;
-        assert_eq!(measurements.round_trip.summary().samples, 3);
-        assert_eq!(measurements.deadline_lateness.summary().samples, 3);
-        assert_eq!(measurements.failed_round_trip.summary().samples, 3);
-        assert_eq!(measurements.client_start_delay.summary().samples, 4);
-        assert_eq!(measurements.outside_server.summary().samples, 4);
-        let ClientPacketTrace::UnrecoveredEcho(trace) = &measurements.slowest_packets[0] else {
-            panic!("unrecovered echo must remain the slowest trace");
-        };
-        assert_eq!(trace.server.device_execution, Duration::from_millis(12));
-        assert_eq!(trace.outside_server, Duration::from_millis(217));
+    #[test]
+    fn stalled_generation_has_zero_rolling_throughput() {
+        let started = Instant::now();
+        let mut timing = TurnTiming::new(started);
+        let mut measurements = Measurements::new("stalled".into());
+        timing.token(started, &mut measurements, 4.0);
+        timing.observe_rate(
+            started + Duration::from_secs(3),
+            &mut measurements,
+            4.0,
+            Duration::from_secs(2),
+        );
+        assert_eq!(measurements.summary.rolling_rate_violations, 1);
+        assert_eq!(
+            measurements.summary.minimum_rolling_tokens_per_second,
+            Some(0.0)
+        );
     }
 }

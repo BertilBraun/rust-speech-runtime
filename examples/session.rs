@@ -1,52 +1,41 @@
-use bytes::Bytes;
 use std::time::Duration;
-use tokio::time::Instant;
+
+use bytes::Bytes;
 use voice_scheduler::{
-    Node, RuntimeError,
-    config::RuntimeConfig,
-    protocol::{
-        AudioContext, AudioPacket, CreateOutcome, InputFrame, InputOutcome, PacketSequence,
-        PrefixState, SessionId,
-    },
+    protocol::{SessionEvent, SessionId, TurnId},
+    transport::VoiceClient,
 };
 
 #[tokio::main]
-async fn main() -> Result<(), RuntimeError> {
-    let node = Node::start(RuntimeConfig::default()).await?;
-    let session_id = SessionId(1);
-    let CreateOutcome::Admitted(admission) = node.ingress.create_session(session_id).await? else {
-        panic!("no realtime capacity");
-    };
-    let assignment = admission.assignment;
-    let timestamp = Instant::now();
-    let outcome = node
-        .ingress
-        .input_frame(
-            session_id,
-            InputFrame {
-                timestamp,
-                deadline: timestamp + Duration::from_millis(50),
-                packet: AudioPacket {
-                    sequence: PacketSequence(0),
-                    payload: Bytes::from(vec![0; 1600]),
-                    context: AudioContext::Cached(PrefixState::default()),
-                },
-            },
-        )
-        .await?;
-    match outcome {
-        InputOutcome::Processed(output) => {
-            assert_eq!(output.audio.assignment, assignment);
-            println!(
-                "Echoed {} bytes from worker {}",
-                output.audio.payload.len(),
-                assignment.worker_id.0
-            );
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client =
+        VoiceClient::connect("ws://127.0.0.1:8080/v1", Duration::from_secs(120)).await?;
+    let worker = client.open(SessionId("example-session".into())).await?;
+    println!("assigned GPU worker {worker}");
+    for index in 1..=2 {
+        let turn_id = TurnId(index);
+        client.begin_turn(turn_id).await?;
+        for chunk in 0..20 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            client
+                .audio(turn_id, chunk, Bytes::from(vec![0; 1600]))
+                .await?;
         }
-        outcome => println!("Packet was not processed: {outcome:?}"),
+        client.commit(turn_id, 20, 16_000).await?;
+        loop {
+            match client.next_event().await? {
+                SessionEvent::TextDelta { text, .. } => print!("{text}"),
+                SessionEvent::Finished { .. } => {
+                    println!();
+                    break;
+                }
+                SessionEvent::Failed { code, message, .. } => {
+                    return Err(format!("{code:?}: {message}").into());
+                }
+                _ => {}
+            }
+        }
     }
-    node.ingress.close_session(session_id).await?;
-    let report = node.shutdown().await?;
-    println!("Delivered {} frames", report.inference.delivered_frames);
+    client.close().await?;
     Ok(())
 }

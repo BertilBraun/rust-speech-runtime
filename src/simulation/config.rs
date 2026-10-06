@@ -1,73 +1,89 @@
-use super::{PacketQualityPolicy, SimulationError};
-use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, clap::ValueEnum)]
-pub enum ArrivalPhase {
-    Aligned,
-    Random,
-}
+use super::SimulationError;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub struct SimulationConfig {
     pub sessions: usize,
-    pub duration: Duration,
-    pub minimum_interval: Duration,
-    pub maximum_interval: Duration,
-    pub payload_bytes: usize,
-    pub phase: ArrivalPhase,
+    pub turns_per_session: usize,
+    pub utterance_ms: u64,
+    pub minimum_packet_ms: u64,
+    pub maximum_packet_ms: u64,
+    pub start_spread_ms: u64,
+    pub think_ms: u64,
+    pub target_tokens_per_second: f64,
+    pub throughput_window_ms: u64,
+    pub response_timeout: Duration,
+    pub interrupt_after_tokens: Option<usize>,
+    pub churn_rounds: usize,
+    pub audio_file: Option<PathBuf>,
     pub seed: u64,
-    pub evict_every: Option<u64>,
-    pub churn_after: Option<Duration>,
-    pub io_timeout: Duration,
-    pub metric_channel_capacity: usize,
-    pub quality: PacketQualityPolicy,
 }
+
 impl Default for SimulationConfig {
     fn default() -> Self {
         Self {
-            sessions: 400,
-            duration: Duration::from_secs(10),
-            minimum_interval: Duration::from_millis(48),
-            maximum_interval: Duration::from_millis(55),
-            payload_bytes: 1600,
-            phase: ArrivalPhase::Random,
-            seed: 42,
-            evict_every: None,
-            churn_after: None,
-            io_timeout: Duration::from_secs(5),
-            metric_channel_capacity: 4096,
-            quality: PacketQualityPolicy::default(),
+            sessions: 8,
+            turns_per_session: 2,
+            utterance_ms: 1000,
+            minimum_packet_ms: 48,
+            maximum_packet_ms: 55,
+            start_spread_ms: 500,
+            think_ms: 250,
+            target_tokens_per_second: 4.0,
+            throughput_window_ms: 2000,
+            response_timeout: Duration::from_secs(120),
+            interrupt_after_tokens: None,
+            churn_rounds: 1,
+            audio_file: None,
+            seed: 7,
         }
     }
 }
+
 impl SimulationConfig {
     pub fn validate(&self) -> Result<(), SimulationError> {
         if self.sessions == 0
             || self.sessions > 10_000
-            || self.duration.is_zero()
-            || self.duration > Duration::from_secs(86400)
-            || self.minimum_interval < Duration::from_millis(1)
-            || self.maximum_interval < self.minimum_interval
-            || self.maximum_interval > Duration::from_secs(1)
-            || self.payload_bytes == 0
-            || self.payload_bytes > 4096
-            || self.io_timeout.is_zero()
-            || self.io_timeout > Duration::from_secs(86400)
-            || self.evict_every == Some(0)
-            || self.metric_channel_capacity == 0
-            || self.metric_channel_capacity > 1_000_000
-            || self.quality.window_packets == 0
-            || self.quality.window_packets > 10_000
-            || self.quality.miss_limit == 0
-            || self.quality.miss_limit > self.quality.window_packets
-            || self
-                .churn_after
-                .is_some_and(|duration| duration.is_zero() || duration > Duration::from_secs(86400))
+            || self.turns_per_session == 0
+            || self.churn_rounds == 0
         {
             return Err(SimulationError::Configuration(
-                "invalid bounded workload configuration",
+                "sessions (1..10000), turns and rounds must be positive",
+            ));
+        }
+        if self
+            .sessions
+            .checked_mul(self.churn_rounds)
+            .is_none_or(|total| total > 100_000)
+        {
+            return Err(SimulationError::Configuration(
+                "total offered sessions must not exceed 100000",
+            ));
+        }
+        if self.minimum_packet_ms == 0
+            || self.maximum_packet_ms < self.minimum_packet_ms
+            || self.maximum_packet_ms > 250
+        {
+            return Err(SimulationError::Configuration(
+                "packet interval must be ordered and between 1 and 250 ms",
+            ));
+        }
+        if self.utterance_ms == 0
+            || self.utterance_ms > 30_000
+            || self.throughput_window_ms == 0
+            || self.response_timeout.is_zero()
+        {
+            return Err(SimulationError::Configuration(
+                "utterance must be 1..30000 ms; window and timeout must be positive",
+            ));
+        }
+        if !self.target_tokens_per_second.is_finite()
+            || self.target_tokens_per_second <= 0.0
+            || self.interrupt_after_tokens == Some(0)
+        {
+            return Err(SimulationError::Configuration(
+                "throughput target and interruption token count must be positive",
             ));
         }
         Ok(())

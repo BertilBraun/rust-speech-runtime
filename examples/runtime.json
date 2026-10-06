@@ -1,0 +1,16 @@
+{
+  "workers": [{"endpoint": "127.0.0.1:9100"}],
+  "max_sessions_per_worker": 64,
+  "max_active_turns_per_worker": 16,
+  "max_audio_samples": 480000,
+  "max_history_bytes": 33554432,
+  "max_output_tokens": 512,
+  "max_context_tokens": 16384,
+  "mailbox_capacity": 128,
+  "event_capacity": 128,
+  "max_batch_size": 16,
+  "target_tokens_per_second": 4.0,
+  "backend_timeout_ms": 120000,
+  "admission_headroom": 0.8,
+  "initial_forward_estimate_ms": 100.0
+}
