@@ -1,10 +1,48 @@
 # Device pipelining and timing experiments
 
-## Capacity with isolated-miss recovery
+## Random starts and independent 48–55 ms packets
+
+This is the intended workload: independent random initial capture phases, followed by an independent 48–55 ms interval for every packet. The readiness barrier completes connection setup before capture starts; random phases represent sessions that started at different times. Perfectly synchronized waves remain a separate stress test, rather than the expected traffic pattern. Socket transfer and echo are real, between separate gateway and simulator processes on Windows loopback. Every nonempty ordinary batch, from one to sixteen packets, still costs exactly 12 ms.
+
+Two unnecessary policy limits were removed. Admission previously rounded the number of batches down before converting to session capacity. The scheduler now estimates the steady packet rate with `floor(compute_budget * batch_size / batch_cost)`, and separately checks how many whole batches fit a burst's playback budget. This never shortens a partial batch. Defaults use a 5 ms margin and a 56-session worker cap: `floor((48 - 5) * 16 / 12) = 57` before that cap, measured host reserve, queue pressure and cache constraints. The node's 448-session cap is an upper bound; calibration may admit fewer.
+
+The other limit was treating one output beyond 60 ms as fatal to the entire session. The agreed target permits isolated discarded outputs while rejecting four misses within any ten-packet window for that session. Output after 50 ms is still late; output after the additional 10 ms grace is discarded. Its validated input advances the cache, allowing the following packets to recover with their complete history. Four queued captures and one active exchange bound outstanding input, and a separate 204 ms progress budget bounds recovery. This larger progress budget is excluded from admission capacity; it does not turn late packets into timely playback. Known unsustainable device slowdowns still revoke sessions, and stalled recovery or queue overflow still fails explicitly.
+
+### Current measurements
+
+Both runs below used eight Tokio mock devices, random phases, 48–55 ms packets, sixteen slots, fixed 12 ms compute, a 56-session worker cap, admission headroom 1 and the retained 5 ms margin. All admitted sessions survived and no diagnostic samples were lost.
+
+| Duration | Admitted / rejected | Echoed packets | Over 50 ms / discarded over 60 ms | Failed sessions / four-miss clusters | Largest miss count in ten packets | RTT p50 / p95 / p99 / max, ms | Batch fill | Modeled GPU utilization |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 60 s | 440 / 8 | 509,333 | 343 / 124 | 0 / 0 | 2 | 21.4 / 27.0 / 30.9 / 78.8 | 79.6% | 98.9% |
+| 300 s | 408 / 40 | 2,361,062 | 781 / 161 | 0 / 0 | 2 | 21.3 / 26.8 / 30.0 / 75.1 | 73.9% | 99.5% |
+
+Discarded outputs are a subset of late packets, and remain included in echo RTT and lateness statistics. They are not successful playback. In the sustained run, 0.033% exceeded the 50 ms target and 0.0068% exceeded 60 ms; maximum consecutive misses were two. Calibration limited five workers to 48 sessions and admitted 56 on the remaining three. The minute run sustained 440, but does not establish a five-minute 440-session guarantee. Raw reports are `recovery-windows-448-60s.json` and `recovery-windows-448-300s.json` in local `benchmark-results/`, using revision `0a6f3fd` with explicit candidate settings. Revision `8dafc10` makes these settings the defaults and adds a CLI scheduling-margin override and max RTT to the console summary.
+
+A separate 60-second ceiling diagnostic removed the 5 ms margin and raised the hard cap to 64 sessions per worker. It admitted 493 and rejected 19, echoed 564,569 packets, and failed **seven sessions on four-miss clusters**, including consecutive misses. Of 422 late packets, 53 outputs were discarded; there were no unrecovered progress failures or lost diagnostic samples. RTT p50/p95/p99/max were 22.2/28.7/34.1/65.4 ms, batch fill 88.3%, and modeled utilization 99.0%. This failed the agreed quality criterion despite a low p99. Offered load fell as those sessions closed, so it does not establish sustained 493-session capacity. The default retains its margin and lower cap. The raw report is `recovery-windows-512-60s.json`, using revision `8dafc10` with explicit diagnostic overrides.
+
+RTT is a packet's latency, rather than a measurement of device idle time. A GPU can answer one session in 21 ms and spend the rest of that session's interval processing other sessions. These runs kept modeled devices approximately 99% busy. More throughput therefore requires fuller batches, with additional queue residence consuming some of the available RTT slack. At full batches the ideal rate is `8 * 16 / 0.012 = 10,667` packets/second, or about 549 sessions at the 51.5 ms mean interval, before host overhead and admission reserves. The current 64 cache slots per worker also cap this implementation at 512 simultaneous sessions. Neither ideal arithmetic nor a low p99 certifies that ceiling.
+
+In the five-minute run, mean EDF preparation took 2.19 microseconds and batch assembly 8.19 microseconds. Mean scheduler queue residence was 5.98 ms and device queue residence 1.95 ms; those are waiting intervals, rather than six milliseconds spent building a batch. Of 199,708 batches, 199,038 were submitted before their predecessor finished. Gateway and simulator each used about 1.12 logical CPU cores on average. Maximum host completion delay was 34.2 ms, so low average CPU use did not eliminate timing tails or establish their OS-level cause.
+
+Earlier attempts at this higher capacity exposed the old fatal-on-first-expiry policy. A Windows random run admitted 392 then failed 341 sessions, including three four-miss clusters. A WSL run admitted 448 and failed 148, with no four-miss clusters; a Windows native-sleep run admitted 448 and failed 45, also with no clusters. These failed runs lose offered load and cannot establish sustained throughput. Reports are `streaming-windows-400-60s.json`, `streaming-linux-448-60s.json` and `streaming-sleep-windows-448-60s.json`. The recovery changes were tested explicitly for discarded-output history, cache replay, fatal progress expiry, slowdown revocation and complete latency accounting.
+
+All 65 tests pass on Windows and WSL with Rust 1.99.0 and locked dependencies. Windows also passes `cargo clippy --all-targets --locked -- -D warnings` and `cargo fmt --check`. WSL shares the Windows host and is not bare-metal Linux; these measurements do not identify the cause of OS timing stalls.
+
+The final five-second-per-scenario Windows suite passed ordinary low/50%/80%/95% load, overload admission, aligned/random arrivals, jitter and churn without session or quality failures. Overload admitted 424 and rejected 392; churn admitted 1,423 across successive lifetimes. Aligned traffic at 204 sessions had 39 isolated late echoes but no clusters. Forced cache replay, 30 ms slowdown and artificially blocked mailboxes deliberately failed 159, 204 and 204 sessions respectively; saturation recorded 95 full-mailbox events. These stress outcomes are explicit failures, not successful service. The raw report is `recovery-current-windows-suite-5s.json`, using revision `8dafc10` and current defaults. Short suite checks do not replace the sustained random workload results above.
+
+```powershell
+cargo run --release -- benchmark --sessions 448 --duration-secs 300 --output benchmark-results\random-current.json
+cargo run --release -- benchmark --sessions 512 --duration-secs 60 --max-sessions-per-worker 64 --scheduling-margin-ms 0 --output benchmark-results\zero-margin-diagnostic.json
+```
+
+The second command deliberately removes the remaining scheduling margin and is a capacity diagnostic. The default retains that margin. Use `--lateness-grace-ms 0 --quality-miss-limit 1` to make the simulator end a session on its first missed target; a playback cutoff alone leaves cached-input recovery enabled.
+
+## Earlier capacity experiment with fatal playback expiry
 
 The revised serving target keeps the 50 ms capture-to-echo deadline, allows up to 10 ms of recovery, and flags four misses in any ten-packet window **within the same session**. A late echo advances both audio prefixes, so subsequent packets keep their original worker and cache. The simulator preserves the original capture schedule and records every late echo; it does not shift deadlines to make results look timely. A hard timeout/rejection remains a separate session failure. These are serving-quality proxies, not a perceptual audio test.
 
-Default admission now caps each GPU at 48 sessions, or 384 across eight workers. The compute budget remains `(48 - 5) * 0.9 = 38.7 ms`, sufficient for three whole 12 ms batches; recovery grace does not add compute capacity. Grace absorbs measured host-delay reserve before excess host delay is subtracted from this budget. Queue pressure and cache availability can still lower admission. This removes the former unconditional 32-session cap and avoids reserving isolated host jitter twice, while retaining bounded queues and fixed batch cost.
+At this earlier revision, default admission capped each GPU at 48 sessions, or 384 across eight workers. The compute budget was `(48 - 5) * 0.9 = 38.7 ms`, rounded to three whole 12 ms batches. Grace absorbed measured host-delay reserve before excess host delay was subtracted. Queue pressure and cache availability could still lower admission. The current packet-rate estimate and independent burst check supersede that whole-batch rounding.
 
 The following sequential runs used real loopback TCP, 1,600-byte packets, fixed 12 ms kernels, eight workers and the agreed quality policy:
 
@@ -24,7 +62,7 @@ A further 60-second aligned Windows run at the former 32-per-GPU cap admitted 25
 
 Reports are `quality-host-grace-windows-384-60s.json`, `quality-host-grace-linux-384-60s.json` and `quality-default-windows-300s.json` under local `benchmark-results/`. The first two used revision `7c0e315`; the sustained run used the same fixed-cost scheduler plus `d7677fc` recovery-budget checks and the new cap in `a4b2f24`. The earlier `quality-windows-384-60s.json` attempted a raised cap before host reserve used grace, and admitted only 256; its zero failures are not evidence of 384-session service.
 
-Reproduce the current random workload with `cargo run --release -- benchmark --sessions 400 --duration-secs 300 --output benchmark-results/quality-default.json`. Pass `--lateness-grace-ms 0 --max-sessions-per-worker 32` for strict completion behavior with the former cap. RTT now includes all echoes accepted within the recovery budget, including late ones; lateness, unrecovered deadline failures and quality bursts are reported separately. Older reports below terminated sessions on the first missed deadline and cannot reveal whether misses would have clustered.
+These reports used the earlier cap and fatal playback-expiry behavior. Their RTT includes echoes accepted within the former 60 ms recovery budget, including late ones; lateness, unrecovered deadline failures and quality bursts are separate. Older reports below terminated sessions on the first missed deadline and cannot reveal whether misses would have clustered.
 
 Validation covers late-prefix recovery, replay after a late packet, rejection beyond the recovery budget, bounded miss windows and consecutive/nearby clusters, alongside existing placement, cancellation, overload and device pipeline tests. All 63 tests pass on Windows and WSL. Windows validation also passes `cargo clippy --all-targets --locked -- -D warnings` and `cargo fmt --check`; both platforms run `cargo test --locked` with the same toolchain and locked dependencies.
 
@@ -53,7 +91,7 @@ Preparation and assembly profiles measure elapsed wall time around those code sc
 
 Windows runs used Windows 11 Home build 26200 and an Intel i7-11370H with four physical/eight logical cores. Linux comparisons used Ubuntu under WSL2, kernel 6.6.87.2-microsoft-standard-WSL2, with four vCPUs. Both used Rust 1.99.0 and the same locked dependencies. WSL shares the Windows host and is not a bare-metal Linux comparison. Benchmarks ran sequentially without concurrent builds or competing benchmark runs.
 
-Default admission is capped at 32 sessions per worker, or 256 for the node, and may admit fewer after calibration. Before host-delay reserves, its compute budget is `(48 - 5) * 0.9 = 38.7 ms`. Admission also checks cache availability and current queued compute/replay work. Raising the configurable hard cap to 48 permits experiments with up to 384 sessions; this is not a validated reliable operating point.
+These historical strict-deadline runs capped admission at 32 sessions per worker, or 256 for the node, and could admit fewer after calibration. Before host-delay reserves, their compute budget was `(48 - 5) * 0.9 = 38.7 ms`. Admission also checked cache availability and queued compute/replay work. The historical raised-cap experiments used 48 sessions per worker; failures in those runs remain documented below.
 
 ## Validation with strict simulator deadline measurements
 
