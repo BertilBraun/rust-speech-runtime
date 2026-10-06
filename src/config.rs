@@ -66,7 +66,7 @@ impl Default for RuntimeConfig {
             device_queue_capacity: 2,
             launch_ahead: Duration::from_millis(2),
             max_batch_wait: Duration::from_millis(5),
-            max_sessions_per_worker: 32,
+            max_sessions_per_worker: 48,
             cache_slots_per_worker: 64,
             ingress_capacity: 1024,
             worker_channel_capacity: 256,

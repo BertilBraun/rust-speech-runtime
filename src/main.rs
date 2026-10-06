@@ -273,11 +273,13 @@ async fn benchmark(
     let gateway = server.await??;
     let client = client?;
     eprintln!(
-        "admitted={} rejected={} failed={} echoed={} RTT p50/p95/p99={:.1}/{:.1}/{:.1}ms batch fill={:.1}%",
+        "admitted={} rejected={} failed={} echoed={} late={} bursts={} RTT p50/p95/p99={:.1}/{:.1}/{:.1}ms batch fill={:.1}%",
         client.counters.admitted_sessions,
         client.counters.rejected_capacity,
         client.counters.failed_sessions,
         client.counters.echoed_frames,
+        client.counters.late_frames,
+        client.counters.quality_failed_sessions,
         client.round_trip_latency.p50_ms,
         client.round_trip_latency.p95_ms,
         client.round_trip_latency.p99_ms,
