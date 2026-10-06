@@ -1,5 +1,7 @@
 # Device pipelining and timing experiments
 
+**Historical workload:** this document records the periodic mocked audio-echo scheduler through revision `0a857df`. The turn-based speech-to-text overhaul replaces that runtime; these capacity, RTT and GPU utilization figures do not describe the new pipeline. See [PLAN.md](PLAN.md), [implementation evidence](docs/IMPLEMENTATION.md) and [the GPU validation checklist](docs/HARDWARE_VALIDATION.md) for its status. References below to the README code guide describe the historical source layout at the measured revisions.
+
 ## Rust code quality pass, 2026-10-06
 
 The follow-up architecture review (`6f01f47`, `8fad05e` and `00b1c8e`) separates the TCP accept loop from an owned connection lifecycle, shortens simulator packet/lifecycle orchestration, and extracts worker packet and replay validation. All 67 tests pass again on Windows and WSL. Strict Windows Clippy, formatting, rustdoc and the release build also pass. These changes retain the serving policies; the performance results below remain measurements of their stated revisions, rather than new measurements of this follow-up.
