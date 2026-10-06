@@ -69,14 +69,11 @@ impl ServiceEstimator {
         known_device_time: Duration,
     ) -> usize {
         let host_delay = self.host_reserve();
-        let host_compute_reserve = host_delay.saturating_sub(configuration.packet_lateness_grace);
         let device_time = self.device_time().max(known_device_time);
-        let available = capacity.min(session_limit_for_budget(
+        let available = capacity.min(session_limit_with_host_delay(
             configuration,
-            configuration
-                .compute_budget()
-                .saturating_sub(host_compute_reserve),
             device_time.mul_f64(self.safety_factor),
+            host_delay,
         ));
         if queue_delay + device_time + host_delay
             > configuration.compute_budget() + configuration.packet_lateness_grace
@@ -94,19 +91,32 @@ impl ServiceEstimator {
     }
 }
 pub(crate) fn session_limit(configuration: &RuntimeConfig, service_time: Duration) -> usize {
-    session_limit_for_budget(configuration, configuration.compute_budget(), service_time)
+    session_limit_with_host_delay(configuration, service_time, Duration::ZERO)
 }
-fn session_limit_for_budget(
+fn session_limit_with_host_delay(
     configuration: &RuntimeConfig,
-    budget: Duration,
     service_time: Duration,
+    host_delay: Duration,
 ) -> usize {
-    let batches = budget.as_nanos() / service_time.as_nanos();
-    (((batches as usize).saturating_mul(configuration.batch_size) as f64
-        * configuration.batch_fill_reserve)
-        .floor() as usize)
-        .min(configuration.max_sessions_per_worker)
-        .min(configuration.cache_slots_per_worker)
+    let budget = configuration
+        .compute_budget()
+        .saturating_sub(host_delay.saturating_sub(configuration.packet_lateness_grace));
+    if service_time > budget {
+        return 0;
+    }
+    let throughput_budget = budget.mul_f64(configuration.batch_fill_reserve);
+    let throughput_sessions =
+        throughput_budget.as_nanos() * configuration.batch_size as u128 / service_time.as_nanos();
+    let burst_budget = configuration
+        .packet_completion_budget()
+        .saturating_sub(configuration.scheduling_margin + host_delay);
+    // A partial final batch consumes a full device step during a simultaneous burst.
+    let burst_sessions =
+        burst_budget.as_nanos() / service_time.as_nanos() * configuration.batch_size as u128;
+    throughput_sessions
+        .min(burst_sessions)
+        .min(configuration.max_sessions_per_worker as u128)
+        .min(configuration.cache_slots_per_worker as u128) as usize
 }
 #[cfg(test)]
 mod tests {
@@ -128,14 +138,21 @@ mod tests {
         assert_eq!(estimator.service_time(), Duration::from_millis(40));
     }
     #[test]
-    fn capacity_reserves_whole_batches_and_headroom() {
+    fn streaming_capacity_retains_fractional_cycles_and_whole_batch_burst_cost() {
         let configuration = RuntimeConfig {
             max_sessions_per_worker: 64,
             ..RuntimeConfig::default()
         };
-        assert_eq!(session_limit(&configuration, Duration::from_millis(12)), 48);
-        assert_eq!(session_limit(&configuration, Duration::from_millis(20)), 16);
+        assert_eq!(session_limit(&configuration, Duration::from_millis(12)), 51);
+        assert_eq!(session_limit(&configuration, Duration::from_millis(20)), 30);
         assert_eq!(session_limit(&configuration, Duration::from_millis(40)), 0);
+        let strict = RuntimeConfig {
+            packet_lateness_grace: Duration::ZERO,
+            ..configuration
+        };
+        assert_eq!(session_limit(&strict, Duration::from_millis(12)), 48);
+        let fourth_batch = Duration::from_millis(12) * 4;
+        assert!(fourth_batch + strict.scheduling_margin > strict.packet_deadline);
     }
     #[test]
     fn rolling_tail_recovers_after_slow_samples_age_out() {
@@ -173,7 +190,7 @@ mod tests {
                 Duration::ZERO,
                 Duration::from_millis(12)
             ),
-            16
+            24
         );
         for _ in 0..3 {
             estimator.observe_host_delay(Duration::from_millis(20));
@@ -186,7 +203,7 @@ mod tests {
                 Duration::ZERO,
                 Duration::from_millis(12)
             ),
-            16
+            24
         );
         assert_eq!(estimator.device_time(), Duration::from_millis(12));
         for _ in 0..64 {
@@ -257,7 +274,7 @@ mod tests {
                 Duration::ZERO,
                 Duration::from_millis(12),
             ),
-            32
+            44
         );
         assert_eq!(
             estimator.available_limit(
@@ -267,13 +284,13 @@ mod tests {
                 Duration::ZERO,
                 Duration::from_millis(18),
             ),
-            16
+            29
         );
         assert_eq!(estimator.device_time(), Duration::from_millis(12));
     }
 
     #[test]
-    fn recovery_grace_absorbs_host_reserve_without_increasing_compute_capacity() {
+    fn recovery_grace_absorbs_host_reserve_and_checks_the_burst_budget() {
         let mut configuration = RuntimeConfig {
             max_sessions_per_worker: 64,
             packet_lateness_grace: Duration::ZERO,
@@ -292,28 +309,25 @@ mod tests {
                 Duration::ZERO,
                 Duration::from_millis(12)
             ),
-            32
+            44
         );
         configuration.packet_lateness_grace = Duration::from_millis(10);
-        assert_eq!(
-            session_limit(&configuration, Duration::from_millis(12)),
-            capacity
-        );
+        assert_eq!(session_limit(&configuration, Duration::from_millis(12)), 51);
         assert_eq!(
             estimator.available_limit(
                 &configuration,
-                capacity,
+                51,
                 0,
                 Duration::ZERO,
                 Duration::from_millis(12)
             ),
-            48
+            51
         );
         estimator.observe_host_delay(Duration::from_millis(20));
         assert_eq!(
             estimator.available_limit(
                 &configuration,
-                capacity,
+                51,
                 0,
                 Duration::ZERO,
                 Duration::from_millis(12)
