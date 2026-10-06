@@ -92,6 +92,47 @@ mod tests {
         );
         assert_eq!(metrics.snapshot().channel_saturation_events, 1);
     }
+    #[tokio::test]
+    async fn close_waits_for_bounded_mailbox_space_and_preserves_record_reply() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let worker = WorkerHandle {
+            id: 0,
+            sender,
+            load: Arc::new(AtomicUsize::new(1)),
+            available: Arc::new(AtomicBool::new(true)),
+            metrics: Arc::new(Metrics::default()),
+        };
+        worker
+            .send(Command::Close {
+                key: "occupied".into(),
+                reply: None,
+            })
+            .unwrap();
+        let (reply, response) = oneshot::channel();
+        let close = tokio::spawn(async move { worker.close("archive".into(), reply).await });
+        tokio::task::yield_now().await;
+        assert!(!close.is_finished());
+        let _ = receiver.recv().await;
+        close.await.unwrap().unwrap();
+        match receiver.recv().await.unwrap() {
+            Command::Close {
+                key,
+                reply: Some(reply),
+            } => {
+                assert_eq!(key, "archive");
+                reply
+                    .send(Ok(SessionRecord {
+                        session_id: SessionId("archive".into()),
+                        worker_id: 0,
+                        model_id: "test".into(),
+                        turns: Vec::new(),
+                    }))
+                    .unwrap();
+            }
+            _ => panic!("close command must preserve reply"),
+        }
+        assert_eq!(response.await.unwrap().unwrap().session_id.0, "archive");
+    }
 }
 #[derive(Clone)]
 pub(crate) struct WorkerHandle {
@@ -159,5 +200,20 @@ impl WorkerHandle {
                 "worker mailbox unavailable",
             )
         })
+    }
+    pub async fn close(
+        &self,
+        key: String,
+        reply: oneshot::Sender<Result<SessionRecord, RuntimeError>>,
+    ) -> Result<(), RuntimeError> {
+        self.sender
+            .send(Command::Close {
+                key,
+                reply: Some(reply),
+            })
+            .await
+            .map_err(|_| {
+                RuntimeError::new(ErrorCode::BackendUnavailable, "worker stopped before close")
+            })
     }
 }

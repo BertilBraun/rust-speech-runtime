@@ -39,6 +39,7 @@ pub struct RuntimeConfig {
     pub max_batch_size: usize,
     pub target_tokens_per_second: f64,
     pub backend_timeout_ms: u64,
+    pub max_prefill_wait_ms: u64,
     pub admission_headroom: f64,
     pub initial_forward_estimate_ms: f64,
 }
@@ -60,6 +61,7 @@ impl Default for RuntimeConfig {
             max_batch_size: 16,
             target_tokens_per_second: 4.0,
             backend_timeout_ms: 120_000,
+            max_prefill_wait_ms: 2_000,
             admission_headroom: 0.8,
             initial_forward_estimate_ms: 100.0,
         }
@@ -103,14 +105,31 @@ impl RuntimeConfig {
             || !(0.0..=1.0).contains(&self.admission_headroom)
             || self.admission_headroom == 0.0
             || self.backend_timeout_ms == 0
+            || self.max_prefill_wait_ms == 0
         {
             return Err(ConfigError("invalid throughput, timing or headroom".into()));
         }
         let interval = std::time::Duration::try_from_secs_f64(1.0 / self.target_tokens_per_second)
             .map_err(|_| ConfigError("token interval exceeds representable duration".into()))?;
-        if interval.is_zero() {
+        if interval.is_zero() || std::time::Instant::now().checked_add(interval).is_none() {
             return Err(ConfigError(
                 "token interval must be a nonzero representable duration".into(),
+            ));
+        }
+        if std::time::Instant::now()
+            .checked_add(std::time::Duration::from_millis(self.backend_timeout_ms))
+            .is_none()
+        {
+            return Err(ConfigError(
+                "backend timeout exceeds platform timer range".into(),
+            ));
+        }
+        if std::time::Instant::now()
+            .checked_add(std::time::Duration::from_millis(self.max_prefill_wait_ms))
+            .is_none()
+        {
+            return Err(ConfigError(
+                "prefill queue wait exceeds platform timer range".into(),
             ));
         }
         if self.max_active_turns_per_worker > self.max_sessions_per_worker {

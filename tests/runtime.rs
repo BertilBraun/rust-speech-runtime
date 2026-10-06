@@ -26,6 +26,14 @@ struct Fixture {
     operations: Arc<Mutex<Vec<Operation>>>,
     task: JoinHandle<()>,
 }
+struct FixtureConfiguration {
+    open_delay_ms: u64,
+    prefill_delay_ms: u64,
+    decode_delay_ms: u64,
+    response_tokens: u64,
+    maximum_sessions: usize,
+    fail_decode: bool,
+}
 impl Fixture {
     async fn start(delay_ms: u64) -> Self {
         Self::limited(delay_ms, usize::MAX).await
@@ -34,6 +42,17 @@ impl Fixture {
         Self::configured(delay_ms, maximum_sessions, false).await
     }
     async fn configured(delay_ms: u64, maximum_sessions: usize, fail_decode: bool) -> Self {
+        Self::with_configuration(FixtureConfiguration {
+            open_delay_ms: delay_ms,
+            prefill_delay_ms: delay_ms,
+            decode_delay_ms: delay_ms,
+            response_tokens: 4,
+            maximum_sessions,
+            fail_decode,
+        })
+        .await
+    }
+    async fn with_configuration(configuration: FixtureConfiguration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = listener.local_addr().unwrap();
         let operations = Arc::new(Mutex::new(Vec::new()));
@@ -65,6 +84,11 @@ impl Fixture {
                 stream.read_exact(&mut audio).await.unwrap();
                 let mut results = Vec::new();
                 recorded.lock().unwrap().extend(request.operations.clone());
+                let delay_ms = match request.operations[0] {
+                    Operation::Prefill { .. } => configuration.prefill_delay_ms,
+                    Operation::Decode { .. } => configuration.decode_delay_ms,
+                    _ => configuration.open_delay_ms,
+                };
                 if delay_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
@@ -73,7 +97,7 @@ impl Fixture {
                     let session_id = operation.session_id().to_string();
                     let (turn_id, generation, outcome) = match operation {
                         Operation::Open { .. } => {
-                            if contexts.len() >= maximum_sessions {
+                            if contexts.len() >= configuration.maximum_sessions {
                                 (
                                     None,
                                     None,
@@ -118,7 +142,7 @@ impl Fixture {
                             accepted,
                             ..
                         } => {
-                            if fail_decode {
+                            if configuration.fail_decode {
                                 (
                                     Some(turn_id),
                                     Some(generation),
@@ -136,12 +160,14 @@ impl Fixture {
                                     Some(generation),
                                     Outcome::Token {
                                         token_id: 101 + accepted.index as u32,
-                                        text_delta: if accepted.index >= 3 {
+                                        text_delta: if accepted.index
+                                            >= configuration.response_tokens - 1
+                                        {
                                             String::new()
                                         } else {
                                             "b".into()
                                         },
-                                        eos: accepted.index >= 3,
+                                        eos: accepted.index >= configuration.response_tokens - 1,
                                         context_tokens: *context,
                                     },
                                 )
@@ -688,5 +714,122 @@ async fn failed_decode_makes_cache_terminal_without_losing_accepted_record() {
         record.turns[0].finish_reason,
         Some(FinishReason::BackendFailed)
     );
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn slow_prefill_with_fast_decode_still_allows_sequential_turns() {
+    let backend = Fixture::with_configuration(FixtureConfiguration {
+        open_delay_ms: 0,
+        prefill_delay_ms: 300,
+        decode_delay_ms: 20,
+        response_tokens: 4,
+        maximum_sessions: 64,
+        fail_decode: false,
+    })
+    .await;
+    let node = Node::start(backend.config()).await.unwrap();
+    let mut session = node
+        .ingress()
+        .open_session(SessionId("solo-turns".into()))
+        .await
+        .unwrap();
+    start_turn(&session, 1).await;
+    assert_eq!(finish_turn(&mut session).await, 5);
+    start_turn(&session, 2).await;
+    assert_eq!(finish_turn(&mut session).await, 5);
+    let record = session.close().await.unwrap();
+    assert_eq!(record.turns.len(), 2);
+    assert_eq!(node.metrics().token_deadline_misses, 0);
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn admitted_prefill_has_bounded_wait_even_when_it_exceeds_token_gap_budget() {
+    let backend = Fixture::with_configuration(FixtureConfiguration {
+        open_delay_ms: 0,
+        prefill_delay_ms: 300,
+        decode_delay_ms: 20,
+        response_tokens: 100,
+        maximum_sessions: 64,
+        fail_decode: false,
+    })
+    .await;
+    let node = Node::start(RuntimeConfig {
+        max_prefill_wait_ms: 100,
+        ..backend.config()
+    })
+    .await
+    .unwrap();
+    let mut first = node
+        .ingress()
+        .open_session(SessionId("first-generator".into()))
+        .await
+        .unwrap();
+    let mut second = node
+        .ingress()
+        .open_session(SessionId("queued-prefill".into()))
+        .await
+        .unwrap();
+    first.begin_turn(TurnId(1)).await.unwrap();
+    second.begin_turn(TurnId(1)).await.unwrap();
+    first
+        .audio(TurnId(1), 0, Bytes::from_static(&[0, 0]))
+        .await
+        .unwrap();
+    second
+        .audio(TurnId(1), 0, Bytes::from_static(&[0, 0]))
+        .await
+        .unwrap();
+    first.commit(TurnId(1), 1, 1).await.unwrap();
+    second.commit(TurnId(1), 1, 1).await.unwrap();
+    let mut second_tokens = 0;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), second.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            SessionEvent::TextDelta { .. } => {
+                second_tokens += 1;
+                break;
+            }
+            SessionEvent::Failed { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
+    assert_eq!(second_tokens, 1);
+    assert!(node.metrics().ttft.max_ms < 1500.0);
+    first.cancel(TurnId(1)).await.unwrap();
+    second.cancel(TurnId(1)).await.unwrap();
+    first.close().await.unwrap();
+    second.close().await.unwrap();
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn rejected_accepted_event_does_not_leave_capture_reservation_alive() {
+    let backend = Fixture::start(0).await;
+    let node = Node::start(RuntimeConfig {
+        event_capacity: 1,
+        ..backend.config()
+    })
+    .await
+    .unwrap();
+    let mut session = node
+        .ingress()
+        .open_session(SessionId("accepted-full".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        session.begin_turn(TurnId(1)).await.unwrap_err().code(),
+        ErrorCode::SlowConsumer
+    );
+    let record = session.close().await.unwrap();
+    assert_eq!(
+        record.turns[0].finish_reason,
+        Some(FinishReason::SlowConsumer)
+    );
+    assert_eq!(node.metrics().active_sessions, 0);
     node.shutdown().await.unwrap();
 }

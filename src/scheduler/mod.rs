@@ -1,4 +1,7 @@
-use crate::session::state::{SessionState, Stage};
+use crate::{
+    config::RuntimeConfig,
+    session::state::{SessionState, Stage},
+};
 use std::collections::{HashMap, VecDeque};
 use tokio::time::Instant;
 
@@ -69,8 +72,8 @@ impl CostModel {
         active: usize,
         maximum_batch: usize,
         context: usize,
-        interval_ms: f64,
-        headroom: f64,
+        config: &RuntimeConfig,
+        reserve_prefill: bool,
     ) -> bool {
         let measured = self
             .samples
@@ -81,8 +84,12 @@ impl CostModel {
             .unwrap_or(1);
         let batches = active.div_ceil(measured);
         let decode = self.estimate(BatchKind::Decode, measured, context) * batches as f64;
-        let prefill = self.estimate(BatchKind::Prefill, 1, context);
-        decode + prefill <= interval_ms * headroom
+        let prefill = if reserve_prefill {
+            self.estimate(BatchKind::Prefill, 1, context)
+        } else {
+            0.0
+        };
+        decode + prefill <= (1000.0 / config.target_tokens_per_second) * config.admission_headroom
     }
 }
 fn bucket(context: usize) -> u32 {
@@ -97,6 +104,7 @@ pub(crate) fn select_batch(
     maximum: usize,
     consecutive_decode_batches: usize,
     costs: &CostModel,
+    maximum_prefill_wait: std::time::Duration,
 ) -> Option<(BatchKind, Vec<String>)> {
     for kind in [BatchKind::Close, BatchKind::Open] {
         let keys = sessions
@@ -146,7 +154,7 @@ pub(crate) fn select_batch(
         .collect::<Vec<_>>();
     decode.sort();
     prefill.sort();
-    let choose_prefill = if let Some((_, key)) = prefill.first() {
+    let choose_prefill = if let Some((queued_at, key)) = prefill.first() {
         let session = &sessions[key];
         let audio_tokens = session
             .turn()
@@ -177,6 +185,7 @@ pub(crate) fn select_batch(
             })
             .unwrap_or(f64::INFINITY);
         decode.is_empty()
+            || queued_at.elapsed() >= maximum_prefill_wait
             || predicted_prefill + predicted_decode < available
             || (consecutive_decode_batches >= 4 && predicted_prefill < available)
     } else {
@@ -211,14 +220,15 @@ mod tests {
     #[test]
     fn unknown_shape_does_not_assume_linear_batch_scaling() {
         let mut costs = CostModel::new(100.0);
-        assert!(costs.admits(1, 16, 32, 250.0, 0.8));
-        assert!(!costs.admits(2, 16, 32, 250.0, 0.8));
+        let config = RuntimeConfig::default();
+        assert!(costs.admits(1, 16, 32, &config, true));
+        assert!(!costs.admits(2, 16, 32, &config, true));
         costs.observe(BatchKind::Decode, 5.0, 1, 32);
         costs.observe(BatchKind::Prefill, 10.0, 1, 32);
         assert_eq!(costs.estimate(BatchKind::Decode, 8, 32), 100.0);
-        assert!(costs.admits(16, 16, 32, 250.0, 0.8));
+        assert!(costs.admits(16, 16, 32, &config, true));
         costs.observe(BatchKind::Decode, 120.0, 8, 32);
-        assert!(!costs.admits(16, 16, 32, 250.0, 0.8));
+        assert!(!costs.admits(16, 16, 32, &config, true));
     }
     #[test]
     fn context_costs_and_slow_recent_batches_remain_conservative() {
@@ -231,5 +241,14 @@ mod tests {
             costs.estimate(BatchKind::Decode, 4, 1024),
             55.00000000000001
         );
+    }
+    #[test]
+    fn slow_prefill_does_not_permanently_reject_solo_turns() {
+        let mut costs = CostModel::new(100.0);
+        let config = RuntimeConfig::default();
+        costs.observe(BatchKind::Prefill, 300.0, 1, 32);
+        costs.observe(BatchKind::Decode, 20.0, 1, 32);
+        assert!(costs.admits(1, 16, 32, &config, false));
+        assert!(!costs.admits(2, 16, 32, &config, true));
     }
 }

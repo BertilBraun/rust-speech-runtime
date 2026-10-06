@@ -116,6 +116,7 @@ impl WorkerActor {
                     self.config.max_batch_size.min(self.ready.max_batch_size),
                     self.consecutive_decode_batches,
                     &self.costs,
+                    Duration::from_millis(self.config.max_prefill_wait_ms),
                 )
             {
                 let job = self.build_batch(kind, keys);

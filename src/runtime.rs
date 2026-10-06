@@ -226,10 +226,7 @@ impl SessionHandle {
     }
     pub async fn close(&mut self) -> Result<SessionRecord, RuntimeError> {
         let (reply, response) = oneshot::channel();
-        self.worker.send(Command::Close {
-            key: self.key.clone(),
-            reply: Some(reply),
-        })?;
+        self.worker.close(self.key.clone(), reply).await?;
         let record = response
             .await
             .map_err(|_| RuntimeError::new(ErrorCode::Shutdown, "worker stopped"))??;

@@ -144,6 +144,10 @@ impl WorkerActor {
             ));
         }
         let reserved = active + usize::from(!previous.active());
+        let reserve_prefill = self
+            .sessions
+            .values()
+            .any(|session| session.active() && matches!(session.stage, Stage::Generating { .. }));
         let context = self
             .sessions
             .values()
@@ -158,8 +162,8 @@ impl WorkerActor {
                     reserved,
                     self.config.max_batch_size.min(self.ready.max_batch_size),
                     context,
-                    1000.0 / self.config.target_tokens_per_second,
-                    self.config.admission_headroom,
+                    &self.config,
+                    reserve_prefill,
                 ))
         {
             return Err(error(
@@ -198,10 +202,18 @@ impl WorkerActor {
         session.stage = Stage::Capturing { chunks: 0 };
         session.committed_at = None;
         session.chunk_count = 0;
-        session
+        if session
             .events
             .try_send(SessionEvent::Accepted { turn_id })
-            .map_err(|_| error(ErrorCode::SlowConsumer, "session event queue full"))?;
+            .is_err()
+        {
+            session.finish(crate::protocol::FinishReason::SlowConsumer);
+            session.cancellation.cancel();
+            session.closing = true;
+            self.metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+            self.metrics.saturation.fetch_add(1, Ordering::Relaxed);
+            return Err(error(ErrorCode::SlowConsumer, "session event queue full"));
+        }
         self.metrics.admitted_turns.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
