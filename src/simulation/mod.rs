@@ -7,6 +7,8 @@ pub use measurements::{ClientEchoTrace, ClientPacketTrace};
 use quality::PacketQuality;
 pub use quality::PacketQualityPolicy;
 
+const CAPTURE_QUEUE_CAPACITY: usize = 4;
+
 use bytes::Bytes;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use serde::{Deserialize, Serialize};
@@ -128,6 +130,7 @@ pub struct ClientCounters {
     pub attempted_frames: u64,
     pub echoed_frames: u64,
     pub late_frames: u64,
+    pub discarded_output_frames: u64,
     pub unrecovered_deadline_frames: u64,
     pub quality_failed_sessions: u64,
     pub maximum_consecutive_misses: u64,
@@ -168,6 +171,7 @@ impl ClientCounters {
         self.attempted_frames += other.attempted_frames;
         self.echoed_frames += other.echoed_frames;
         self.late_frames += other.late_frames;
+        self.discarded_output_frames += other.discarded_output_frames;
         self.unrecovered_deadline_frames += other.unrecovered_deadline_frames;
         self.quality_failed_sessions += other.quality_failed_sessions;
         self.maximum_consecutive_misses = self
@@ -312,9 +316,10 @@ fn pace(
 
 fn classify(error: ClientError) -> FailureReason {
     match error {
-        ClientError::DeadlineExceeded | ClientError::LateEcho(_) | ClientError::ExpiredEcho(_) => {
-            FailureReason::DeadlineExceeded
-        }
+        ClientError::DeadlineExceeded
+        | ClientError::LateEcho(_)
+        | ClientError::ExpiredEcho(_)
+        | ClientError::RecoveryExceeded(_) => FailureReason::DeadlineExceeded,
         ClientError::Rejected(reason) => FailureReason::ServerRejected(reason),
         ClientError::Wire(_) => FailureReason::Connection,
         ClientError::Protocol(_) => FailureReason::Protocol,
@@ -361,27 +366,33 @@ async fn run_session(
         let outcome = session.infer_audio(payload.clone(), captured_at).await;
         let round_trip = captured_at.elapsed();
         let outcome = match outcome {
+            Ok(audio) if round_trip > session.packet_recovery_budget() => {
+                Err(ClientError::RecoveryExceeded(Box::new(audio)))
+            }
+            Err(ClientError::LateEcho(audio)) if round_trip > session.packet_recovery_budget() => {
+                Err(ClientError::RecoveryExceeded(audio))
+            }
+            Err(ClientError::ExpiredEcho(audio))
+                if round_trip > session.packet_recovery_budget() =>
+            {
+                Err(ClientError::RecoveryExceeded(audio))
+            }
             Ok(audio) if round_trip > session.packet_completion_budget() => {
                 Err(ClientError::ExpiredEcho(Box::new(audio)))
-            }
-            Err(ClientError::LateEcho(audio))
-                if round_trip > session.packet_completion_budget() =>
-            {
-                Err(ClientError::ExpiredEcho(audio))
             }
             Ok(audio) if round_trip > session.packet_deadline() => {
                 Err(ClientError::LateEcho(Box::new(audio)))
             }
             outcome => outcome,
         };
-        let (audio, late) = match outcome {
-            Ok(audio) => (audio, false),
-            Err(ClientError::LateEcho(audio)) => (*audio, true),
+        let audio = match outcome {
+            Ok(audio) => audio,
+            Err(ClientError::LateEcho(audio) | ClientError::ExpiredEcho(audio)) => *audio,
             Err(error) => {
                 let (reason, trace) = match error {
-                    ClientError::ExpiredEcho(audio) => (
+                    ClientError::RecoveryExceeded(audio) => (
                         FailureReason::DeadlineExceeded,
-                        ClientPacketTrace::ExpiredEcho(ClientEchoTrace::new(
+                        ClientPacketTrace::UnrecoveredEcho(ClientEchoTrace::new(
                             session_id,
                             &audio,
                             round_trip,
@@ -411,6 +422,7 @@ async fn run_session(
             }
         };
         {
+            let late = round_trip > session.packet_deadline();
             let trace = ClientEchoTrace::new(
                 session_id,
                 &audio,
@@ -418,7 +430,10 @@ async fn run_session(
                 client_start_delay,
                 session.packet_deadline(),
             );
-            let trace = if late {
+            let trace = if round_trip > session.packet_completion_budget() {
+                counters.discarded_output_frames += 1;
+                ClientPacketTrace::ExpiredEcho(trace)
+            } else if late {
                 ClientPacketTrace::LateEcho(trace)
             } else {
                 ClientPacketTrace::Echo(trace)
@@ -541,7 +556,7 @@ pub async fn run(
     let (metrics, packet_mailbox) = mpsc::channel(configuration.metric_channel_capacity);
     let collector = tokio::spawn(PacketMeasurements::default().collect(packet_mailbox));
     for (session_id, session) in admitted {
-        let (sender, receiver) = mpsc::channel(1);
+        let (sender, receiver) = mpsc::channel(CAPTURE_QUEUE_CAPACITY);
         let cancellation = CancellationToken::new();
         let (ready, initialized) = tokio::sync::oneshot::channel();
         readiness.push(initialized);

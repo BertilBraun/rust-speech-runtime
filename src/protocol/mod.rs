@@ -125,6 +125,7 @@ pub struct SessionAdmission {
     pub audio_limits: AudioLimits,
     pub packet_deadline: Duration,
     pub packet_lateness_grace: Duration,
+    pub packet_recovery_budget: Duration,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FrameRejection {

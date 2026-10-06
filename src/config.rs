@@ -151,6 +151,10 @@ impl RuntimeConfig {
         self.packet_deadline + self.packet_lateness_grace
     }
 
+    pub fn packet_recovery_budget(&self) -> Duration {
+        self.packet_completion_budget() + self.minimum_packet_interval * 3
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.packet_lateness_grace > self.minimum_packet_interval {
             return Err(ConfigError(

@@ -18,8 +18,11 @@ pub enum ClientError {
     #[error("audio echo arrived after its end-to-end packet deadline")]
     /// Both audio prefixes have advanced; the next packet can use this same session.
     LateEcho(Box<AudioResult>),
-    #[error("audio echo arrived beyond its recovery budget")]
+    #[error("audio echo arrived beyond its playback budget")]
+    /// Discard the output audio; both prefixes advanced and the session can continue.
     ExpiredEcho(Box<AudioResult>),
+    #[error("audio echo arrived beyond the bounded session recovery budget")]
+    RecoveryExceeded(Box<AudioResult>),
     #[error("server rejected packet: {0:?}")]
     Rejected(FrameRejection),
     #[error("invalid server response: {0}")]
@@ -78,11 +81,14 @@ impl AudioSession {
     pub fn packet_completion_budget(&self) -> Duration {
         self.admission.packet_deadline + self.admission.packet_lateness_grace
     }
+    pub fn packet_recovery_budget(&self) -> Duration {
+        self.admission.packet_recovery_budget
+    }
     pub fn next_sequence(&self) -> PacketSequence {
         PacketSequence(self.prefix.packets)
     }
 
-    /// Only `LateEcho` is recoverable; other errors require closing this connection.
+    /// `LateEcho` and `ExpiredEcho` preserve the session; other errors require closing it.
     pub async fn infer_audio(
         &mut self,
         payload: Bytes,
@@ -96,9 +102,9 @@ impl AudioSession {
             return Err(ClientError::PrefixCapacity);
         }
         let deadline = captured_at + self.admission.packet_deadline;
-        let completion_deadline = deadline + self.admission.packet_lateness_grace;
+        let recovery_deadline = captured_at + self.admission.packet_recovery_budget;
         let operation = self.exchange_audio(payload, deadline);
-        tokio::time::timeout_at(completion_deadline, operation)
+        tokio::time::timeout_at(recovery_deadline, operation)
             .await
             .map_err(|_| ClientError::DeadlineExceeded)?
     }
@@ -110,6 +116,8 @@ impl AudioSession {
     ) -> Result<AudioResult, ClientError> {
         let sequence = self.next_sequence();
         let completion_deadline = deadline + self.admission.packet_lateness_grace;
+        let recovery_deadline =
+            deadline + (self.admission.packet_recovery_budget - self.admission.packet_deadline);
         let packet = AudioPacket {
             sequence,
             payload: payload.clone(),
@@ -118,7 +126,7 @@ impl AudioSession {
         self.peer
             .send(ClientRequest::Audio {
                 packet,
-                remaining_budget: completion_deadline.saturating_duration_since(Instant::now()),
+                remaining_budget: recovery_deadline.saturating_duration_since(Instant::now()),
             })
             .await?;
         let mut reply = self.peer.receive().await?.ok_or(WireError::Closed)?;
@@ -131,7 +139,7 @@ impl AudioSession {
             self.peer
                 .send(ClientRequest::Audio {
                     packet,
-                    remaining_budget: completion_deadline.saturating_duration_since(Instant::now()),
+                    remaining_budget: recovery_deadline.saturating_duration_since(Instant::now()),
                 })
                 .await?;
             reply = self.peer.receive().await?.ok_or(WireError::Closed)?;
@@ -146,11 +154,14 @@ impl AudioSession {
                 {
                     return Err(ClientError::EchoMismatch);
                 }
-                if Instant::now() > completion_deadline {
-                    return Err(ClientError::ExpiredEcho(Box::new(audio)));
+                if Instant::now() > recovery_deadline {
+                    return Err(ClientError::RecoveryExceeded(Box::new(audio)));
                 }
                 self.history.0.push(payload);
                 self.prefix = expected;
+                if Instant::now() > completion_deadline {
+                    return Err(ClientError::ExpiredEcho(Box::new(audio)));
+                }
                 if Instant::now() > deadline {
                     return Err(ClientError::LateEcho(Box::new(audio)));
                 }
@@ -216,6 +227,7 @@ mod tests {
                     audio_limits: AudioLimits::default(),
                     packet_deadline: Duration::from_millis(50),
                     packet_lateness_grace: Duration::from_millis(10),
+                    packet_recovery_budget: Duration::from_millis(204),
                 },
             )))
             .await
@@ -270,10 +282,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn received_echo_beyond_recovery_budget_is_fatal_and_retains_its_profile() {
+    async fn discarded_output_advances_input_history_and_retains_its_profile() {
         let (outcome, session) = delayed_echo(Duration::from_millis(65)).await;
         let ClientError::ExpiredEcho(audio) = outcome.unwrap_err() else {
-            panic!("expired echo must not be recoverable");
+            panic!("output beyond playback budget must be discarded");
+        };
+        assert_eq!(audio.timings.device_execution, Duration::from_millis(12));
+        assert_eq!(session.prefix, PrefixState::default().append(b"audio"));
+        assert_eq!(session.history.0, vec![Bytes::from_static(b"audio")]);
+    }
+
+    #[tokio::test]
+    async fn expired_session_recovery_is_fatal_and_retains_its_profile() {
+        let (outcome, session) = delayed_echo(Duration::from_millis(230)).await;
+        let ClientError::RecoveryExceeded(audio) = outcome.unwrap_err() else {
+            panic!("session recovery must remain bounded");
         };
         assert_eq!(audio.timings.device_execution, Duration::from_millis(12));
         assert_eq!(session.prefix, PrefixState::default());

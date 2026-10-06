@@ -142,6 +142,51 @@ async fn late_audio_recovers_on_the_same_session_and_retains_its_entire_prefix()
 }
 
 #[tokio::test]
+async fn discarded_output_keeps_the_input_cache_and_complete_replay_history() {
+    let (address, signal, task) = start(configuration()).await;
+    let mut session = connect(address, 1).await;
+    let assignment = session.assignment();
+    let error = session
+        .infer_audio(
+            Bytes::from_static(b"voice"),
+            Instant::now() - Duration::from_millis(300),
+        )
+        .await
+        .unwrap_err();
+    let ClientError::ExpiredEcho(audio) = error else {
+        panic!("expected discarded output, got {error:?}");
+    };
+    assert_eq!(audio.assignment, assignment);
+    assert_eq!(session.next_sequence().0, 1);
+    let audio = session
+        .infer_audio(Bytes::from_static(b"next"), Instant::now())
+        .await
+        .unwrap();
+    assert_eq!(audio.assignment, assignment);
+    assert_eq!(audio.cache, CacheOutcome::Hit);
+    assert_eq!(audio.prefix.packets, 2);
+    assert!(session.evict_cache().await.unwrap());
+    let audio = session
+        .infer_audio(Bytes::from_static(b"last"), Instant::now())
+        .await
+        .unwrap();
+    assert_eq!(audio.prefix.packets, 3);
+    assert_eq!(
+        audio.cache,
+        CacheOutcome::Replayed {
+            packets: 2,
+            bytes: 9
+        }
+    );
+    session.close().await.unwrap();
+    signal.cancel();
+    let report = task.await.unwrap().unwrap();
+    assert_eq!(report.runtime.inference.deadline_misses, 1);
+    assert_eq!(report.runtime.inference.delivered_frames, 3);
+    assert_eq!(report.runtime.active_sessions_at_shutdown, 0);
+}
+
+#[tokio::test]
 async fn gateway_rejects_capacity_and_reclaims_disconnected_sessions() {
     let (address, signal, task) = start(configuration()).await;
     let mut sessions = Vec::new();

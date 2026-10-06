@@ -328,8 +328,7 @@ async fn serve_connection(
                 let Some(lease) = *session else {
                     return Err(WireError::InvalidMessage("open a session before audio").into());
                 };
-                if remaining_budget.is_zero()
-                    || remaining_budget > runtime.packet_completion_budget()
+                if remaining_budget.is_zero() || remaining_budget > runtime.packet_recovery_budget()
                 {
                     send_reply(
                         peer,
@@ -341,12 +340,13 @@ async fn serve_connection(
                     return Ok(());
                 }
                 let timestamp = Instant::now();
-                // The wire budget includes recovery grace; EDF retains the original target.
+                // Recovery preserves input state; EDF retains the original playback target.
                 let future = ingress.input_frame(
                     lease,
                     InputFrame {
                         timestamp,
-                        deadline: timestamp + remaining_budget - runtime.packet_lateness_grace,
+                        deadline: timestamp + remaining_budget
+                            - (runtime.packet_recovery_budget() - runtime.packet_deadline),
                         packet,
                     },
                 );

@@ -810,8 +810,10 @@ async fn oversending_terminates_session_without_coalescing_audio() {
     assert_eq!(report.inference.delivered_frames, 0);
 }
 #[tokio::test]
-async fn configured_slow_work_is_rejected_before_launch_if_it_cannot_meet_the_packet_deadline() {
+async fn known_unsustainable_slowdown_revokes_sessions_before_more_device_work() {
     let node = Node::start(RuntimeConfig {
+        packet_deadline: Duration::from_millis(50),
+        minimum_packet_interval: Duration::from_millis(50),
         slowdown: Some(WorkerSlowdown {
             after: Duration::from_millis(30),
             inference_latency: Duration::from_millis(100),
@@ -837,12 +839,12 @@ async fn configured_slow_work_is_rejected_before_launch_if_it_cannot_meet_the_pa
         .unwrap();
     assert!(matches!(
         outcome,
-        InputOutcome::Rejected(FrameRejection::DeadlineExceeded)
+        InputOutcome::Rejected(FrameRejection::UnknownSession)
     ));
     let report = node.shutdown().await.unwrap();
     assert_eq!(report.inference.processed_frames, 0);
     assert_eq!(report.inference.deadline_misses, 0);
-    assert_eq!(report.inference.rejected_frames, 1);
+    assert_eq!(report.inference.capacity_terminations, 1);
 }
 
 #[tokio::test(start_paused = true)]

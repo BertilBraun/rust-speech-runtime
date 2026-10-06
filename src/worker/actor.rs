@@ -144,8 +144,14 @@ impl Worker {
         self.measurements.initial_session_limit = self.admission_limit();
         let _ = ready.send(());
         let mut next_probe = self.epoch + self.configuration.probe_interval;
+        let mut slowdown_time = self
+            .configuration
+            .slowdown
+            .as_ref()
+            .map(|slowdown| self.epoch + slowdown.after);
         loop {
             let wakeup = self.next_wakeup();
+            let slowdown_wakeup = slowdown_time.unwrap_or(next_probe);
             let can_dispatch = !self.prepared.is_empty()
                 && self.submitted.len() < self.configuration.device_queue_capacity + 1
                 && (self.prepared.len() == self.configuration.batch_size
@@ -156,6 +162,10 @@ impl Worker {
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => break,
+                _ = tokio::time::sleep_until(slowdown_wakeup), if slowdown_time.is_some() => {
+                    slowdown_time = None;
+                    self.refresh_capacity();
+                }
                 result = results.recv(), if !self.submitted.is_empty() => {
                     self.complete(result.expect("device returns active work"));
                 }
@@ -245,6 +255,15 @@ impl Worker {
             + replay
             + self.configuration.scheduling_margin
             <= deadline + self.configuration.packet_lateness_grace
+    }
+    fn recovery_deadline(&self, deadline: Instant) -> Instant {
+        deadline
+            + (self.configuration.packet_recovery_budget() - self.configuration.packet_deadline)
+    }
+    fn input_has_time_for_recovery(&self, deadline: Instant) -> bool {
+        self.projected_device_time() <= self.configuration.compute_budget()
+            && Instant::now() + self.projected_device_time() + self.configuration.scheduling_margin
+                <= self.recovery_deadline(deadline)
     }
     fn admission_limit(&self) -> usize {
         let now = Instant::now();
@@ -438,7 +457,7 @@ impl Worker {
             self.reject(session_id, reply, FrameRejection::Overloaded);
             return;
         }
-        if input.deadline + self.configuration.packet_lateness_grace <= Instant::now() {
+        if self.recovery_deadline(input.deadline) <= Instant::now() {
             self.reject(session_id, reply, FrameRejection::DeadlineExceeded);
             return;
         }
@@ -513,7 +532,13 @@ impl Worker {
             CacheOutcome::Hit => Duration::ZERO,
             CacheOutcome::Replayed { .. } => replay_cost,
         };
-        if !self.input_has_time_for_compute(input.deadline, replay_duration) {
+        let has_time = match cache {
+            CacheOutcome::Hit => self.input_has_time_for_recovery(input.deadline),
+            CacheOutcome::Replayed { .. } => {
+                self.input_has_time_for_compute(input.deadline, replay_duration)
+            }
+        };
+        if !has_time {
             self.reject(
                 session_id,
                 reply,
@@ -672,8 +697,14 @@ impl Worker {
                 + replay
                 + pending.replay_duration
                 + self.configuration.scheduling_margin;
-            let completion_deadline =
-                pending.input.deadline + self.configuration.packet_lateness_grace;
+            let completion_deadline = pending.input.deadline
+                + match pending.cache {
+                    CacheOutcome::Hit => {
+                        self.configuration.packet_recovery_budget()
+                            - self.configuration.packet_deadline
+                    }
+                    CacheOutcome::Replayed { .. } => self.configuration.packet_lateness_grace,
+                };
             let batch_deadline = earliest_deadline
                 .unwrap_or(completion_deadline)
                 .min(completion_deadline);
@@ -841,7 +872,9 @@ impl Worker {
                             .record(Instant::now().duration_since(item.input.deadline));
                     }
                     if Instant::now()
-                        > item.input.deadline + self.configuration.packet_lateness_grace
+                        > item.input.deadline
+                            + (self.configuration.packet_recovery_budget()
+                                - self.configuration.packet_deadline)
                     {
                         self.reject(
                             item.session_id,
