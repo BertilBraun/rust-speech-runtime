@@ -1,10 +1,13 @@
 use super::Worker;
 use crate::{
     protocol::{
-        AudioContext, AudioPacket, CacheOutcome, FrameRejection, Generation, InputFrame,
-        InputOutcome, SessionId,
+        AudioContext, AudioPacket, AudioPrefix, CacheOutcome, FrameRejection, Generation,
+        InputFrame, InputOutcome, PrefixState, SessionId,
     },
-    worker::{mock_gpu::WorkItem, session::SessionWork},
+    worker::{
+        mock_gpu::WorkItem,
+        session::{SessionWork, WorkerSession},
+    },
 };
 use std::time::Duration;
 use tokio::{sync::oneshot, time::Instant};
@@ -18,16 +21,6 @@ impl Worker {
         reply: oneshot::Sender<InputOutcome>,
         routed_at: Instant,
     ) {
-        let InputFrame {
-            timestamp,
-            deadline,
-            packet,
-        } = input;
-        let AudioPacket {
-            sequence,
-            payload,
-            context,
-        } = packet;
         let received_at = Instant::now();
         self.measurements
             .profile
@@ -41,45 +34,36 @@ impl Worker {
             let _ = reply.send(InputOutcome::Rejected(FrameRejection::Cancelled));
             return;
         }
-        if !matches!(session.work, SessionWork::Idle) {
-            self.reject(session_id, reply, FrameRejection::Overloaded);
-            return;
-        }
-        if self.recovery_deadline(deadline) <= Instant::now() {
-            self.reject(session_id, reply, FrameRejection::DeadlineExceeded);
-            return;
-        }
-        if sequence.0 != session.prefix.packets {
-            self.reject(session_id, reply, FrameRejection::InvalidSequence);
+        if let Err(reason) = self.validate_input(session, &input) {
+            self.reject(session_id, reply, reason);
             return;
         }
         let prior_prefix = session.prefix;
-        if prior_prefix.packets >= self.configuration.audio_limits.max_prefix_packets as u64
-            || prior_prefix.bytes + payload.len() as u64
-                > self.configuration.audio_limits.max_prefix_bytes as u64
-        {
-            self.reject(session_id, reply, FrameRejection::PrefixCapacity);
-            return;
-        }
+        let cache_handle = session.cache;
+        let InputFrame {
+            timestamp,
+            deadline,
+            packet,
+        } = input;
+        let AudioPacket {
+            sequence,
+            payload,
+            context,
+        } = packet;
         let replay_cost = self
             .configuration
             .replay_latency_per_packet
             .mul_f64(prior_prefix.packets as f64);
-        let recovery_rejection = if replay_cost.is_zero() {
-            FrameRejection::DeadlineExceeded
-        } else {
-            FrameRejection::ReplayTooExpensive
-        };
         let cache = match context {
             AudioContext::Cached(expected) => {
                 if expected != prior_prefix {
                     self.reject(session_id, reply, FrameRejection::InvalidPrefix);
                     return;
                 }
-                if self.cache.lookup(session.cache) != Some(prior_prefix) {
+                if self.cache.lookup(cache_handle) != Some(prior_prefix) {
                     self.measurements.counters.cache_misses += 1;
                     if !self.input_has_time_for_compute(deadline, replay_cost) {
-                        self.reject(session_id, reply, recovery_rejection);
+                        self.reject(session_id, reply, compute_rejection(replay_cost));
                         return;
                     }
                     let _ = reply.send(InputOutcome::CacheMiss);
@@ -88,30 +72,15 @@ impl Worker {
                 CacheOutcome::Hit
             }
             AudioContext::Replay(prefix) => {
-                if !self.input_has_time_for_compute(deadline, replay_cost) {
-                    self.reject(session_id, reply, recovery_rejection);
-                    return;
-                }
-                if prefix.0.len() > self.configuration.audio_limits.max_prefix_packets
-                    || prefix.byte_len() > self.configuration.audio_limits.max_prefix_bytes
-                    || prefix
-                        .0
-                        .iter()
-                        .any(|frame| frame.len() > self.configuration.audio_limits.max_frame_bytes)
-                {
-                    self.reject(session_id, reply, FrameRejection::PrefixCapacity);
-                    return;
-                }
-                let state = tokio::task::spawn_blocking(move || prefix.state())
+                match self
+                    .validate_replay(prefix, prior_prefix, deadline, replay_cost)
                     .await
-                    .expect("prefix hashing does not panic");
-                if state != prior_prefix {
-                    self.reject(session_id, reply, FrameRejection::InvalidPrefix);
-                    return;
-                }
-                CacheOutcome::Replayed {
-                    packets: state.packets,
-                    bytes: state.bytes,
+                {
+                    Ok(cache) => cache,
+                    Err(reason) => {
+                        self.reject(session_id, reply, reason);
+                        return;
+                    }
                 }
             }
         };
@@ -126,15 +95,7 @@ impl Worker {
             }
         };
         if !has_time {
-            self.reject(
-                session_id,
-                reply,
-                if replay_duration.is_zero() {
-                    FrameRejection::DeadlineExceeded
-                } else {
-                    FrameRejection::ReplayTooExpensive
-                },
-            );
+            self.reject(session_id, reply, compute_rejection(replay_duration));
             return;
         }
         let prefix = prior_prefix.append(&payload);
@@ -165,5 +126,68 @@ impl Worker {
         });
         self.refresh_prepared();
         self.publish();
+    }
+
+    fn validate_input(
+        &self,
+        session: &WorkerSession,
+        input: &InputFrame,
+    ) -> Result<(), FrameRejection> {
+        if !matches!(session.work, SessionWork::Idle) {
+            return Err(FrameRejection::Overloaded);
+        }
+        if self.recovery_deadline(input.deadline) <= Instant::now() {
+            return Err(FrameRejection::DeadlineExceeded);
+        }
+        if input.packet.sequence.0 != session.prefix.packets {
+            return Err(FrameRejection::InvalidSequence);
+        }
+        if session.prefix.packets >= self.configuration.audio_limits.max_prefix_packets as u64
+            || session.prefix.bytes + input.packet.payload.len() as u64
+                > self.configuration.audio_limits.max_prefix_bytes as u64
+        {
+            return Err(FrameRejection::PrefixCapacity);
+        }
+        Ok(())
+    }
+
+    async fn validate_replay(
+        &self,
+        prefix: AudioPrefix,
+        expected: PrefixState,
+        deadline: Instant,
+        replay_duration: Duration,
+    ) -> Result<CacheOutcome, FrameRejection> {
+        if !self.input_has_time_for_compute(deadline, replay_duration) {
+            return Err(compute_rejection(replay_duration));
+        }
+        let limits = self.configuration.audio_limits;
+        if prefix.0.len() > limits.max_prefix_packets
+            || prefix.byte_len() > limits.max_prefix_bytes
+            || prefix
+                .0
+                .iter()
+                .any(|frame| frame.len() > limits.max_frame_bytes)
+        {
+            return Err(FrameRejection::PrefixCapacity);
+        }
+        let state = tokio::task::spawn_blocking(move || prefix.state())
+            .await
+            .expect("prefix hashing does not panic");
+        if state != expected {
+            return Err(FrameRejection::InvalidPrefix);
+        }
+        Ok(CacheOutcome::Replayed {
+            packets: state.packets,
+            bytes: state.bytes,
+        })
+    }
+}
+
+fn compute_rejection(replay_duration: Duration) -> FrameRejection {
+    if replay_duration.is_zero() {
+        FrameRejection::DeadlineExceeded
+    } else {
+        FrameRejection::ReplayTooExpensive
     }
 }
