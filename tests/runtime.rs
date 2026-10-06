@@ -182,6 +182,32 @@ async fn packet_profile_separates_ingress_mailbox_batching_and_device_time() {
 }
 
 #[tokio::test]
+async fn simultaneous_inputs_form_one_full_batch_before_the_idle_device_starts() {
+    let node = Node::start(RuntimeConfig {
+        max_batch_wait: Duration::from_millis(1),
+        ..configuration()
+    })
+    .await
+    .unwrap();
+    for session_id in 0..4 {
+        admit(&node, session_id).await;
+    }
+    let outcomes = tokio::join!(
+        first_packet(&node, 0),
+        first_packet(&node, 1),
+        first_packet(&node, 2),
+        first_packet(&node, 3),
+    );
+    for outcome in [outcomes.0, outcomes.1, outcomes.2, outcomes.3] {
+        assert!(matches!(outcome, InputOutcome::Processed(_)));
+    }
+    let report = node.shutdown().await.unwrap();
+    assert_eq!(report.inference.processed_frames, 4);
+    assert_eq!(report.inference.batches, 1);
+    assert_eq!(report.batch_fill_ratio, 1.0);
+}
+
+#[tokio::test]
 async fn batches_are_prepared_and_submitted_while_the_device_is_running() {
     let node = Node::start(RuntimeConfig {
         batch_size: 1,

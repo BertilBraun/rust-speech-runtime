@@ -147,6 +147,9 @@ impl Worker {
             let wakeup = self.next_wakeup();
             let can_dispatch = !self.prepared.is_empty()
                 && self.submitted.len() < self.configuration.device_queue_capacity + 1
+                && (self.prepared.len() == self.configuration.batch_size
+                    || !self.submitted.is_empty()
+                    || commands.is_empty())
                 && wakeup <= Instant::now();
             tokio::select! {
                 biased;
