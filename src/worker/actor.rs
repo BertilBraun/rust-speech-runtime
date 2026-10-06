@@ -557,15 +557,24 @@ impl Worker {
         {
             return now + self.configuration.session_timeout;
         }
+        let completion_pending = self
+            .submitted
+            .front()
+            .is_some_and(|batch| batch.expected_completion <= now);
         if self.prepared.len() == self.configuration.batch_size
-            || self
-                .sessions
-                .values()
-                .all(|session| !matches!(session.work, SessionWork::Idle))
+            || (!completion_pending
+                && self
+                    .sessions
+                    .values()
+                    .all(|session| !matches!(session.work, SessionWork::Idle)))
         {
             return now;
         }
-        if let Some(previous) = self.submitted.back() {
+        if let Some(previous) = self
+            .submitted
+            .back()
+            .filter(|batch| batch.expected_completion > now)
+        {
             return previous.expected_completion - self.configuration.launch_ahead;
         }
         let mut count = 0;
