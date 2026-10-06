@@ -102,6 +102,7 @@ impl SessionManager {
         }
         .await;
         commands.close();
+        self.reconcile();
         self.measurements.active_sessions = self.sessions.len();
         self.worker_cancellation.cancel();
         let mut workers = Vec::new();

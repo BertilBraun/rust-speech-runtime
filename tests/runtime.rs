@@ -625,6 +625,43 @@ async fn cache_eviction_requires_replaying_all_preceding_audio() {
     assert!(report.inference_latency.max_ms >= 7.0);
 }
 #[tokio::test]
+async fn impossible_cache_recovery_is_rejected_before_requesting_prefix_upload() {
+    let node = Node::start(RuntimeConfig {
+        replay_latency_per_packet: Duration::from_millis(200),
+        ..configuration()
+    })
+    .await
+    .unwrap();
+    admit(&node, 1).await;
+    let InputOutcome::Processed(first) = first_packet(&node, 1).await else {
+        panic!("expected prefix warmup");
+    };
+    assert!(node.ingress.evict_cache(SessionId(1)).await.unwrap());
+    assert!(matches!(
+        node.ingress
+            .input_frame(
+                SessionId(1),
+                frame(
+                    1,
+                    first.audio.prefix,
+                    Bytes::from_static(b"next"),
+                    Duration::from_millis(50)
+                ),
+            )
+            .await
+            .unwrap(),
+        InputOutcome::Rejected(FrameRejection::ReplayTooExpensive)
+    ));
+    let report = node.shutdown().await.unwrap();
+    assert_eq!(report.inference.cache_misses, 1);
+    assert_eq!(report.inference.batches, 1);
+    assert_eq!(report.inference.replayed_packets, 0);
+    assert_eq!(report.inference.deadline_misses, 0);
+    assert_eq!(report.active_sessions_at_shutdown, 0);
+    assert_eq!(report.terminated_sessions, 1);
+}
+
+#[tokio::test]
 async fn expensive_prefix_replay_fails_instead_of_missing_realtime() {
     let node = Node::start(RuntimeConfig {
         replay_latency_per_packet: Duration::from_millis(200),

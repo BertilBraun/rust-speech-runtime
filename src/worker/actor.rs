@@ -233,6 +233,13 @@ impl Worker {
     fn projected_device_time(&self) -> Duration {
         self.estimator.device_time().max(self.base_latency())
     }
+    fn input_has_time_for_compute(&self, deadline: Instant, replay: Duration) -> bool {
+        Instant::now()
+            + self.projected_device_time()
+            + replay
+            + self.configuration.scheduling_margin
+            <= deadline
+    }
     fn admission_limit(&self) -> usize {
         let now = Instant::now();
         let mut queued = Duration::ZERO;
@@ -440,6 +447,15 @@ impl Worker {
             self.reject(session_id, reply, FrameRejection::PrefixCapacity);
             return;
         }
+        let replay_cost = self
+            .configuration
+            .replay_latency_per_packet
+            .mul_f64(prior_prefix.packets as f64);
+        let recovery_rejection = if replay_cost.is_zero() {
+            FrameRejection::DeadlineExceeded
+        } else {
+            FrameRejection::ReplayTooExpensive
+        };
         let cache = match &input.packet.context {
             AudioContext::Cached(expected) => {
                 if *expected != prior_prefix {
@@ -448,12 +464,20 @@ impl Worker {
                 }
                 if self.cache.lookup(session.cache) != Some(prior_prefix) {
                     self.measurements.counters.cache_misses += 1;
+                    if !self.input_has_time_for_compute(input.deadline, replay_cost) {
+                        self.reject(session_id, reply, recovery_rejection);
+                        return;
+                    }
                     let _ = reply.send(InputOutcome::CacheMiss);
                     return;
                 }
                 CacheOutcome::Hit
             }
             AudioContext::Replay(prefix) => {
+                if !self.input_has_time_for_compute(input.deadline, replay_cost) {
+                    self.reject(session_id, reply, recovery_rejection);
+                    return;
+                }
                 if prefix.0.len() > self.configuration.audio_limits.max_prefix_packets
                     || prefix.byte_len() > self.configuration.audio_limits.max_prefix_bytes
                     || prefix
@@ -480,17 +504,9 @@ impl Worker {
         };
         let replay_duration = match cache {
             CacheOutcome::Hit => Duration::ZERO,
-            CacheOutcome::Replayed { packets, .. } => self
-                .configuration
-                .replay_latency_per_packet
-                .mul_f64(packets as f64),
+            CacheOutcome::Replayed { .. } => replay_cost,
         };
-        if Instant::now()
-            + self.projected_device_time()
-            + replay_duration
-            + self.configuration.scheduling_margin
-            > input.deadline
-        {
+        if !self.input_has_time_for_compute(input.deadline, replay_duration) {
             self.reject(
                 session_id,
                 reply,
