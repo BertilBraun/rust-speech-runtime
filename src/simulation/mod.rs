@@ -19,7 +19,7 @@ use crate::{
     metrics::profile::{RuntimeLagReport, monitor_runtime},
     metrics::{LatencyDistribution, LatencyHistogram},
     protocol::{CacheOutcome, CreateRejection, FrameRejection, SessionId},
-    transport::{AudioSession, ClientError, ConnectOutcome, connect_session},
+    transport::{AudioDelivery, AudioSession, ClientError, ConnectOutcome, connect_session},
 };
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, clap::ValueEnum)]
@@ -316,10 +316,9 @@ fn pace(
 
 fn classify(error: ClientError) -> FailureReason {
     match error {
-        ClientError::DeadlineExceeded
-        | ClientError::LateEcho(_)
-        | ClientError::ExpiredEcho(_)
-        | ClientError::RecoveryExceeded(_) => FailureReason::DeadlineExceeded,
+        ClientError::DeadlineExceeded | ClientError::RecoveryExceeded(_) => {
+            FailureReason::DeadlineExceeded
+        }
         ClientError::Rejected(reason) => FailureReason::ServerRejected(reason),
         ClientError::Wire(_) => FailureReason::Connection,
         ClientError::Protocol(_) => FailureReason::Protocol,
@@ -365,29 +364,10 @@ async fn run_session(
         let client_start_delay = captured_at.elapsed();
         let outcome = session.infer_audio(payload.clone(), captured_at).await;
         let round_trip = captured_at.elapsed();
-        let outcome = match outcome {
-            Ok(audio) if round_trip > session.packet_recovery_budget() => {
-                Err(ClientError::RecoveryExceeded(Box::new(audio)))
-            }
-            Err(ClientError::LateEcho(audio)) if round_trip > session.packet_recovery_budget() => {
-                Err(ClientError::RecoveryExceeded(audio))
-            }
-            Err(ClientError::ExpiredEcho(audio))
-                if round_trip > session.packet_recovery_budget() =>
-            {
-                Err(ClientError::RecoveryExceeded(audio))
-            }
-            Ok(audio) if round_trip > session.packet_completion_budget() => {
-                Err(ClientError::ExpiredEcho(Box::new(audio)))
-            }
-            Ok(audio) if round_trip > session.packet_deadline() => {
-                Err(ClientError::LateEcho(Box::new(audio)))
-            }
-            outcome => outcome,
-        };
-        let audio = match outcome {
-            Ok(audio) => audio,
-            Err(ClientError::LateEcho(audio) | ClientError::ExpiredEcho(audio)) => *audio,
+        let outcome =
+            outcome.and_then(|delivery| session.classify_echo(delivery.into_audio(), round_trip));
+        let delivery = match outcome {
+            Ok(delivery) => delivery,
             Err(error) => {
                 let (reason, trace) = match error {
                     ClientError::RecoveryExceeded(audio) => (
@@ -422,7 +402,9 @@ async fn run_session(
             }
         };
         {
-            let late = round_trip > session.packet_deadline();
+            let late = !matches!(delivery, AudioDelivery::OnTime(_));
+            let discarded = matches!(delivery, AudioDelivery::Discarded(_));
+            let audio = delivery.into_audio();
             let trace = ClientEchoTrace::new(
                 session_id,
                 &audio,
@@ -430,7 +412,7 @@ async fn run_session(
                 client_start_delay,
                 session.packet_deadline(),
             );
-            let trace = if round_trip > session.packet_completion_budget() {
+            let trace = if discarded {
                 counters.discarded_output_frames += 1;
                 ClientPacketTrace::ExpiredEcho(trace)
             } else if late {

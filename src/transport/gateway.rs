@@ -92,7 +92,8 @@ mod tests {
         let audio = current
             .infer_audio(Bytes::from_static(b"current"), Instant::now())
             .await
-            .unwrap();
+            .unwrap()
+            .into_audio();
         assert_eq!(audio.cache, CacheOutcome::Hit);
         assert!(current.close().await.unwrap());
         signal.cancel();

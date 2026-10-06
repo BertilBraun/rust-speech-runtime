@@ -8,7 +8,7 @@ use voice_scheduler::{
     protocol::{CacheOutcome, CreateRejection, PacketSequence, SessionId},
     simulation::{self, SimulationConfig},
     transport::{
-        AudioSession, ClientError, ConnectOutcome, Gateway, GatewayConfig, GatewayError,
+        AudioDelivery, AudioSession, ConnectOutcome, Gateway, GatewayConfig, GatewayError,
         GatewayReport, connect_session,
     },
 };
@@ -71,7 +71,8 @@ async fn tcp_echo_is_sticky_and_replays_complete_prefix_on_cache_miss() {
         let audio = session
             .infer_audio(payload.clone(), captured_at)
             .await
-            .unwrap();
+            .unwrap()
+            .into_audio();
         assert!(audio.timings.total() <= captured_at.elapsed());
         assert!(audio.timings.device_execution >= Duration::from_millis(3));
         assert_eq!(audio.assignment, assignment);
@@ -80,7 +81,11 @@ async fn tcp_echo_is_sticky_and_replays_complete_prefix_on_cache_miss() {
         assert_eq!(audio.cache, CacheOutcome::Hit);
     }
     assert!(session.evict_cache().await.unwrap());
-    let audio = session.infer_audio(payload, Instant::now()).await.unwrap();
+    let audio = session
+        .infer_audio(payload, Instant::now())
+        .await
+        .unwrap()
+        .into_audio();
     assert_eq!(audio.prefix.packets, 4);
     assert_eq!(
         audio.cache,
@@ -110,12 +115,12 @@ async fn late_audio_recovers_on_the_same_session_and_retains_its_entire_prefix()
     let assignment = session.assignment();
     let payload = Bytes::from_static(b"voice");
     for sequence in 0..3 {
-        let error = session
+        let delivery = session
             .infer_audio(payload.clone(), Instant::now() - Duration::from_millis(260))
             .await
-            .unwrap_err();
-        let ClientError::LateEcho(audio) = error else {
-            panic!("expected recoverable late echo, got {error:?}");
+            .unwrap();
+        let AudioDelivery::Late(audio) = delivery else {
+            panic!("expected recoverable late echo, got {delivery:?}");
         };
         assert_eq!(audio.assignment, assignment);
         assert_eq!(audio.sequence.0, sequence);
@@ -123,7 +128,11 @@ async fn late_audio_recovers_on_the_same_session_and_retains_its_entire_prefix()
         assert_eq!(session.next_sequence().0, sequence + 1);
     }
     assert!(session.evict_cache().await.unwrap());
-    let audio = session.infer_audio(payload, Instant::now()).await.unwrap();
+    let audio = session
+        .infer_audio(payload, Instant::now())
+        .await
+        .unwrap()
+        .into_audio();
     assert_eq!(audio.assignment, assignment);
     assert_eq!(audio.prefix.packets, 4);
     assert_eq!(
@@ -146,22 +155,23 @@ async fn discarded_output_keeps_the_input_cache_and_complete_replay_history() {
     let (address, signal, task) = start(configuration()).await;
     let mut session = connect(address, 1).await;
     let assignment = session.assignment();
-    let error = session
+    let delivery = session
         .infer_audio(
             Bytes::from_static(b"voice"),
             Instant::now() - Duration::from_millis(300),
         )
         .await
-        .unwrap_err();
-    let ClientError::ExpiredEcho(audio) = error else {
-        panic!("expected discarded output, got {error:?}");
+        .unwrap();
+    let AudioDelivery::Discarded(audio) = delivery else {
+        panic!("expected discarded output, got {delivery:?}");
     };
     assert_eq!(audio.assignment, assignment);
     assert_eq!(session.next_sequence().0, 1);
     let audio = session
         .infer_audio(Bytes::from_static(b"next"), Instant::now())
         .await
-        .unwrap();
+        .unwrap()
+        .into_audio();
     assert_eq!(audio.assignment, assignment);
     assert_eq!(audio.cache, CacheOutcome::Hit);
     assert_eq!(audio.prefix.packets, 2);
@@ -169,7 +179,8 @@ async fn discarded_output_keeps_the_input_cache_and_complete_replay_history() {
     let audio = session
         .infer_audio(Bytes::from_static(b"last"), Instant::now())
         .await
-        .unwrap();
+        .unwrap()
+        .into_audio();
     assert_eq!(audio.prefix.packets, 3);
     assert_eq!(
         audio.cache,
