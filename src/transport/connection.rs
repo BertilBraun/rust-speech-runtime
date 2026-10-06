@@ -193,7 +193,10 @@ impl Connection {
                 if self.session.is_some() {
                     return Err(GatewayError::Protocol("connection already owns a session"));
                 }
-                self.session = Some(self.ingress.open_session(session_id).await?);
+                self.session = Some(tokio::select! {
+                    _ = self.cancellation.cancelled() => return Ok(()),
+                    session = self.ingress.open_session(session_id) => session?,
+                });
             }
             ClientControl::StartTurn { turn_id } => {
                 self.require_session()?.begin_turn(turn_id).await?

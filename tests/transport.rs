@@ -477,3 +477,83 @@ async fn malformed_controls_report_stable_failure_and_endpoint_is_versioned() {
     websocket.close(None).await.expect("close peer");
     gateway.shutdown().await;
 }
+
+#[tokio::test]
+async fn benchmark_reports_terminal_backend_failure_instead_of_completed_turn() {
+    let backend = Fixture::failing_decode(1).await;
+    let gateway = TestGateway::start(backend.config(), gateway_config()).await;
+    let report = simulation::run(
+        &gateway.url,
+        SimulationConfig {
+            sessions: 1,
+            turns_per_session: 1,
+            utterance_ms: 50,
+            start_spread_ms: 0,
+            ..SimulationConfig::default()
+        },
+    )
+    .await
+    .expect("failure report");
+    assert_eq!(report.failed_sessions, 1);
+    assert_eq!(report.completed_turns, 0);
+    assert_eq!(report.received_tokens, 1);
+    assert!(
+        report.sessions[0]
+            .error
+            .as_ref()
+            .expect("failure reason")
+            .contains("BackendFailed")
+    );
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn gateway_shutdown_cancels_pending_backend_open() {
+    let backend = Fixture::start(5000).await;
+    let gateway = TestGateway::start(backend.config(), gateway_config()).await;
+    let url = gateway.url.clone();
+    let opening = tokio::spawn(async move {
+        let mut client = VoiceClient::connect(&url, Duration::from_secs(10))
+            .await
+            .expect("WebSocket connects");
+        client.open(SessionId("slow-open".into())).await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    timeout(Duration::from_secs(1), gateway.shutdown())
+        .await
+        .expect("shutdown does not await backend open latency");
+    assert!(opening.await.expect("opening client task").is_err());
+}
+
+#[tokio::test]
+async fn benchmark_distinguishes_session_admission_from_active_turn_rejection() {
+    let backend = Fixture::start(1).await;
+    let gateway = TestGateway::start(
+        RuntimeConfig {
+            max_sessions_per_worker: 8,
+            max_active_turns_per_worker: 1,
+            ..backend.config()
+        },
+        gateway_config(),
+    )
+    .await;
+    let report = simulation::run(
+        &gateway.url,
+        SimulationConfig {
+            sessions: 8,
+            turns_per_session: 1,
+            utterance_ms: 100,
+            start_spread_ms: 0,
+            ..SimulationConfig::default()
+        },
+    )
+    .await
+    .expect("capacity report");
+    assert_eq!(report.admitted_sessions, 8);
+    assert_eq!(report.rejected_sessions, 0);
+    assert_eq!(report.rejected_turns, 7);
+    assert_eq!(report.admitted_turns, 1);
+    assert_eq!(report.completed_turns, 1);
+    assert_eq!(report.failed_sessions, 0);
+    gateway.shutdown().await;
+}

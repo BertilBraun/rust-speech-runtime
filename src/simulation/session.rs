@@ -5,7 +5,7 @@ use rand::{Rng, SeedableRng, rngs::SmallRng};
 use tokio::time::Instant;
 
 use crate::{
-    protocol::{ErrorCode, SessionEvent, SessionId, TurnId},
+    protocol::{ErrorCode, FinishReason, SessionEvent, SessionId, TurnId},
     transport::{GatewayError, VoiceClient},
 };
 
@@ -83,6 +83,7 @@ async fn turns(
     for index in 0..configuration.turns_per_session {
         let turn_id = TurnId(index as u64 + 1);
         client.begin_turn(turn_id).await?;
+        measurements.summary.admitted_turns += 1;
         let chunks = send_audio(client, turn_id, audio.clone(), configuration, random).await?;
         let committed = Instant::now();
         client.commit(turn_id, chunks, audio.len() / 2).await?;
@@ -161,13 +162,26 @@ async fn generate(
                 }
             }
             SessionEvent::Finished {
-                turn_id: observed, ..
+                turn_id: observed,
+                reason,
+                ..
             } if observed == turn_id => {
                 timing.finish(measurements);
-                if interrupted {
-                    measurements.summary.interrupted_turns += 1;
-                } else {
-                    measurements.summary.completed_turns += 1;
+                match reason {
+                    FinishReason::Eos => measurements.summary.completed_turns += 1,
+                    FinishReason::TokenLimit => {
+                        measurements.summary.completed_turns += 1;
+                        measurements.summary.token_limited_turns += 1;
+                    }
+                    FinishReason::Cancelled if interrupted => {
+                        measurements.summary.interrupted_turns += 1
+                    }
+                    failure => {
+                        return Err(GatewayError::Rejected(
+                            finish_error(failure),
+                            format!("generation finished with {failure:?}"),
+                        ));
+                    }
                 }
                 return Ok(());
             }
@@ -175,6 +189,18 @@ async fn generate(
                 return Err(GatewayError::Rejected(code, message));
             }
             _ => {}
+        }
+    }
+}
+
+fn finish_error(reason: FinishReason) -> ErrorCode {
+    match reason {
+        FinishReason::ContextLimit => ErrorCode::ContextLimit,
+        FinishReason::SlowConsumer => ErrorCode::SlowConsumer,
+        FinishReason::BackendFailed => ErrorCode::BackendFailed,
+        FinishReason::Cancelled => ErrorCode::InvalidState,
+        FinishReason::Eos | FinishReason::TokenLimit => {
+            unreachable!("successful finish handled by generation loop")
         }
     }
 }

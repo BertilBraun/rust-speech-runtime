@@ -140,14 +140,20 @@ async fn suite(arguments: SuiteArguments) -> Result<(), ApplicationError> {
 
 fn print_summary(report: &SimulationReport) {
     println!(
-        "sessions: {} admitted, {} rejected, {} failed; {} completed turns, {} rejected turns, {} tokens ({:.1} aggregate tokens/s)",
+        "sessions: {} admitted, {} rejected, {} failed; {} tokens ({:.1} aggregate tokens/s)",
         report.admitted_sessions,
         report.rejected_sessions,
         report.failed_sessions,
-        report.completed_turns,
-        report.rejected_turns,
         report.received_tokens,
         report.aggregate_tokens_per_second
+    );
+    println!(
+        "turns: {} admitted, {} completed, {} token-limited, {} interrupted, {} rejected",
+        report.admitted_turns,
+        report.completed_turns,
+        report.token_limited_turns,
+        report.interrupted_turns,
+        report.rejected_turns
     );
     println!(
         "TTFT p50/p95/p99/max: {:.1}/{:.1}/{:.1}/{:.1} ms",

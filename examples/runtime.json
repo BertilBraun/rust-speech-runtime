@@ -12,5 +12,6 @@
   "target_tokens_per_second": 4.0,
   "backend_timeout_ms": 120000,
   "admission_headroom": 0.8,
-  "initial_forward_estimate_ms": 100.0
+  "initial_forward_estimate_ms": 100.0,
+  "max_prefill_wait_ms": 2000
 }

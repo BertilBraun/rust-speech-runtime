@@ -64,7 +64,12 @@ pub async fn run(
         admitted_sessions: sessions.iter().filter(|session| session.admitted).count(),
         rejected_sessions: sessions.iter().filter(|session| session.rejected).count(),
         failed_sessions: sessions.iter().filter(|session| session.failed).count(),
+        admitted_turns: sessions.iter().map(|session| session.admitted_turns).sum(),
         completed_turns: sessions.iter().map(|session| session.completed_turns).sum(),
+        token_limited_turns: sessions
+            .iter()
+            .map(|session| session.token_limited_turns)
+            .sum(),
         rejected_turns: sessions.iter().map(|session| session.rejected_turns).sum(),
         interrupted_turns: sessions
             .iter()

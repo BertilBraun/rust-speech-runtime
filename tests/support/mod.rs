@@ -19,6 +19,14 @@ pub struct Fixture {
 
 impl Fixture {
     pub async fn start(delay_ms: u64) -> Self {
+        Self::launch(delay_ms, false).await
+    }
+
+    pub async fn failing_decode(delay_ms: u64) -> Self {
+        Self::launch(delay_ms, true).await
+    }
+
+    async fn launch(delay_ms: u64, fail_decode: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("fixture binds");
@@ -57,7 +65,7 @@ impl Fixture {
                 let results = request
                     .operations
                     .into_iter()
-                    .map(|operation| result(operation, &mut contexts))
+                    .map(|operation| result(operation, &mut contexts, fail_decode))
                     .collect();
                 write_json(
                     &mut stream,
@@ -96,7 +104,11 @@ impl Drop for Fixture {
     }
 }
 
-fn result(operation: Operation, contexts: &mut HashMap<String, usize>) -> OperationResult {
+fn result(
+    operation: Operation,
+    contexts: &mut HashMap<String, usize>,
+    fail_decode: bool,
+) -> OperationResult {
     let operation_id = operation.operation_id();
     let session_id = operation.session_id().to_owned();
     let (turn_id, generation, outcome) = match operation {
@@ -134,6 +146,18 @@ fn result(operation: Operation, contexts: &mut HashMap<String, usize>) -> Operat
             accepted,
             ..
         } => {
+            if fail_decode {
+                return OperationResult {
+                    operation_id,
+                    session_id,
+                    turn_id: Some(turn_id),
+                    generation: Some(generation),
+                    outcome: Outcome::Failed {
+                        code: voice_scheduler::protocol::ErrorCode::BackendFailed,
+                        message: "test decode failure".into(),
+                    },
+                };
+            }
             let context = contexts.get_mut(&session_id).expect("owned cache");
             *context += 1;
             let eos = accepted.index >= 3;
