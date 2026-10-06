@@ -22,6 +22,25 @@ pub struct ArchiveRecord {
     pub conversation: SessionRecord,
 }
 
+pub enum EnqueueOutcome {
+    Queued,
+    Backpressured,
+}
+
+pub async fn enqueue(
+    sender: &mpsc::Sender<ArchiveRecord>,
+    record: ArchiveRecord,
+) -> Result<EnqueueOutcome, mpsc::error::SendError<ArchiveRecord>> {
+    match sender.try_send(record) {
+        Ok(()) => Ok(EnqueueOutcome::Queued),
+        Err(mpsc::error::TrySendError::Full(record)) => {
+            sender.send(record).await?;
+            Ok(EnqueueOutcome::Backpressured)
+        }
+        Err(mpsc::error::TrySendError::Closed(record)) => Err(mpsc::error::SendError(record)),
+    }
+}
+
 pub fn unix_milliseconds() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -94,6 +113,56 @@ fn write_pending(path: &std::path::Path, record: &ArchiveRecord) -> Result<(), s
 mod tests {
     use super::*;
     use crate::protocol::SessionId;
+
+    #[tokio::test]
+    async fn saturated_archive_mailbox_retains_pending_record() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender.send(record("first")).await.expect("first record");
+        let mut pending = tokio::spawn(async move { enqueue(&sender, record("second")).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut pending)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            receiver
+                .recv()
+                .await
+                .expect("first queued")
+                .conversation
+                .session_id
+                .0,
+            "first"
+        );
+        assert!(matches!(
+            pending.await.expect("enqueue task").expect("second queued"),
+            EnqueueOutcome::Backpressured
+        ));
+        assert_eq!(
+            receiver
+                .recv()
+                .await
+                .expect("retained record")
+                .conversation
+                .session_id
+                .0,
+            "second"
+        );
+        assert!(receiver.recv().await.is_none());
+    }
+
+    fn record(session_id: &str) -> ArchiveRecord {
+        ArchiveRecord {
+            created_unix_ms: 1,
+            closed_unix_ms: 2,
+            conversation: SessionRecord {
+                session_id: SessionId(session_id.into()),
+                worker_id: 0,
+                model_id: "test-model".into(),
+                turns: Vec::new(),
+            },
+        }
+    }
 
     #[tokio::test]
     async fn archive_directory_failure_is_reported() {

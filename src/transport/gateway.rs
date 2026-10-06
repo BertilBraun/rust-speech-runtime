@@ -46,6 +46,7 @@ pub struct GatewayReport {
     pub rejected_connections: u64,
     pub failed_connections: u64,
     pub archive_queue_rejections: u64,
+    pub archive_backpressure_events: u64,
     pub archives: ArchiveReport,
     pub runtime: MetricsSnapshot,
 }
@@ -86,14 +87,47 @@ impl Gateway {
             }
             None => (None, None),
         };
-        let capacity = Arc::new(Semaphore::new(self.configuration.max_connections));
         let mut connections = JoinSet::new();
         let mut report = GatewayReport::default();
+        let mut outcome = self
+            .accept_connections(
+                &cancellation,
+                &mut connections,
+                archives.as_ref(),
+                &mut report,
+            )
+            .await;
+        if outcome.is_err() {
+            cancellation.cancel();
+        }
+        while let Some(completed) = connections.join_next().await {
+            outcome = outcome.and(accumulate(&mut report, completed));
+        }
+        drop(archives);
+        if let Some(task) = archive_task {
+            match task.await {
+                Ok(archives) => report.archives = archives,
+                Err(error) => outcome = outcome.and(Err(error.into())),
+            }
+        }
+        report.runtime = self.node.metrics();
+        outcome = outcome.and(self.node.shutdown().await.map_err(GatewayError::from));
+        outcome.map(|()| report)
+    }
+
+    async fn accept_connections(
+        &self,
+        cancellation: &CancellationToken,
+        connections: &mut JoinSet<connection::ConnectionReport>,
+        archives: Option<&ArchiveSender>,
+        report: &mut GatewayReport,
+    ) -> Result<(), GatewayError> {
+        let capacity = Arc::new(Semaphore::new(self.configuration.max_connections));
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => break,
                 completed = connections.join_next(), if !connections.is_empty() => {
-                    accumulate(&mut report, completed.expect("join set is nonempty"))?;
+                    accumulate(report, completed.expect("join set is nonempty"))?;
                 }
                 accepted = self.listener.accept() => {
                     let (stream, _) = accepted?;
@@ -105,7 +139,7 @@ impl Gateway {
                     report.connections += 1;
                     let ingress = self.node.ingress();
                     let configuration = self.configuration.clone();
-                    let archives = archives.clone();
+                    let archives = archives.cloned();
                     let connection_cancellation = cancellation.child_token();
                     connections.spawn(async move {
                         let _permit = permit;
@@ -114,16 +148,7 @@ impl Gateway {
                 }
             }
         }
-        while let Some(completed) = connections.join_next().await {
-            accumulate(&mut report, completed)?;
-        }
-        drop(archives);
-        if let Some(task) = archive_task {
-            report.archives = task.await?;
-        }
-        report.runtime = self.node.metrics();
-        self.node.shutdown().await?;
-        Ok(report)
+        Ok(())
     }
 }
 
@@ -134,6 +159,7 @@ fn accumulate(
     let connection = completed?;
     report.failed_connections += u64::from(connection.failed);
     report.archive_queue_rejections += u64::from(connection.archive_rejected);
+    report.archive_backpressure_events += u64::from(connection.archive_backpressured);
     Ok(())
 }
 

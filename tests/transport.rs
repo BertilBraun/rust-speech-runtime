@@ -161,6 +161,35 @@ async fn websocket_multi_turn_preserves_assignment_and_exact_archive() {
 }
 
 #[tokio::test]
+async fn rejected_open_completes_websocket_close_without_connection_failure() {
+    let backend = Fixture::start(1).await;
+    let gateway = TestGateway::start(
+        RuntimeConfig {
+            max_sessions_per_worker: 1,
+            max_active_turns_per_worker: 1,
+            ..backend.config()
+        },
+        gateway_config(),
+    )
+    .await;
+    let first = connected(&gateway.url, "admitted").await;
+    let mut rejected = VoiceClient::connect(&gateway.url, Duration::from_secs(5))
+        .await
+        .expect("connected");
+    assert!(matches!(
+        rejected.open(SessionId("rejected".into())).await,
+        Err(voice_scheduler::transport::GatewayError::Rejected(
+            ErrorCode::CapacityExceeded,
+            _
+        ))
+    ));
+    first.close().await.expect("admitted client closed");
+    let report = gateway.shutdown().await;
+    assert_eq!(report.runtime.rejected_sessions, 1);
+    assert_eq!(report.failed_connections, 0);
+}
+
+#[tokio::test]
 async fn websocket_rejects_capacity_and_releases_disconnected_session() {
     let backend = Fixture::start(2).await;
     let runtime = RuntimeConfig {

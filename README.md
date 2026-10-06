@@ -65,7 +65,7 @@ On Ctrl+C, the gateway closes sessions, drains archive work and prints admission
 
 Closed conversations are archived under `session-archives/` by default. Records contain timestamps, session/worker IDs, backend model/manifest identity, original PCM16, turn commit/finish state, exact accepted token IDs/text and token timing. Audio is currently represented as JSON integer arrays: inspectable but less compact than binary sidecars. History is bounded and never silently truncated.
 
-Archival has a bounded queue and one blocking file writer outside Tokio async workers. Files are flushed, synced and atomically renamed from a temporary file. Queue rejection and disk errors are logged and counted. Archive overload can explicitly fail a record rather than consume unlimited memory; configure capacity and disk throughput for expected churn.
+Archival has a bounded queue and one blocking file writer outside Tokio async workers. Files are flushed, synced and atomically renamed from a temporary file. A full archive queue delays connection teardown while preserving the record; inference workers continue independently. Each waiting connection retains its connection permit, bounding pending records by the connection limit plus archive queue capacity and one writer. Backpressure is counted; a stopped writer or disk error is logged and counted. Configure disk throughput for expected churn.
 
 ## Code and validation
 

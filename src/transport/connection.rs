@@ -23,7 +23,7 @@ use crate::{
 
 use super::{
     GatewayConfig, GatewayError,
-    archive::{ArchiveRecord, unix_milliseconds},
+    archive::{self, ArchiveRecord, EnqueueOutcome, unix_milliseconds},
     gateway::ArchiveSender,
     wire::{AudioChunk, ClientControl},
     writer::start_writer,
@@ -33,6 +33,7 @@ use super::{
 pub(crate) struct ConnectionReport {
     pub failed: bool,
     pub archive_rejected: bool,
+    pub archive_backpressured: bool,
 }
 
 struct Connection {
@@ -67,7 +68,7 @@ pub(crate) async fn run(
             eprintln!("WebSocket handshake failed: {failure:?}");
             return ConnectionReport {
                 failed: true,
-                archive_rejected: false,
+                ..ConnectionReport::default()
             };
         }
     };
@@ -91,7 +92,7 @@ pub(crate) async fn run(
     let result = connection.serve().await;
     let mut report = ConnectionReport {
         failed: result.is_err(),
-        archive_rejected: false,
+        ..ConnectionReport::default()
     };
     if let Err(error) = result {
         eprintln!("WebSocket connection closed: {error}");
@@ -111,11 +112,13 @@ pub(crate) async fn run(
                         closed_unix_ms: unix_milliseconds(),
                         conversation,
                     };
-                    if sender.try_send(record).is_err() {
-                        report.archive_rejected = true;
-                        eprintln!(
-                            "session archive rejected: bounded archive queue is full or stopped"
-                        );
+                    match archive::enqueue(&sender, record).await {
+                        Ok(EnqueueOutcome::Queued) => {}
+                        Ok(EnqueueOutcome::Backpressured) => report.archive_backpressured = true,
+                        Err(error) => {
+                            report.archive_rejected = true;
+                            eprintln!("session archive enqueue failed: {error}");
+                        }
                     }
                 }
             }

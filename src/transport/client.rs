@@ -2,10 +2,13 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use tokio::{net::TcpStream, time::timeout};
+use tokio::{
+    net::TcpStream,
+    time::{Instant, timeout, timeout_at},
+};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
-    tungstenite::{Message, protocol::WebSocketConfig},
+    tungstenite::{Error, Message, protocol::WebSocketConfig},
 };
 
 use crate::protocol::{SessionEvent, SessionId, TurnId};
@@ -45,6 +48,7 @@ impl VoiceClient {
         match self.next_event().await? {
             SessionEvent::Opened { worker_id, .. } => Ok(worker_id),
             SessionEvent::Failed { code, message, .. } => {
+                self.close_websocket().await?;
                 Err(GatewayError::Rejected(code, message))
             }
             _ => Err(GatewayError::Protocol("expected opened event")),
@@ -128,10 +132,26 @@ impl VoiceClient {
                 break;
             }
         }
-        timeout(self.timeout, self.websocket.close(None))
+        self.close_websocket().await
+    }
+
+    async fn close_websocket(&mut self) -> Result<(), GatewayError> {
+        let deadline = Instant::now() + self.timeout;
+        timeout_at(deadline, self.websocket.close(None))
             .await
             .map_err(|_| GatewayError::Timeout)??;
-        Ok(())
+        loop {
+            match timeout_at(deadline, self.websocket.next())
+                .await
+                .map_err(|_| GatewayError::Timeout)?
+            {
+                None | Some(Ok(Message::Close(_))) | Some(Err(Error::ConnectionClosed)) => {
+                    return Ok(());
+                }
+                Some(Err(error)) => return Err(error.into()),
+                Some(Ok(_)) => {}
+            }
+        }
     }
 
     pub async fn send_control(&mut self, control: ClientControl) -> Result<(), GatewayError> {
