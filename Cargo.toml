@@ -17,11 +17,19 @@ rand = { version = "0.9", features = ["small_rng"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "fs", "net", "io-util", "io-std", "process", "test-util"] }
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "fs", "net", "io-util", "io-std", "process"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+
+[dev-dependencies]
+tokio = { version = "1.47", features = ["test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"
+unused_must_use = "deny"
 
 [lints.clippy]
-all = "warn"
+all = { level = "warn", priority = -1 }
+await_holding_lock = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"

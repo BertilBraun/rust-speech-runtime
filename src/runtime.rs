@@ -50,6 +50,7 @@ pub(crate) struct IngressMeasurements {
     pub channel_saturation: AtomicU64,
     pub inputs_overloaded: AtomicU64,
 }
+/// Cloneable bounded ingress handle; scheduling state stays in its owning actor.
 #[derive(Clone)]
 pub struct Ingress {
     commands: mpsc::Sender<Command>,
@@ -58,6 +59,7 @@ pub struct Ingress {
     cancellation: CancellationToken,
 }
 impl Ingress {
+    /// Admits a session with sticky worker assignment or returns an explicit rejection.
     pub async fn create_session(
         &self,
         session_id: SessionId,
@@ -67,6 +69,7 @@ impl Ingress {
             .await?;
         response.await.map_err(|_| RuntimeError::Stopped)
     }
+    /// Routes one packet; mailbox saturation terminates its session instead of growing a queue.
     pub async fn input_frame(
         &self,
         target: impl Into<SessionTarget>,
@@ -108,6 +111,7 @@ impl Ingress {
             Err(mpsc::error::TrySendError::Closed(_)) => Err(RuntimeError::Stopped),
         }
     }
+    /// Removes a matching session and invalidates its outstanding results.
     pub async fn close_session(
         &self,
         target: impl Into<SessionTarget>,
@@ -120,6 +124,7 @@ impl Ingress {
         .await?;
         response.await.map_err(|_| RuntimeError::Stopped)
     }
+    /// Evicts simulated cached state while retaining worker assignment and input history.
     pub async fn evict_cache(
         &self,
         target: impl Into<SessionTarget>,
@@ -151,12 +156,14 @@ impl Ingress {
         }
     }
 }
+/// Owns the session manager and cancels its workers when dropped.
 pub struct Node {
     pub ingress: Ingress,
     cancellation: CancellationToken,
     manager: Option<JoinHandle<Result<Report, RuntimeError>>>,
 }
 impl Node {
+    /// Completes worker calibration before opening session admission.
     pub async fn start(configuration: RuntimeConfig) -> Result<Self, RuntimeError> {
         configuration.validate()?;
         let configuration = Arc::new(configuration);
@@ -177,6 +184,7 @@ impl Node {
             manager: Some(task),
         })
     }
+    /// Cancels sessions, drains submitted device work and returns final measurements.
     pub async fn shutdown(mut self) -> Result<Report, RuntimeError> {
         self.cancellation.cancel();
         self.manager

@@ -25,80 +25,6 @@ pub(crate) enum ClientRequest {
     Close,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{ClientRequest, MAX_MESSAGE_BYTES, ServerPeer};
-    use crate::protocol::SessionId;
-    use std::time::Duration;
-    use tokio::{
-        io::AsyncWriteExt,
-        net::{TcpListener, TcpStream},
-    };
-
-    #[tokio::test]
-    async fn cancelled_receive_keeps_partially_received_message() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (socket, _) = listener.accept().await.unwrap();
-        let mut server = ServerPeer::new(socket, MAX_MESSAGE_BYTES).unwrap();
-        let message = bincode::serde::encode_to_vec(
-            ClientRequest::Open(SessionId(42)),
-            bincode::config::standard(),
-        )
-        .unwrap();
-        client
-            .write_all(&(message.len() as u32).to_be_bytes())
-            .await
-            .unwrap();
-        client.write_all(&message[..1]).await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(5), server.receive())
-                .await
-                .is_err()
-        );
-        client.write_all(&message[1..]).await.unwrap();
-        assert!(matches!(
-            server.receive().await.unwrap(),
-            Some(ClientRequest::Open(SessionId(42)))
-        ));
-    }
-
-    #[tokio::test]
-    async fn cancelled_receive_keeps_pending_decode() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (socket, _) = listener.accept().await.unwrap();
-        let mut server = ServerPeer::new(socket, MAX_MESSAGE_BYTES).unwrap();
-        let message = bincode::serde::encode_to_vec(
-            ClientRequest::Open(SessionId(7)),
-            bincode::config::standard(),
-        )
-        .unwrap();
-        server.pending_decode = Some(tokio::task::spawn_blocking(move || {
-            std::thread::sleep(Duration::from_millis(40));
-            Ok(
-                bincode::serde::decode_from_slice(&message, bincode::config::standard())
-                    .unwrap()
-                    .0,
-            )
-        }));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(5), server.receive())
-                .await
-                .is_err()
-        );
-        assert!(matches!(
-            server.receive().await.unwrap(),
-            Some(ClientRequest::Open(SessionId(7)))
-        ));
-        drop(client);
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum ServerReply {
     Opened(CreateOutcome),
@@ -238,5 +164,79 @@ impl<Incoming: DeserializeOwned + Send + 'static, Outgoing: WireMessage>
         self.pending_decode = None;
         let message = result??;
         Ok(Some(message))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClientRequest, MAX_MESSAGE_BYTES, ServerPeer};
+    use crate::protocol::SessionId;
+    use std::time::Duration;
+    use tokio::{
+        io::AsyncWriteExt,
+        net::{TcpListener, TcpStream},
+    };
+
+    #[tokio::test]
+    async fn cancelled_receive_keeps_partially_received_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut server = ServerPeer::new(socket, MAX_MESSAGE_BYTES).unwrap();
+        let message = bincode::serde::encode_to_vec(
+            ClientRequest::Open(SessionId(42)),
+            bincode::config::standard(),
+        )
+        .unwrap();
+        client
+            .write_all(&(message.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        client.write_all(&message[..1]).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), server.receive())
+                .await
+                .is_err()
+        );
+        client.write_all(&message[1..]).await.unwrap();
+        assert!(matches!(
+            server.receive().await.unwrap(),
+            Some(ClientRequest::Open(SessionId(42)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_receive_keeps_pending_decode() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut server = ServerPeer::new(socket, MAX_MESSAGE_BYTES).unwrap();
+        let message = bincode::serde::encode_to_vec(
+            ClientRequest::Open(SessionId(7)),
+            bincode::config::standard(),
+        )
+        .unwrap();
+        server.pending_decode = Some(tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            Ok(
+                bincode::serde::decode_from_slice(&message, bincode::config::standard())
+                    .unwrap()
+                    .0,
+            )
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), server.receive())
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            server.receive().await.unwrap(),
+            Some(ClientRequest::Open(SessionId(7)))
+        ));
+        drop(client);
     }
 }

@@ -46,6 +46,7 @@ impl AudioDelivery {
     }
 }
 
+/// Owns a persistent connection and its bounded input replay history.
 pub struct AudioSession {
     peer: ClientPeer,
     admission: SessionAdmission,

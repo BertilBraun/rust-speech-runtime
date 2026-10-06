@@ -1,210 +1,43 @@
-use std::{error::Error, net::SocketAddr, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    process::{ExitStatus, Stdio},
+    time::Duration,
+};
 
-use clap::{Args, Parser, Subcommand};
+use clap::Parser;
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use voice_scheduler::{
-    config::{DeviceWait, RuntimeConfig, WorkerSlowdown},
-    simulation::{self, ArrivalPhase, SimulationConfig, SimulationReport},
-    transport::{Gateway, GatewayConfig, GatewayReport},
+    config::{RuntimeConfig, WorkerSlowdown},
+    simulation::{self, ArrivalPhase, SimulationConfig, SimulationError, SimulationReport},
+    transport::{Gateway, GatewayConfig, GatewayError, GatewayReport},
 };
 
-type ApplicationResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+mod cli;
+use cli::{BenchmarkArguments, Cli, Command};
 
-#[derive(Parser)]
-#[command(about = "Realtime audio echo gateway and external TCP benchmark")]
-struct Cli {
-    #[arg(long, global = true)]
-    output: Option<PathBuf>,
-    #[command(subcommand)]
-    command: Command,
+#[derive(Debug, thiserror::Error)]
+enum ApplicationError {
+    #[error(transparent)]
+    Gateway(#[from] GatewayError),
+    #[error(transparent)]
+    Simulation(#[from] SimulationError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Report(#[from] serde_json::Error),
+    #[error(transparent)]
+    Task(#[from] tokio::task::JoinError),
+    #[error("external simulator exited with {0}")]
+    SimulatorExited(ExitStatus),
+    #[error("calibration found no realtime capacity")]
+    NoCapacity,
 }
-#[derive(Subcommand)]
-enum Command {
-    Serve {
-        #[arg(long, default_value = "127.0.0.1:9000")]
-        listen: SocketAddr,
-        #[command(flatten)]
-        runtime: RuntimeArguments,
-    },
-    Simulate {
-        #[arg(long, default_value = "127.0.0.1:9000")]
-        address: SocketAddr,
-        #[arg(long, hide = true)]
-        config_stdin: bool,
-        #[command(flatten)]
-        workload: WorkloadArguments,
-    },
-    Benchmark(BenchmarkArguments),
-    Suite(BenchmarkArguments),
-}
-#[derive(Clone, Default, Args)]
-struct RuntimeArguments {
-    #[arg(long)]
-    workers: Option<usize>,
-    #[arg(long)]
-    batch_size: Option<usize>,
-    #[arg(long)]
-    inference_ms: Option<u64>,
-    #[arg(long)]
-    device_wait: Option<DeviceWait>,
-    #[arg(long)]
-    device_queue_capacity: Option<usize>,
-    #[arg(long)]
-    launch_ahead_us: Option<u64>,
-    #[arg(long)]
-    deadline_ms: Option<u64>,
-    #[arg(long)]
-    lateness_grace_ms: Option<u64>,
-    #[arg(long)]
-    batch_wait_ms: Option<u64>,
-    #[arg(long)]
-    max_sessions_per_worker: Option<usize>,
-    #[arg(long)]
-    admission_headroom: Option<f64>,
-    #[arg(long)]
-    scheduling_margin_ms: Option<u64>,
-    #[arg(long)]
-    batch_fill_reserve: Option<f64>,
-    #[arg(long)]
-    latency_safety_factor: Option<f64>,
-    #[arg(long)]
-    worker_channel_capacity: Option<usize>,
-    #[arg(long)]
-    worker_input_delay_ms: Option<u64>,
-    #[arg(long, requires = "slowdown_ms")]
-    slowdown_after_secs: Option<u64>,
-    #[arg(long, requires = "slowdown_after_secs")]
-    slowdown_ms: Option<u64>,
-}
-impl RuntimeArguments {
-    fn configuration(&self) -> RuntimeConfig {
-        let mut configuration = RuntimeConfig::default();
-        if let Some(value) = self.workers {
-            configuration.workers = value;
-        }
-        if let Some(value) = self.batch_size {
-            configuration.batch_size = value;
-        }
-        if let Some(value) = self.inference_ms {
-            configuration.inference_latency = Duration::from_millis(value);
-        }
-        if let Some(value) = self.device_wait {
-            configuration.device_wait = value;
-        }
-        if let Some(value) = self.device_queue_capacity {
-            configuration.device_queue_capacity = value;
-        }
-        if let Some(value) = self.launch_ahead_us {
-            configuration.launch_ahead = Duration::from_micros(value);
-        }
-        if let Some(value) = self.deadline_ms {
-            configuration.packet_deadline = Duration::from_millis(value);
-        }
-        if let Some(value) = self.lateness_grace_ms {
-            configuration.packet_lateness_grace = Duration::from_millis(value);
-        }
-        if let Some(value) = self.batch_wait_ms {
-            configuration.max_batch_wait = Duration::from_millis(value);
-        }
-        if let Some(value) = self.max_sessions_per_worker {
-            configuration.max_sessions_per_worker = value;
-        }
-        if let Some(value) = self.admission_headroom {
-            configuration.admission_headroom = value;
-        }
-        if let Some(value) = self.scheduling_margin_ms {
-            configuration.scheduling_margin = Duration::from_millis(value);
-        }
-        if let Some(value) = self.batch_fill_reserve {
-            configuration.batch_fill_reserve = value;
-        }
-        if let Some(value) = self.latency_safety_factor {
-            configuration.latency_safety_factor = value;
-        }
-        if let Some(value) = self.worker_channel_capacity {
-            configuration.worker_channel_capacity = value;
-        }
-        if let Some(value) = self.worker_input_delay_ms {
-            configuration.worker_input_delay = Duration::from_millis(value);
-        }
-        if let (Some(after), Some(latency)) = (self.slowdown_after_secs, self.slowdown_ms) {
-            configuration.slowdown = Some(WorkerSlowdown {
-                after: Duration::from_secs(after),
-                inference_latency: Duration::from_millis(latency),
-            });
-        }
-        configuration
-    }
-}
-#[derive(Clone, Default, Args)]
-struct WorkloadArguments {
-    #[arg(long)]
-    sessions: Option<usize>,
-    #[arg(long)]
-    duration_secs: Option<u64>,
-    #[arg(long)]
-    min_interval_ms: Option<u64>,
-    #[arg(long)]
-    max_interval_ms: Option<u64>,
-    #[arg(long)]
-    payload_bytes: Option<usize>,
-    #[arg(long, value_enum)]
-    phase: Option<ArrivalPhase>,
-    #[arg(long)]
-    seed: Option<u64>,
-    #[arg(long)]
-    evict_every: Option<u64>,
-    #[arg(long)]
-    churn_secs: Option<u64>,
-    #[arg(long)]
-    quality_window_packets: Option<usize>,
-    #[arg(long)]
-    quality_miss_limit: Option<usize>,
-}
-impl WorkloadArguments {
-    fn configuration(&self) -> SimulationConfig {
-        let mut configuration = SimulationConfig::default();
-        if let Some(value) = self.sessions {
-            configuration.sessions = value;
-        }
-        if let Some(value) = self.duration_secs {
-            configuration.duration = Duration::from_secs(value);
-        }
-        if let Some(value) = self.min_interval_ms {
-            configuration.minimum_interval = Duration::from_millis(value);
-        }
-        if let Some(value) = self.max_interval_ms {
-            configuration.maximum_interval = Duration::from_millis(value);
-        }
-        if let Some(value) = self.payload_bytes {
-            configuration.payload_bytes = value;
-        }
-        if let Some(value) = self.phase {
-            configuration.phase = value;
-        }
-        if let Some(value) = self.seed {
-            configuration.seed = value;
-        }
-        configuration.evict_every = self.evict_every;
-        configuration.churn_after = self.churn_secs.map(Duration::from_secs);
-        if let Some(value) = self.quality_window_packets {
-            configuration.quality.window_packets = value;
-        }
-        if let Some(value) = self.quality_miss_limit {
-            configuration.quality.miss_limit = value;
-        }
-        configuration
-    }
-}
-#[derive(Clone, Args)]
-struct BenchmarkArguments {
-    #[command(flatten)]
-    runtime: RuntimeArguments,
-    #[command(flatten)]
-    workload: WorkloadArguments,
-}
+
+type ApplicationResult<T> = Result<T, ApplicationError>;
+
 #[derive(Serialize)]
 struct BenchmarkReport {
     client: SimulationReport,
@@ -240,43 +73,46 @@ async fn benchmark(
     let gateway = Gateway::bind(
         runtime,
         GatewayConfig {
-            listen_address: "127.0.0.1:0".parse()?,
+            listen_address: SocketAddr::from(([127, 0, 0, 1], 0)),
             ..GatewayConfig::default()
         },
     )
     .await?;
     let address = gateway.local_address()?;
     let cancellation = CancellationToken::new();
+    let _server_cleanup = cancellation.clone().drop_guard();
     let signal = cancellation.clone();
     let server = tokio::spawn(gateway.serve(signal));
-    let client = async {
-        let mut child = tokio::process::Command::new(std::env::current_exe()?)
-            .args([
-                "simulate",
-                "--address",
-                &address.to_string(),
-                "--config-stdin",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()?;
-        let mut input = child.stdin.take().expect("piped stdin");
-        input.write_all(&serde_json::to_vec(&workload)?).await?;
-        drop(input);
-        let output = child.wait_with_output().await?;
-        if !output.status.success() {
-            return Err(format!("external simulator exited with {}", output.status).into());
-        }
-        Ok::<SimulationReport, Box<dyn Error + Send + Sync>>(serde_json::from_slice(
-            &output.stdout,
-        )?)
-    }
-    .await;
+    let client = run_external_simulator(address, &workload).await;
     cancellation.cancel();
     let gateway = server.await??;
     let client = client?;
+    print_benchmark(&client, &gateway);
+    Ok(BenchmarkReport { client, gateway })
+}
+
+async fn run_external_simulator(
+    address: SocketAddr,
+    workload: &SimulationConfig,
+) -> ApplicationResult<SimulationReport> {
+    let mut child = tokio::process::Command::new(std::env::current_exe()?)
+        .args(["simulate-stdin", "--address", &address.to_string()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut input = child.stdin.take().expect("piped stdin");
+    input.write_all(&serde_json::to_vec(workload)?).await?;
+    drop(input);
+    let output = child.wait_with_output().await?;
+    if !output.status.success() {
+        return Err(ApplicationError::SimulatorExited(output.status));
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn print_benchmark(client: &SimulationReport, gateway: &GatewayReport) {
     eprintln!(
         "admitted={} rejected={} failed={} echoed={} late={} discarded={} bursts={} RTT p50/p95/p99/max={:.1}/{:.1}/{:.1}/{:.1}ms batch fill={:.1}%",
         client.counters.admitted_sessions,
@@ -292,7 +128,6 @@ async fn benchmark(
         client.round_trip_latency.max_ms,
         gateway.runtime.batch_fill_ratio * 100.0
     );
-    Ok(BenchmarkReport { client, gateway })
 }
 
 async fn suite(arguments: BenchmarkArguments) -> ApplicationResult<Vec<ScenarioReport>> {
@@ -310,7 +145,7 @@ async fn suite(arguments: BenchmarkArguments) -> ApplicationResult<Vec<ScenarioR
         .map(|worker| worker.initial_session_limit)
         .sum::<usize>();
     if capacity == 0 {
-        return Err("calibration found no realtime capacity".into());
+        return Err(ApplicationError::NoCapacity);
     }
     reports.push(ScenarioReport {
         scenario: Scenario::LowLoad,
@@ -388,6 +223,30 @@ async fn write_report<T: Serialize>(report: &T, output: Option<PathBuf>) -> Appl
     Ok(())
 }
 
+async fn serve_gateway(gateway: Gateway) -> ApplicationResult<GatewayReport> {
+    let cancellation = CancellationToken::new();
+    let serving = gateway.serve(cancellation.clone());
+    tokio::pin!(serving);
+    tokio::select! {
+        report = &mut serving => Ok(report?),
+        interrupt = tokio::signal::ctrl_c() => {
+            cancellation.cancel();
+            let report = serving.await?;
+            interrupt?;
+            Ok(report)
+        }
+    }
+}
+
+async fn read_workload() -> ApplicationResult<SimulationConfig> {
+    let mut data = Vec::new();
+    tokio::io::stdin()
+        .take(1024 * 1024)
+        .read_to_end(&mut data)
+        .await?;
+    Ok(serde_json::from_slice(&data)?)
+}
+
 #[tokio::main]
 async fn main() -> ApplicationResult<()> {
     let cli = Cli::parse();
@@ -405,33 +264,16 @@ async fn main() -> ApplicationResult<()> {
                 "ready: {} (Ctrl+C to stop and write metrics)",
                 gateway.local_address()?
             );
-            let cancellation = CancellationToken::new();
-            let signal = cancellation.clone();
-            let interrupt = tokio::spawn(async move {
-                if tokio::signal::ctrl_c().await.is_ok() {
-                    signal.cancel();
-                }
-            });
-            let report = gateway.serve(cancellation).await?;
-            interrupt.abort();
+            let report = serve_gateway(gateway).await?;
             write_report(&report, cli.output).await
         }
-        Command::Simulate {
-            address,
-            config_stdin,
-            workload,
-        } => {
-            let configuration = if config_stdin {
-                let mut data = Vec::new();
-                tokio::io::stdin()
-                    .take(1024 * 1024)
-                    .read_to_end(&mut data)
-                    .await?;
-                serde_json::from_slice::<SimulationConfig>(&data)?
-            } else {
-                workload.configuration()
-            };
+        Command::Simulate { address, workload } => {
+            let configuration = workload.configuration();
             let report = simulation::run(address, configuration).await?;
+            write_report(&report, cli.output).await
+        }
+        Command::SimulateFromStdin { address } => {
+            let report = simulation::run(address, read_workload().await?).await?;
             write_report(&report, cli.output).await
         }
         Command::Benchmark(arguments) => {

@@ -78,6 +78,27 @@ Tests cover calibration/admission, EDF batching, sticky echoing, prefix continui
 
 The current profiling results and their limits are documented in [PERFORMANCE.md](PERFORMANCE.md). Batch preparation takes microseconds; time spent waiting for input or a queued device job is reported separately. Sustained runs have exposed host timing spikes on both Windows and WSL, so the default admission ceiling is not a certified zero-failure capacity.
 
+## Rust code guide
+
+| Responsibility | Code |
+| --- | --- |
+| Public runtime API and shutdown | [runtime.rs](src/runtime.rs) |
+| Session routing, leases and admission coordination | [session/manager.rs](src/session/manager.rs) |
+| Owned worker state and control loop | [worker/actor.rs](src/worker/actor.rs) |
+| Worker admission and deadline budgets | [actor/admission.rs](src/worker/actor/admission.rs) |
+| Input validation and cache replay | [actor/input.rs](src/worker/actor/input.rs) |
+| EDF preparation, device submission and completion | [actor/scheduling.rs](src/worker/actor/scheduling.rs) |
+| Bounded worker messages and mock device execution | [mailbox.rs](src/worker/mailbox.rs), [mock_gpu.rs](src/worker/mock_gpu.rs) |
+| TCP lifecycle and cancellation-safe framing | [gateway.rs](src/transport/gateway.rs), [wire.rs](src/transport/wire.rs) |
+| Simulated capture, session behavior and reporting | [pacing.rs](src/simulation/pacing.rs), [session.rs](src/simulation/session.rs), [report.rs](src/simulation/report.rs) |
+| CLI argument overrides and process orchestration | [cli.rs](src/cli.rs), [main.rs](src/main.rs) |
+
+The private `Worker` owns scheduling and cache state. Its child modules implement focused methods on that same owner. Messages transfer work by ownership, and `Bytes` shares audio buffers cheaply. Cache replay consumes the uploaded history during validation; device jobs retain the current packet and verified prefix. A cancelled session's cache slot remains pinned until its submitted work physically completes.
+
+Explicit shutdown cancels sessions and awaits submitted device work. Dropping the node requests cancellation, and scoped cancellation guards cover startup failures and early returns in serving, benchmarking and simulation. Calibration stops submitting probes after cancellation; its running probe finishes. The serving task handles Ctrl+C directly. The client models recoverable audio delivery with enum variants, while terminal failures use typed errors.
+
+Configuration defaults and validation belong to `RuntimeConfig`, `GatewayConfig` and `SimulationConfig`. Scheduler internals stay private to the library. Tokio's paused-clock support is a development dependency. Cargo forbids unsafe code and denies ignored must-use results, locks held across awaits, debug macros and unfinished implementations. Validate changes with `cargo test --locked`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo fmt --check`, and `cargo doc --no-deps --locked` with `RUSTDOCFLAGS=-D warnings`.
+
 ## Historical baseline, 2026-10-05
 
 On this Windows machine, the 2026-10-05 release benchmark with eight 12 ms mock devices, 400 attempted sessions and 60 seconds of 48–55 ms packet arrivals admitted 64 sessions and rejected 336 before any audio processing. All 73,965 attempted packets were echoed: no failed sessions, deadline misses, capacity terminations or channel saturation. Round-trip p50/p95/p99/max were 22.4/25.6/26.2/39.1 ms. Batch fill was 16.3%, device utilization 72.8%, and node throughput about 1,221 packets/second. These are measured prototype results, rather than a universal capacity claim.

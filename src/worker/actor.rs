@@ -33,6 +33,10 @@ struct SubmittedBatch {
     latency: Duration,
     expected_completion: Instant,
 }
+enum CalibrationStatus {
+    Ready,
+    Cancelled,
+}
 struct Worker {
     configuration: Arc<RuntimeConfig>,
     sessions: HashMap<SessionId, WorkerSession>,
@@ -93,7 +97,15 @@ impl Worker {
             mpsc::channel(self.configuration.device_queue_capacity + 1);
         let wait = self.configuration.device_wait;
         let device = mock_gpu::spawn(job_mailbox, device_results, wait);
-        self.calibrate(&jobs, &mut results).await;
+        if matches!(
+            self.calibrate(&jobs, &mut results, &cancellation).await,
+            CalibrationStatus::Cancelled
+        ) {
+            drop(jobs);
+            self.measurements.device_cpu = device.await.expect("mock device does not panic");
+            self.measurements.elapsed = self.epoch.elapsed();
+            return self.measurements;
+        }
         self.epoch = Instant::now();
         self.refresh_capacity();
         self.measurements.initial_session_limit = self.admission_limit();
@@ -171,8 +183,12 @@ impl Worker {
         &mut self,
         jobs: &mpsc::Sender<DeviceJob>,
         results: &mut mpsc::Receiver<DeviceResult>,
-    ) {
+        cancellation: &CancellationToken,
+    ) -> CalibrationStatus {
         for _ in 0..self.configuration.calibration_samples {
+            if cancellation.is_cancelled() {
+                return CalibrationStatus::Cancelled;
+            }
             jobs.send(DeviceJob {
                 work: DeviceWork::Probe,
                 latency: self.configuration.inference_latency,
@@ -188,6 +204,11 @@ impl Worker {
             self.estimator
                 .observe_host_delay(received_at - result.completed_at);
             self.measurements.calibration_latency.record(elapsed);
+        }
+        if cancellation.is_cancelled() {
+            CalibrationStatus::Cancelled
+        } else {
+            CalibrationStatus::Ready
         }
     }
 
@@ -345,5 +366,35 @@ impl Worker {
         self.terminate(session_id, reason);
         self.publish();
         let _ = reply.send(InputOutcome::Rejected(reason));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spawn_worker;
+    use crate::{config::RuntimeConfig, protocol::WorkerId};
+    use std::{sync::Arc, time::Duration};
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_startup_finishes_only_its_running_calibration_probe() {
+        let cancellation = CancellationToken::new();
+        let (worker, ready) = spawn_worker(
+            WorkerId(0),
+            Arc::new(RuntimeConfig {
+                inference_latency: Duration::from_millis(100),
+                ..RuntimeConfig::default()
+            }),
+            cancellation.clone(),
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancellation.cancel();
+        let measurements = tokio::time::timeout(Duration::from_millis(150), worker.task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(measurements.calibration_latency.summary().samples, 1);
+        assert_eq!(measurements.initial_session_limit, 0);
+        assert!(ready.await.is_err());
     }
 }

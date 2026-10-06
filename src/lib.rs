@@ -1,11 +1,13 @@
+//! Realtime voice scheduling with bounded actor mailboxes and worker-local cache state.
+
 pub mod config;
 pub mod metrics;
 pub mod protocol;
-pub mod scheduler;
-pub mod session;
+mod scheduler;
+mod session;
 pub mod simulation;
 pub mod transport;
-pub mod worker;
+mod worker;
 
 mod runtime;
 

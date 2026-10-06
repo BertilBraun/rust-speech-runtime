@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use super::wire::{ClientRequest, MAX_MESSAGE_BYTES, ServerPeer, ServerReply, WireError};
 use crate::{
     Ingress, Node, RuntimeError,
-    config::RuntimeConfig,
+    config::{AudioLimits, RuntimeConfig},
     metrics::{
         Report,
         cpu::{CpuUsage, ProcessCpuMeasurement},
@@ -32,76 +32,34 @@ pub struct GatewayConfig {
     pub io_timeout: Duration,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{Gateway, GatewayConfig};
-    use crate::{
-        config::RuntimeConfig,
-        protocol::{CacheOutcome, FrameRejection, SessionId},
-        transport::{ClientError, ConnectOutcome, connect_session},
-    };
-    use bytes::Bytes;
-    use std::time::Duration;
-    use tokio::time::Instant;
-    use tokio_util::sync::CancellationToken;
-
-    #[tokio::test]
-    async fn obsolete_tcp_connection_cannot_cancel_its_replacement() {
-        let gateway = Gateway::bind(
-            RuntimeConfig {
-                workers: 1,
-                inference_latency: Duration::from_millis(3),
-                calibration_samples: 2,
-                minimum_packet_interval: Duration::from_millis(250),
-                packet_deadline: Duration::from_millis(250),
-                max_batch_wait: Duration::ZERO,
-                ..RuntimeConfig::default()
-            },
-            GatewayConfig {
-                listen_address: "127.0.0.1:0".parse().unwrap(),
-                ..GatewayConfig::default()
-            },
-        )
-        .await
-        .unwrap();
-        let address = gateway.local_address().unwrap();
-        let ingress = gateway.node.ingress.clone();
-        let signal = CancellationToken::new();
-        let task = tokio::spawn(gateway.serve(signal.clone()));
-        let ConnectOutcome::Admitted(mut old) =
-            connect_session(address, SessionId(1), Duration::from_secs(2))
-                .await
-                .unwrap()
-        else {
-            panic!("expected admission");
-        };
-        ingress.close_session(SessionId(1)).await.unwrap();
-        let ConnectOutcome::Admitted(mut current) =
-            connect_session(address, SessionId(1), Duration::from_secs(2))
-                .await
-                .unwrap()
-        else {
-            panic!("expected replacement");
-        };
-        assert!(matches!(
-            old.infer_audio(Bytes::from_static(b"old"), Instant::now())
-                .await,
-            Err(ClientError::Rejected(FrameRejection::Cancelled))
-        ));
-        drop(old);
-        let audio = current
-            .infer_audio(Bytes::from_static(b"current"), Instant::now())
-            .await
-            .unwrap()
-            .into_audio();
-        assert_eq!(audio.cache, CacheOutcome::Hit);
-        assert!(current.close().await.unwrap());
-        signal.cancel();
-        let report = task.await.unwrap().unwrap();
-        assert_eq!(report.runtime.admitted_sessions, 2);
-        assert_eq!(report.runtime.inference.delivered_frames, 1);
+impl GatewayConfig {
+    /// Checks transport bounds and space for the negotiated audio replay limits.
+    pub fn validate(&self, audio_limits: AudioLimits) -> Result<(), GatewayError> {
+        if self.maximum_connections == 0
+            || self.message_limit == 0
+            || self.message_limit > MAX_MESSAGE_BYTES
+            || self.io_timeout.is_zero()
+            || self.io_timeout > Duration::from_secs(86400)
+        {
+            return Err(GatewayError::Configuration(
+                "positive bounded connection, message and timeout limits required",
+            ));
+        }
+        let replay_limit = audio_limits
+            .max_prefix_packets
+            .checked_mul(10)
+            .and_then(|bytes| bytes.checked_add(audio_limits.max_prefix_bytes))
+            .and_then(|bytes| bytes.checked_add(audio_limits.max_frame_bytes))
+            .and_then(|bytes| bytes.checked_add(65536));
+        if replay_limit.is_none_or(|limit| limit > self.message_limit) {
+            return Err(GatewayError::Configuration(
+                "wire limit must hold a full audio prefix replay",
+            ));
+        }
+        Ok(())
     }
 }
+
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
@@ -140,6 +98,7 @@ pub struct GatewayReport {
     pub connections: ConnectionMetrics,
     pub runtime: Report,
 }
+/// Owns TCP ingress, bounded connection tasks and the inference runtime.
 pub struct Gateway {
     listener: TcpListener,
     node: Node,
@@ -154,30 +113,7 @@ impl Gateway {
         runtime_configuration
             .validate()
             .map_err(RuntimeError::from)?;
-        if configuration.maximum_connections == 0
-            || configuration.message_limit == 0
-            || configuration.message_limit > MAX_MESSAGE_BYTES
-            || configuration.io_timeout.is_zero()
-            || configuration.io_timeout > Duration::from_secs(86400)
-        {
-            return Err(GatewayError::Configuration(
-                "positive bounded connection, message and timeout limits required",
-            ));
-        }
-        let replay_limit = runtime_configuration
-            .audio_limits
-            .max_prefix_packets
-            .checked_mul(10)
-            .and_then(|bytes| {
-                bytes.checked_add(runtime_configuration.audio_limits.max_prefix_bytes)
-            })
-            .and_then(|bytes| bytes.checked_add(runtime_configuration.audio_limits.max_frame_bytes))
-            .and_then(|bytes| bytes.checked_add(65536));
-        if replay_limit.is_none_or(|limit| limit > configuration.message_limit) {
-            return Err(GatewayError::Configuration(
-                "wire limit must hold a full audio prefix replay",
-            ));
-        }
+        configuration.validate(runtime_configuration.audio_limits)?;
         let listener = TcpListener::bind(configuration.listen_address).await?;
         let node = Node::start(runtime_configuration.clone()).await?;
         Ok(Self {
@@ -423,5 +359,76 @@ async fn serve_connection(
                 return Err(WireError::InvalidMessage("connection already owns a session").into());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Gateway, GatewayConfig};
+    use crate::{
+        config::RuntimeConfig,
+        protocol::{CacheOutcome, FrameRejection, SessionId},
+        transport::{ClientError, ConnectOutcome, connect_session},
+    };
+    use bytes::Bytes;
+    use std::time::Duration;
+    use tokio::time::Instant;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn obsolete_tcp_connection_cannot_cancel_its_replacement() {
+        let gateway = Gateway::bind(
+            RuntimeConfig {
+                workers: 1,
+                inference_latency: Duration::from_millis(3),
+                calibration_samples: 2,
+                minimum_packet_interval: Duration::from_millis(250),
+                packet_deadline: Duration::from_millis(250),
+                max_batch_wait: Duration::ZERO,
+                ..RuntimeConfig::default()
+            },
+            GatewayConfig {
+                listen_address: "127.0.0.1:0".parse().unwrap(),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let address = gateway.local_address().unwrap();
+        let ingress = gateway.node.ingress.clone();
+        let signal = CancellationToken::new();
+        let task = tokio::spawn(gateway.serve(signal.clone()));
+        let ConnectOutcome::Admitted(mut old) =
+            connect_session(address, SessionId(1), Duration::from_secs(2))
+                .await
+                .unwrap()
+        else {
+            panic!("expected admission");
+        };
+        ingress.close_session(SessionId(1)).await.unwrap();
+        let ConnectOutcome::Admitted(mut current) =
+            connect_session(address, SessionId(1), Duration::from_secs(2))
+                .await
+                .unwrap()
+        else {
+            panic!("expected replacement");
+        };
+        assert!(matches!(
+            old.infer_audio(Bytes::from_static(b"old"), Instant::now())
+                .await,
+            Err(ClientError::Rejected(FrameRejection::Cancelled))
+        ));
+        drop(old);
+        let audio = current
+            .infer_audio(Bytes::from_static(b"current"), Instant::now())
+            .await
+            .unwrap()
+            .into_audio();
+        assert_eq!(audio.cache, CacheOutcome::Hit);
+        assert!(current.close().await.unwrap());
+        signal.cancel();
+        let report = task.await.unwrap().unwrap();
+        assert_eq!(report.runtime.admitted_sessions, 2);
+        assert_eq!(report.runtime.inference.delivered_frames, 1);
     }
 }
