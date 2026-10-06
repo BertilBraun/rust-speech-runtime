@@ -1,5 +1,30 @@
 # Device pipelining and timing experiments
 
+## Rust code quality pass, 2026-10-06
+
+Revisions `15100c8` through `a4c95a9` refactor the implementation without changing the default workload, admission settings or fixed 12 ms batch cost. Worker admission, input validation, scheduling and completion are focused methods on one private worker owner. The simulator separates capture pacing, owned session state and reporting. Recoverable deliveries are explicit `AudioDelivery` variants; terminal transport and CLI failures use typed errors. Cache replay consumes its uploaded history during validation, and submitted device jobs retain only the current packet and verified prefix.
+
+Scoped cancellation guards cover startup, serving and simulation failures. Calibration stops submitting probes after cancellation and lets its running probe finish. New regression tests cover cancellation during calibration and dropping a node during inference. Configuration defaults and validation stay with their canonical types; scheduler internals are private, and Tokio's paused-clock support is restricted to development builds. [The README code guide](README.md#rust-code-guide) maps these responsibilities to their modules.
+
+All **67 tests** pass on Windows and WSL with Rust 1.99.0 and locked dependencies. Windows also passes `cargo clippy --all-targets --locked -- -D warnings`, `cargo fmt --check`, `cargo doc --no-deps --locked` with `RUSTDOCFLAGS=-D warnings`, and `cargo build --release --locked`. These checks validate the code and regression tests; they do not certify realtime capacity.
+
+The first post-refactor 30-second Windows release smoke run offered 448 sessions and admitted 384. It **failed twelve sessions on four-miss clusters**: 216,174 echoes, 596 packets over 50 ms including 149 discarded outputs over 60 ms, and no unrecovered progress failures or lost metric samples. RTT p50/p95/p99/max were 22.1/28.2/40.7/74.0 ms, batch fill 68.0%, and modeled utilization 98.6%. Mean EDF preparation and assembly were 3.98 and 13.67 microseconds. Gateway and simulator used about 1.92 and 1.85 logical cores, respectively. The raw report is `rust-cleanup-windows-448-30s.json`, using revision `a4c95a9`.
+
+The worst traces include overlapping client and gateway runtime delays around ten seconds, as well as elevated queue, completion and result-delivery delays. These observations do not identify their OS-level cause or exclude a refactor regression. This failed run is retained alongside the earlier passing results below; its low median RTT is not evidence of acceptable serving quality.
+
+A sequential control then ran the pre-cleanup revision `9ab05a6` and refactored revision `a4c95a9` on this Windows host, each offering 384 sessions with a 48-session worker cap for 30 seconds. Both retained the other defaults: independent random phases, 48–55 ms packets, fixed 12 ms nonempty batches, 5 ms margin and the agreed quality policy. No builds or other benchmark runs overlapped either measurement.
+
+| Revision | Admitted / rejected | Echoed packets | Over 50 ms / discarded over 60 ms | Failed sessions / four-miss clusters | RTT p50 / p95 / p99 / max, ms | Batch fill | Modeled GPU utilization |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Before cleanup, `9ab05a6` | 382 / 2 | 218,138 | 342 / 12 | 6 / 6 | 22.6 / 28.8 / 35.2 / 77.1 | 68.4% | 98.9% |
+| After cleanup, `a4c95a9` | 384 / 0 | 221,641 | 0 / 0 | 0 / 0 | 21.9 / 27.5 / 28.7 / 44.9 | 69.2% | 97.7% |
+
+Both controls had zero unrecovered progress failures and lost metric samples. Before/after mean EDF preparation was 3.92/4.05 microseconds; assembly was 13.66/13.52 microseconds. Gateway average CPU cores were 1.89/2.02, and simulator cores 1.76/1.79. Similar preparation costs and quality failures in the original code do not support attributing the first smoke failure solely to the refactor. However, one short pair, slightly different admitted counts and variable host timing cannot prove equivalent performance or a reliable capacity. No admission defaults were changed to obtain the passing repeat. Raw reports are `rust-cleanup-control-before-384-30s.json` and `rust-cleanup-control-after-384-30s.json` in local `benchmark-results/`.
+
+```powershell
+.\target\release\voice-scheduler.exe benchmark --sessions 384 --max-sessions-per-worker 48 --duration-secs 30 --output benchmark-results\rust-cleanup-control-after-384-30s.json
+```
+
 ## Random starts and independent 48–55 ms packets
 
 This is the intended workload: independent random initial capture phases, followed by an independent 48–55 ms interval for every packet. The readiness barrier completes connection setup before capture starts; random phases represent sessions that started at different times. Perfectly synchronized waves remain a separate stress test, rather than the expected traffic pattern. Socket transfer and echo are real, between separate gateway and simulator processes on Windows loopback. Every nonempty ordinary batch, from one to sixteen packets, still costs exactly 12 ms.
@@ -8,7 +33,7 @@ Two unnecessary policy limits were removed. Admission previously rounded the num
 
 The other limit was treating one output beyond 60 ms as fatal to the entire session. The agreed target permits isolated discarded outputs while rejecting four misses within any ten-packet window for that session. Output after 50 ms is still late; output after the additional 10 ms grace is discarded. Its validated input advances the cache, allowing the following packets to recover with their complete history. Four queued captures and one active exchange bound outstanding input, and a separate 204 ms progress budget bounds recovery. This larger progress budget is excluded from admission capacity; it does not turn late packets into timely playback. Known unsustainable device slowdowns still revoke sessions, and stalled recovery or queue overflow still fails explicitly.
 
-### Current measurements
+### Capacity measurements before the Rust cleanup
 
 Both runs below used eight Tokio mock devices, random phases, 48–55 ms packets, sixteen slots, fixed 12 ms compute, a 56-session worker cap, admission headroom 1 and the retained 5 ms margin. All admitted sessions survived and no diagnostic samples were lost.
 
@@ -27,7 +52,7 @@ In the five-minute run, mean EDF preparation took 2.19 microseconds and batch as
 
 Earlier attempts at this higher capacity exposed the old fatal-on-first-expiry policy. A Windows random run admitted 392 then failed 341 sessions, including three four-miss clusters. A WSL run admitted 448 and failed 148, with no four-miss clusters; a Windows native-sleep run admitted 448 and failed 45, also with no clusters. These failed runs lose offered load and cannot establish sustained throughput. Reports are `streaming-windows-400-60s.json`, `streaming-linux-448-60s.json` and `streaming-sleep-windows-448-60s.json`. The recovery changes were tested explicitly for discarded-output history, cache replay, fatal progress expiry, slowdown revocation and complete latency accounting.
 
-All 65 tests pass on Windows and WSL with Rust 1.99.0 and locked dependencies. Windows also passes `cargo clippy --all-targets --locked -- -D warnings` and `cargo fmt --check`. WSL shares the Windows host and is not bare-metal Linux; these measurements do not identify the cause of OS timing stalls.
+At these revisions, all 65 tests passed on Windows and WSL with Rust 1.99.0 and locked dependencies. Windows also passed `cargo clippy --all-targets --locked -- -D warnings` and `cargo fmt --check`. WSL shares the Windows host and is not bare-metal Linux; these measurements do not identify the cause of OS timing stalls.
 
 The final five-second-per-scenario Windows suite passed ordinary low/50%/80%/95% load, overload admission, aligned/random arrivals, jitter and churn without session or quality failures. Overload admitted 424 and rejected 392; churn admitted 1,423 across successive lifetimes. Aligned traffic at 204 sessions had 39 isolated late echoes but no clusters. Forced cache replay, 30 ms slowdown and artificially blocked mailboxes deliberately failed 159, 204 and 204 sessions respectively; saturation recorded 95 full-mailbox events. These stress outcomes are explicit failures, not successful service. The raw report is `recovery-current-windows-suite-5s.json`, using revision `8dafc10` and current defaults. Short suite checks do not replace the sustained random workload results above.
 
