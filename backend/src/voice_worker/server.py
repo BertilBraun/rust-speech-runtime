@@ -44,12 +44,12 @@ class WorkerServer:
             LOGGER.exception("Worker connection failed")
         finally:
             await loop.run_in_executor(self.executor, self.engine.reset)
-            self.connected = False
             writer.close()
             with suppress(ConnectionError):
                 await writer.wait_closed()
             self.active_handler = None
             self.active_writer = None
+            self.connected = False
 
     async def close(self) -> None:
         if self.active_writer is not None:

@@ -15,8 +15,10 @@ class FrameLimits:
 
 
 async def read_request(reader: asyncio.StreamReader, limits: FrameLimits) -> tuple[Request, bytes]:
+    first_header_byte = await reader.readexactly(1)
+
     async def read_frame() -> tuple[Request, bytes]:
-        length = struct.unpack(">I", await reader.readexactly(4))[0]
+        length = struct.unpack(">I", first_header_byte + await reader.readexactly(3))[0]
         if length == 0 or length > limits.metadata_bytes:
             raise ValueError("Metadata frame exceeds its configured bound")
         request = Request.model_validate_json(await reader.readexactly(length))
