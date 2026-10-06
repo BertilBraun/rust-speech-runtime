@@ -182,16 +182,30 @@ class FixtureEngine(Engine):
         )
 
 
-async def run(port: int, configuration: FixtureConfig) -> None:
+async def run(port: int, configuration: FixtureConfig, exit_on_disconnect: bool = False) -> None:
     worker = WorkerServer(
         FixtureEngine(configuration),
         FrameLimits(1024 * 1024, configuration.max_batch_size * 960000, 60.0),
     )
-    server = await asyncio.start_server(worker.handle, "127.0.0.1", port)
-    print(f"Fixture worker ready on 127.0.0.1:{port}", flush=True)
+    disconnected = asyncio.Event()
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        owns_connection = not worker.connected
+        try:
+            await worker.handle(reader, writer)
+        finally:
+            if owns_connection:
+                disconnected.set()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", port)
+    bound_port = server.sockets[0].getsockname()[1]
+    print(f"Fixture worker ready on 127.0.0.1:{bound_port}", flush=True)
     try:
         async with server:
-            await server.serve_forever()
+            if exit_on_disconnect:
+                await disconnected.wait()
+            else:
+                await server.serve_forever()
     finally:
         await worker.close()
 
@@ -204,6 +218,7 @@ def main() -> None:
     parser.add_argument("--decode-ms", type=float, default=12.0)
     parser.add_argument("--max-sessions", type=int, default=256)
     parser.add_argument("--max-batch-size", type=int, default=16)
+    parser.add_argument("--exit-on-disconnect", action="store_true")
     arguments = parser.parse_args()
     configuration = FixtureConfig(
         arguments.response_tokens,
@@ -219,7 +234,7 @@ def main() -> None:
         parser.error("Token/session/batch limits must be positive")
     if min(configuration.prefill_ms, configuration.decode_ms) < 0:
         parser.error("Latencies must be nonnegative")
-    asyncio.run(run(arguments.port, configuration))
+    asyncio.run(run(arguments.port, configuration, arguments.exit_on_disconnect))
 
 
 if __name__ == "__main__":
