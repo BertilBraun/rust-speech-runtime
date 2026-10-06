@@ -1,400 +1,218 @@
-use super::{
-    cache::{CacheHandle, CachePool},
-    mailbox::{WorkerCommand, WorkerHandle},
-    mock_gpu::{self, DeviceJob, DeviceResult, DeviceWork, SessionCancellation},
-    session::{SessionWork, WorkerSession},
-};
+use super::{Command, backend::BackendConnection};
 use crate::{
     config::RuntimeConfig,
-    metrics::WorkerMeasurements,
-    protocol::{FrameRejection, InputOutcome, PrefixState, SessionId, SessionLease, WorkerId},
-    scheduler::{
-        admission::{ServiceEstimator, WorkerStatus},
-        deadline::ReadySession,
+    metrics::Metrics,
+    protocol::{
+        ErrorCode, SessionEvent,
+        backend::{BatchRequest, BatchResponse, Ready},
     },
+    runtime::RuntimeError,
+    scheduler::{BatchKind, CostModel, select_batch},
+    session::state::SessionState,
 };
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
-use tokio::{
-    sync::{mpsc, oneshot, watch},
-    time::Instant,
-};
+use tokio::{sync::mpsc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
-mod admission;
-mod input;
-mod scheduling;
-
-struct SubmittedBatch {
-    submitted_at: Instant,
-    latency: Duration,
-    expected_completion: Instant,
+pub(super) struct Job {
+    pub request: BatchRequest,
+    pub audio: Vec<u8>,
 }
-enum CalibrationStatus {
-    Ready,
-    Cancelled,
+pub(super) struct Completion {
+    pub response: Result<BatchResponse, RuntimeError>,
+    pub elapsed_ms: f64,
 }
-struct Worker {
-    configuration: Arc<RuntimeConfig>,
-    sessions: HashMap<SessionId, WorkerSession>,
-    cache: CachePool,
-    retired_cache: HashMap<SessionLease, CacheHandle>,
-    measurements: WorkerMeasurements,
-    estimator: ServiceEstimator,
-    status: watch::Sender<WorkerStatus>,
-    submitted: VecDeque<SubmittedBatch>,
-    prepared: Vec<ReadySession>,
-    session_limit: usize,
-    epoch: Instant,
+pub(super) struct ActiveBatch {
+    pub request: BatchRequest,
+    pub kind: BatchKind,
 }
-pub(crate) fn spawn_worker(
-    worker_id: WorkerId,
-    configuration: Arc<RuntimeConfig>,
-    cancellation: CancellationToken,
-) -> (WorkerHandle, oneshot::Receiver<()>) {
-    let (commands, mailbox) = mpsc::channel(configuration.worker_channel_capacity);
-    let (status, updates) = watch::channel(WorkerStatus {
-        worker_id,
-        sessions: HashSet::new(),
-        session_limit: 0,
-        service_time: configuration.inference_latency,
-    });
-    let (ready, response) = oneshot::channel();
-    let worker = Worker {
-        cache: CachePool::new(worker_id, configuration.cache_slots_per_worker),
-        estimator: ServiceEstimator::new(&configuration),
-        configuration,
-        sessions: HashMap::new(),
-        retired_cache: HashMap::new(),
-        measurements: WorkerMeasurements::new(worker_id),
-        status,
-        submitted: VecDeque::new(),
-        prepared: Vec::new(),
-        session_limit: 0,
-        epoch: Instant::now(),
-    };
-    (
-        WorkerHandle {
-            commands,
-            status: updates,
-            task: tokio::spawn(worker.run(mailbox, cancellation, ready)),
-        },
-        response,
-    )
+pub(super) struct WorkerActor {
+    pub id: usize,
+    pub config: RuntimeConfig,
+    pub ready: Ready,
+    pub sessions: HashMap<String, SessionState>,
+    pub metrics: Arc<Metrics>,
+    pub clock: Arc<AtomicU64>,
+    pub load: Arc<AtomicUsize>,
+    pub available: Arc<AtomicBool>,
+    pub costs: CostModel,
+    pub next_operation: u64,
+    pub active: Option<ActiveBatch>,
+    pub consecutive_decode_batches: usize,
 }
-impl Worker {
-    async fn run(
-        mut self,
-        mut commands: mpsc::Receiver<WorkerCommand>,
-        cancellation: CancellationToken,
-        ready: oneshot::Sender<()>,
-    ) -> WorkerMeasurements {
-        let (jobs, job_mailbox) = mpsc::channel(self.configuration.device_queue_capacity);
-        let (device_results, mut results) =
-            mpsc::channel(self.configuration.device_queue_capacity + 1);
-        let wait = self.configuration.device_wait;
-        let device = mock_gpu::spawn(job_mailbox, device_results, wait);
-        if matches!(
-            self.calibrate(&jobs, &mut results, &cancellation).await,
-            CalibrationStatus::Cancelled
-        ) {
-            drop(jobs);
-            self.measurements.device_cpu = device.await.expect("mock device does not panic");
-            self.measurements.elapsed = self.epoch.elapsed();
-            return self.measurements;
+impl WorkerActor {
+    pub fn new(
+        id: usize,
+        config: RuntimeConfig,
+        ready: Ready,
+        metrics: Arc<Metrics>,
+        clock: Arc<AtomicU64>,
+        load: Arc<AtomicUsize>,
+        available: Arc<AtomicBool>,
+    ) -> Self {
+        let costs = CostModel::new(config.initial_forward_estimate_ms);
+        Self {
+            id,
+            config,
+            ready,
+            sessions: HashMap::new(),
+            metrics,
+            clock,
+            load,
+            available,
+            costs,
+            next_operation: 0,
+            active: None,
+            consecutive_decode_batches: 0,
         }
-        self.epoch = Instant::now();
-        self.refresh_capacity();
-        self.measurements.initial_session_limit = self.admission_limit();
-        let _ = ready.send(());
-        let mut next_probe = self.epoch + self.configuration.probe_interval;
-        let mut slowdown_time = self
-            .configuration
-            .slowdown
-            .as_ref()
-            .map(|slowdown| self.epoch + slowdown.after);
-        loop {
-            let wakeup = self.next_wakeup();
-            let slowdown_wakeup = slowdown_time.unwrap_or(next_probe);
-            let can_dispatch = !self.prepared.is_empty()
-                && self.submitted.len() < self.configuration.device_queue_capacity + 1
-                && (self.prepared.len() == self.configuration.batch_size
-                    || !self.submitted.is_empty()
-                    || commands.is_empty()
-                    || self.idle_collection_expired())
-                && wakeup <= Instant::now();
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => break,
-                _ = tokio::time::sleep_until(slowdown_wakeup), if slowdown_time.is_some() => {
-                    slowdown_time = None;
-                    self.refresh_capacity();
-                }
-                result = results.recv(), if !self.submitted.is_empty() => {
-                    self.complete(result.expect("device returns active work"));
-                }
-                permit = jobs.reserve(), if can_dispatch => {
-                    self.dispatch_batch(permit.expect("device is running"));
-                }
-                command = commands.recv() => {
-                    let Some(command) = command else {
-                        break;
-                    };
-                    if matches!(&command, WorkerCommand::InputReady { .. })
-                        && !self.configuration.worker_input_delay.is_zero()
-                    {
-                        tokio::select! {
-                            _ = cancellation.cancelled() => break,
-                            _ = tokio::time::sleep(self.configuration.worker_input_delay) => {}
-                        }
-                    }
-                    self.handle(command).await;
-                }
-                _ = tokio::time::sleep_until(wakeup), if !can_dispatch => {},
-                _ = tokio::time::sleep_until(next_probe), if self.submitted.is_empty() && self.sessions.is_empty() => {
-                    let submitted_at = Instant::now();
-                    let latency = self.base_latency();
-                    jobs.send(DeviceJob {
-                        work: DeviceWork::Probe,
-                        latency,
-                        submitted_at,
-                    })
-                    .await
-                    .expect("device is running");
-                    self.track_submission(submitted_at, latency);
-                    next_probe = Instant::now() + self.configuration.probe_interval;
-                }
-            }
-        }
-        self.drain(&mut commands, &mut results).await;
-        drop(jobs);
-        self.measurements.device_cpu = device.await.expect("mock device does not panic");
-        self.measurements.elapsed = Instant::now().duration_since(self.epoch);
-        self.measurements.final_session_limit = self.admission_limit();
-        self.measurements.service_time = self.projected_service_time();
-        self.measurements.host_delay = self.estimator.host_delay();
-        self.measurements.host_reserve = self.estimator.host_reserve();
-        self.measurements
     }
-    async fn calibrate(
-        &mut self,
-        jobs: &mpsc::Sender<DeviceJob>,
-        results: &mut mpsc::Receiver<DeviceResult>,
-        cancellation: &CancellationToken,
-    ) -> CalibrationStatus {
-        for _ in 0..self.configuration.calibration_samples {
-            if cancellation.is_cancelled() {
-                return CalibrationStatus::Cancelled;
+    pub async fn run(
+        mut self,
+        mut commands: mpsc::Receiver<Command>,
+        connection: BackendConnection,
+        cancellation: CancellationToken,
+    ) {
+        let (jobs, job_receiver) = mpsc::channel(1);
+        let (results, result_receiver) = mpsc::channel(1);
+        let execution = tokio::spawn(run_backend(
+            connection,
+            job_receiver,
+            results,
+            Duration::from_millis(self.config.backend_timeout_ms),
+            cancellation.child_token(),
+        ));
+        let mut results = result_receiver;
+        let mut reap = tokio::time::interval(Duration::from_millis(50));
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled()=>break,
+                command = commands.recv()=>match command {Some(command)=>self.command(command),None=>break},
+                result = results.recv(),if self.active.is_some()=>match result {Some(completion)=>{if let Err(error)=self.complete(completion){self.fail(error);}},None=>{self.fail(RuntimeError::new(ErrorCode::BackendUnavailable,"execution task stopped"));}},
+                _ = reap.tick()=>self.reap(),
             }
-            jobs.send(DeviceJob {
-                work: DeviceWork::Probe,
-                latency: self.configuration.inference_latency,
-                submitted_at: Instant::now(),
+            if self.available.load(Ordering::Acquire)
+                && self.active.is_none()
+                && let Some((kind, keys)) = select_batch(
+                    &self.sessions,
+                    self.config.max_batch_size.min(self.ready.max_batch_size),
+                    self.consecutive_decode_batches,
+                    &self.costs,
+                )
+            {
+                let job = self.build_batch(kind, keys);
+                if jobs.try_send(job).is_err() {
+                    self.fail(RuntimeError::new(
+                        ErrorCode::BackendUnavailable,
+                        "execution queue stopped",
+                    ));
+                }
+            }
+        }
+        self.available.store(false, Ordering::Release);
+        self.metrics.active_sessions.fetch_sub(
+            self.sessions
+                .values()
+                .filter(|session| !session.closing)
+                .count() as u64,
+            Ordering::Relaxed,
+        );
+        self.load.store(0, Ordering::Relaxed);
+        for mut session in self.sessions.into_values() {
+            session.cancellation.cancel();
+            if let Some(reply) = session.close_reply.take() {
+                let _ = reply.send(Err(RuntimeError::new(
+                    ErrorCode::BackendUnavailable,
+                    "worker stopped",
+                )));
+            }
+        }
+        cancellation.cancel();
+        let _ = execution.await;
+    }
+    pub fn generation(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::Relaxed)
+    }
+    fn reap(&mut self) {
+        let generation = self.generation();
+        for session in self.sessions.values_mut() {
+            if !session.closing
+                && (session.cancellation.is_cancelled() || session.events.is_closed())
+            {
+                session.interrupt(generation);
+                session.closing = true;
+                self.metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        self.sessions.retain(|_, session| {
+            !session.closing
+                || session.in_flight
+                || (!session.backend_closed && session.opened)
+                || !session.events.is_closed()
+        });
+        self.load.store(self.sessions.len(), Ordering::Relaxed);
+    }
+    fn fail(&mut self, error: RuntimeError) {
+        self.available.store(false, Ordering::Release);
+        self.active = None;
+        self.metrics
+            .backend_failures
+            .fetch_add(1, Ordering::Relaxed);
+        for session in self.sessions.values_mut() {
+            session.opened = false;
+            session.backend_closed = true;
+            session.in_flight = false;
+            if session.active() {
+                session.finish(crate::protocol::FinishReason::BackendFailed);
+            }
+            if let Some(reply) = session.open_reply.take() {
+                let _ = reply.send(Err(error.clone()));
+            }
+            let _ = session.events.try_send(SessionEvent::Failed {
+                turn_id: session.turn().map(|turn| turn.turn_id),
+                code: error.code(),
+                message: error.to_string(),
+            });
+        }
+        let closing = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.closing && session.close_reply.is_some())
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in closing {
+            self.remove_closed(&key);
+        }
+    }
+}
+async fn run_backend(
+    mut connection: BackendConnection,
+    mut jobs: mpsc::Receiver<Job>,
+    results: mpsc::Sender<Completion>,
+    timeout: Duration,
+    cancellation: CancellationToken,
+) {
+    loop {
+        let job = tokio::select! {_=cancellation.cancelled()=>break,job=jobs.recv()=>match job{Some(job)=>job,None=>break}};
+        let started = Instant::now();
+        let response = tokio::select! {_=cancellation.cancelled()=>break,result=tokio::time::timeout(timeout,connection.execute(&job.request,&job.audio))=>result.unwrap_or_else(|_|Err(RuntimeError::new(ErrorCode::BackendUnavailable,"worker execution timeout")))};
+        let failed = response.is_err();
+        if results
+            .send(Completion {
+                response,
+                elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
             })
             .await
-            .expect("device is running");
-            let result = results.recv().await.expect("probe result");
-            let received_at = Instant::now();
-            let elapsed = received_at.duration_since(result.started_at);
-            self.estimator
-                .observe(result.completed_at - result.started_at);
-            self.estimator
-                .observe_host_delay(received_at - result.completed_at);
-            self.measurements.calibration_latency.record(elapsed);
+            .is_err()
+            || failed
+        {
+            break;
         }
-        if cancellation.is_cancelled() {
-            CalibrationStatus::Cancelled
-        } else {
-            CalibrationStatus::Ready
-        }
-    }
-
-    async fn drain(
-        &mut self,
-        commands: &mut mpsc::Receiver<WorkerCommand>,
-        results: &mut mpsc::Receiver<DeviceResult>,
-    ) {
-        let sessions: Vec<SessionId> = self.sessions.keys().copied().collect();
-        for session_id in sessions {
-            self.terminate(session_id, FrameRejection::Cancelled);
-        }
-        while !self.submitted.is_empty() {
-            self.complete(results.recv().await.expect("drain physical device work"));
-        }
-        commands.close();
-        while let Ok(command) = commands.try_recv() {
-            match command {
-                WorkerCommand::InputReady { reply, .. } => {
-                    let _ = reply.send(InputOutcome::Rejected(FrameRejection::Cancelled));
-                }
-                WorkerCommand::AddSession { reply, .. } => {
-                    let _ = reply.send(false);
-                }
-                WorkerCommand::RemoveSession { reply, .. } => {
-                    let _ = reply.send(());
-                }
-                WorkerCommand::EvictCache { reply, .. } => {
-                    let _ = reply.send(false);
-                }
-            }
-        }
-    }
-    fn terminate(&mut self, session_id: SessionId, reason: FrameRejection) {
-        if let Some(session) = self.sessions.remove(&session_id) {
-            session.cancellation.cancel();
-            let submitted = matches!(session.work, SessionWork::Submitted);
-            if let SessionWork::Ready(pending) = session.work {
-                self.measurements.counters.rejected_frames += 1;
-                let _ = pending.reply.send(InputOutcome::Rejected(reason));
-            }
-            if submitted {
-                let prior = self.retired_cache.insert(
-                    SessionLease {
-                        session_id,
-                        generation: session.assignment.generation,
-                    },
-                    session.cache,
-                );
-                assert!(prior.is_none(), "each cache lease is retired once");
-                self.measurements.peak_retired_cache_slots = self
-                    .measurements
-                    .peak_retired_cache_slots
-                    .max(self.retired_cache.len());
-            } else {
-                self.cache.free(session.cache);
-            }
-            self.refresh_prepared();
-        }
-    }
-    async fn handle(&mut self, command: WorkerCommand) {
-        match command {
-            WorkerCommand::AddSession {
-                session_id,
-                assignment,
-                reply,
-            } => {
-                assert_eq!(assignment.worker_id, self.measurements.worker_id);
-                assert!(!self.sessions.contains_key(&session_id));
-                if self.sessions.len() >= self.admission_limit() {
-                    let _ = reply.send(false);
-                    return;
-                }
-                let Some(cache) = self.cache.allocate() else {
-                    let _ = reply.send(false);
-                    return;
-                };
-                self.sessions.insert(
-                    session_id,
-                    WorkerSession {
-                        assignment,
-                        cache,
-                        prefix: PrefixState::default(),
-                        work: SessionWork::Idle,
-                        cancellation: SessionCancellation::default(),
-                    },
-                );
-                self.measurements.peak_sessions =
-                    self.measurements.peak_sessions.max(self.sessions.len());
-                self.publish();
-                let _ = reply.send(true);
-            }
-            WorkerCommand::InputReady {
-                session_id,
-                generation,
-                input,
-                reply,
-                routed_at,
-            } => {
-                self.queue_input(session_id, generation, input, reply, routed_at)
-                    .await
-            }
-            WorkerCommand::RemoveSession {
-                session_id,
-                generation,
-                reply,
-            } => {
-                if self
-                    .sessions
-                    .get(&session_id)
-                    .is_some_and(|session| session.assignment.generation == generation)
-                {
-                    self.terminate(session_id, FrameRejection::Cancelled);
-                    self.publish();
-                }
-                let _ = reply.send(());
-            }
-            WorkerCommand::EvictCache {
-                session_id,
-                generation,
-                reply,
-            } => {
-                let removed = match self.sessions.get(&session_id) {
-                    Some(session)
-                        if session.assignment.generation == generation
-                            && matches!(session.work, SessionWork::Idle) =>
-                    {
-                        self.cache.evict(session.cache);
-                        self.measurements.counters.cache_evictions += 1;
-                        true
-                    }
-                    _ => false,
-                };
-                let _ = reply.send(removed);
-            }
-        }
-    }
-    fn reject(
-        &mut self,
-        session_id: SessionId,
-        reply: oneshot::Sender<InputOutcome>,
-        reason: FrameRejection,
-    ) {
-        self.measurements.counters.rejected_frames += 1;
-        match reason {
-            FrameRejection::Overloaded => self.measurements.counters.busy_rejections += 1,
-            FrameRejection::InvalidSequence
-            | FrameRejection::InvalidPrefix
-            | FrameRejection::PrefixCapacity
-            | FrameRejection::ReplayTooExpensive => {
-                self.measurements.counters.prefix_rejections += 1
-            }
-            _ => {}
-        }
-        self.terminate(session_id, reason);
-        self.publish();
-        let _ = reply.send(InputOutcome::Rejected(reason));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::spawn_worker;
-    use crate::{config::RuntimeConfig, protocol::WorkerId};
-    use std::{sync::Arc, time::Duration};
-    use tokio_util::sync::CancellationToken;
-
-    #[tokio::test(start_paused = true)]
-    async fn cancelled_startup_finishes_only_its_running_calibration_probe() {
-        let cancellation = CancellationToken::new();
-        let (worker, ready) = spawn_worker(
-            WorkerId(0),
-            Arc::new(RuntimeConfig {
-                inference_latency: Duration::from_millis(100),
-                ..RuntimeConfig::default()
-            }),
-            cancellation.clone(),
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        cancellation.cancel();
-        let measurements = tokio::time::timeout(Duration::from_millis(150), worker.task)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(measurements.calibration_latency.summary().samples, 1);
-        assert_eq!(measurements.initial_session_limit, 0);
-        assert!(ready.await.is_err());
     }
 }

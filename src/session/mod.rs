@@ -1,2 +1,2 @@
 pub(crate) mod manager;
-mod state;
+pub(crate) mod state;
