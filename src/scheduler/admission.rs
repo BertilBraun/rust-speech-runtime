@@ -115,7 +115,10 @@ mod tests {
     }
     #[test]
     fn capacity_reserves_whole_batches_and_headroom() {
-        let configuration = RuntimeConfig::default();
+        let configuration = RuntimeConfig {
+            max_sessions_per_worker: 64,
+            ..RuntimeConfig::default()
+        };
         assert_eq!(session_limit(&configuration, Duration::from_millis(12)), 48);
         assert_eq!(session_limit(&configuration, Duration::from_millis(20)), 16);
         assert_eq!(session_limit(&configuration, Duration::from_millis(40)), 0);
@@ -137,7 +140,10 @@ mod tests {
 
     #[test]
     fn sustained_host_delay_pauses_admission_without_changing_device_capacity() {
-        let configuration = RuntimeConfig::default();
+        let configuration = RuntimeConfig {
+            max_sessions_per_worker: 48,
+            ..RuntimeConfig::default()
+        };
         let mut estimator = ServiceEstimator::new(&configuration);
         estimator.observe(Duration::from_millis(12));
         for _ in 0..64 {

@@ -671,6 +671,42 @@ async fn oversending_terminates_session_without_coalescing_audio() {
     assert_eq!(report.inference.delivered_frames, 0);
 }
 #[tokio::test]
+async fn configured_slow_work_is_rejected_before_launch_if_it_cannot_meet_the_packet_deadline() {
+    let node = Node::start(RuntimeConfig {
+        slowdown: Some(WorkerSlowdown {
+            after: Duration::from_millis(30),
+            inference_latency: Duration::from_millis(100),
+        }),
+        ..configuration()
+    })
+    .await
+    .unwrap();
+    admit(&node, 1).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let outcome = node
+        .ingress
+        .input_frame(
+            SessionId(1),
+            frame(
+                0,
+                PrefixState::default(),
+                Bytes::from_static(b"too slow"),
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        InputOutcome::Rejected(FrameRejection::DeadlineExceeded)
+    ));
+    let report = node.shutdown().await.unwrap();
+    assert_eq!(report.inference.processed_frames, 0);
+    assert_eq!(report.inference.deadline_misses, 0);
+    assert_eq!(report.inference.rejected_frames, 1);
+}
+
+#[tokio::test]
 async fn observed_slowdown_reduces_admission_and_sheds_unsustainable_sessions() {
     let node = Node::start(RuntimeConfig {
         minimum_packet_interval: Duration::from_millis(100),

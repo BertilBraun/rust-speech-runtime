@@ -228,6 +228,9 @@ impl Worker {
             service_time: self.estimator.service_time(),
         });
     }
+    fn projected_device_time(&self) -> Duration {
+        self.estimator.device_time().max(self.base_latency())
+    }
     fn admission_limit(&self) -> usize {
         let queued = self
             .sessions
@@ -468,7 +471,7 @@ impl Worker {
                 .mul_f64(packets as f64),
         };
         if Instant::now()
-            + self.estimator.device_time()
+            + self.projected_device_time()
             + replay_duration
             + self.configuration.scheduling_margin
             > input.deadline
@@ -569,7 +572,7 @@ impl Worker {
         {
             count += 1;
             let latest = pending.item.input.deadline
-                - self.estimator.device_time()
+                - self.projected_device_time()
                 - pending.item.replay_duration
                 - self.configuration.scheduling_margin;
             wakeup =
@@ -589,7 +592,7 @@ impl Worker {
             .any(|pending| {
                 now >= pending.queued_at + self.configuration.max_batch_wait
                     || now
-                        + self.estimator.device_time()
+                        + self.projected_device_time()
                         + pending.item.replay_duration
                         + self.configuration.scheduling_margin
                         >= pending.item.input.deadline
@@ -597,6 +600,7 @@ impl Worker {
     }
     fn dispatch_batch(&mut self, permit: mpsc::Permit<'_, DeviceJob>) {
         let assembly_started = Instant::now();
+        let device_time = self.projected_device_time();
         let selected = std::mem::take(&mut self.prepared);
         let predicted_start = self.submitted.back().map_or(Instant::now(), |batch| {
             batch.expected_completion.max(Instant::now())
@@ -610,16 +614,15 @@ impl Worker {
                 .get_mut(&selected.session_id)
                 .expect("selected session exists");
             let pending = session.work.ready().expect("pending frame exists");
-            let projected = self.estimator.device_time()
+            let projected = device_time
                 + replay
                 + pending.item.replay_duration
                 + self.configuration.scheduling_margin;
             let batch_deadline = earliest_deadline
                 .unwrap_or(pending.item.input.deadline)
                 .min(pending.item.input.deadline);
-            let own_cost = self.estimator.device_time()
-                + pending.item.replay_duration
-                + self.configuration.scheduling_margin;
+            let own_cost =
+                device_time + pending.item.replay_duration + self.configuration.scheduling_margin;
             if predicted_start + own_cost > pending.item.input.deadline {
                 let pending = session.work.take_ready();
                 self.measurements
