@@ -10,11 +10,13 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from voice_worker.cache import (
     attention_layer,
+    batch_workspace_bytes,
     cache_bytes,
     continuation_mask,
     continuation_positions,
     join_caches,
     recurrent_layer,
+    reservation_bytes,
     split_cache,
 )
 
@@ -141,3 +143,12 @@ def test_batch_membership_can_change_and_states_do_not_alias(
     other_state = recurrent_layer(next_caches[1], 0).conv_states.clone()
     recurrent_layer(next_caches[0], 0).conv_states.zero_()
     torch.testing.assert_close(recurrent_layer(next_caches[1], 0).conv_states, other_state)
+
+
+def test_workspace_accounts_for_ragged_attention_padding_and_appended_tokens(
+    tiny_model: Qwen3_5ForCausalLM,
+) -> None:
+    configuration = tiny_model.config
+    workspace = batch_workspace_bytes(configuration, (1000, 1), 5)
+    assert workspace == 4 * reservation_bytes(configuration, 1005)
+    assert workspace > 2 * sum(reservation_bytes(configuration, length) for length in (1000, 1))

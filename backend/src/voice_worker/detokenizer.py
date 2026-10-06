@@ -1,6 +1,7 @@
 """Preview byte-level tokens without committing proposals to session history."""
 
 from dataclasses import dataclass
+from encodings.utf_8 import IncrementalDecoder
 
 
 def byte_decoder() -> dict[str, int]:
@@ -34,12 +35,7 @@ class TextPreview:
 
 
 def preview_text(pending: bytes, piece: bytes, finished: bool = False) -> TextPreview:
-    combined = pending + piece
-    if finished:
-        return TextPreview(combined.decode("utf-8", errors="replace"), b"")
-    try:
-        return TextPreview(combined.decode("utf-8"), b"")
-    except UnicodeDecodeError as error:
-        if error.reason != "unexpected end of data":
-            raise ValueError("Tokenizer produced invalid UTF-8 bytes") from error
-        return TextPreview(combined[: error.start].decode("utf-8"), combined[error.start :])
+    decoder = IncrementalDecoder(errors="replace")
+    delta = decoder.decode(pending + piece, final=finished)
+    incomplete, _ = decoder.getstate()
+    return TextPreview(delta, incomplete)

@@ -1,6 +1,6 @@
 import pytest
 
-from voice_worker.detokenizer import BYTE_DECODER, preview_text, token_bytes
+from voice_worker.detokenizer import BYTE_DECODER, TextPreview, preview_text, token_bytes
 
 
 def test_byte_alphabet_roundtrip_all_values() -> None:
@@ -26,6 +26,16 @@ def test_preview_does_not_commit_and_eos_flushes_incomplete_bytes() -> None:
     assert preview_text(pending, b"", finished=True).delta == "�"
 
 
-def test_invalid_token_bytes_fail_explicitly() -> None:
-    with pytest.raises(ValueError):
-        preview_text(b"", b"\xff")
+@pytest.mark.parametrize(
+    ("pending", "piece", "delta", "remaining"),
+    [
+        (b"", b"\xff", "�", b""),
+        (b"\xe2", b"hello", "�hello", b""),
+        (b"", b"\xff\xe2", "�", b"\xe2"),
+        (b"\xe2", b"\x82\xac\xff", "€�", b""),
+    ],
+)
+def test_arbitrary_generated_bytes_replace_invalid_sequences_and_keep_only_incomplete_tail(
+    pending: bytes, piece: bytes, delta: str, remaining: bytes
+) -> None:
+    assert preview_text(pending, piece) == TextPreview(delta, remaining)

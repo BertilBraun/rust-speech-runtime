@@ -10,7 +10,7 @@ import torch
 from torch import Tensor
 from transformers.cache_utils import DynamicCache
 
-from voice_worker.cache import cache_bytes, reservation_bytes
+from voice_worker.cache import batch_workspace_bytes, cache_bytes, reservation_bytes
 from voice_worker.config import WorkerConfig
 from voice_worker.detokenizer import preview_text
 from voice_worker.engine import Engine
@@ -153,7 +153,10 @@ class PyTorchEngine(Engine):
         if (
             len(self.sessions) >= self.configuration.max_sessions
             or reserved > self.configuration.cache_budget_bytes
-            or free < self.configuration.workspace_reserve_bytes + self.reservation
+            or free
+            < self.configuration.workspace_reserve_bytes
+            + self._unmaterialized_reservations()
+            + self.reservation
         ):
             return result_for(
                 operation,
@@ -163,6 +166,12 @@ class PyTorchEngine(Engine):
             DynamicCache(config=self.model.text_config)
         )
         return result_for(operation, Opened())
+
+    def _unmaterialized_reservations(self) -> int:
+        return sum(
+            max(0, self.reservation - cache_bytes(session.cache, self.model.text_config))
+            for session in self.sessions.values()
+        )
 
     def _close(self, operation: Close) -> OperationResult:
         self.sessions.pop(operation.session_id, None)
@@ -309,11 +318,17 @@ class PyTorchEngine(Engine):
         results = []
         elapsed = 0.0
         for group in groups.values():
-            workspace = sum(
-                cache_bytes(item.session.cache, self.model.text_config) for item in group
+            lengths = tuple(item.session.cache.get_seq_length() for item in group)
+            workspace = batch_workspace_bytes(
+                self.model.text_config, lengths, group[0].embeddings.shape[0]
             )
             free, _ = torch.cuda.mem_get_info(self.model.device)
-            if free < self.configuration.workspace_reserve_bytes + workspace * 2:
+            if (
+                free
+                < self.configuration.workspace_reserve_bytes
+                + self._unmaterialized_reservations()
+                + workspace
+            ):
                 results.extend(
                     result_for(
                         item.operation,

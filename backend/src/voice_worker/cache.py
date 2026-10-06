@@ -143,3 +143,11 @@ def reservation_bytes(config: Qwen3_5TextConfig, context_tokens: int) -> int:
         * 4
     )
     return key_value + convolution + recurrent
+
+
+def batch_workspace_bytes(
+    config: Qwen3_5TextConfig, lengths: Sequence[int], appended_tokens: int
+) -> int:
+    # Joined attention tensors retain padding until all separated session caches are copied.
+    padded_context = max(lengths) + appended_tokens
+    return 2 * len(lengths) * reservation_bytes(config, padded_context)

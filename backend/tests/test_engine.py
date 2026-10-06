@@ -8,6 +8,7 @@ from test_hybrid_cache import tiny_model as tiny_model
 from torch import Tensor
 from transformers import Qwen3_5ForCausalLM
 
+from voice_worker.cache import batch_workspace_bytes, cache_bytes
 from voice_worker.config import ModelManifest, WorkerConfig
 from voice_worker.model import SpeechModel, StageTimer, pseudo_token_count
 from voice_worker.protocol import (
@@ -15,6 +16,7 @@ from voice_worker.protocol import (
     Decode,
     Failed,
     Open,
+    Opened,
     Operation,
     Prefill,
     Request,
@@ -164,3 +166,95 @@ def test_invalid_accepted_token_and_stale_generation_leave_cache_unchanged(
     stale = execute(engine, (prefill("a", 3, 10, 1, 0, 3200),), bytes(3200))
     assert isinstance(stale.results[0].outcome, Failed)
     assert engine.sessions["a"].cache.get_seq_length() == length
+
+
+def test_open_reserves_unmaterialized_cache_against_actual_free_memory(
+    engine: PyTorchEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine.configuration = WorkerConfig(
+        model=engine.configuration.model,
+        device="cuda:0",
+        cache_budget_bytes=engine.reservation * 10,
+        workspace_reserve_bytes=1,
+    )
+
+    def free_memory(device: torch.device) -> tuple[int, int]:
+        return engine.reservation + 1, engine.reservation + 1
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", free_memory)
+    response = execute(
+        engine,
+        tuple(Open(operation_id=index, session_id=str(index)) for index in range(3)),
+    )
+    assert isinstance(response.results[0].outcome, Opened)
+    assert all(isinstance(result.outcome, Failed) for result in response.results[1:])
+    assert len(engine.sessions) == 1
+
+
+def test_materialized_cache_is_not_charged_twice_against_free_memory(
+    engine: PyTorchEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    execute(engine, (Open(operation_id=0, session_id="a"),))
+    execute(engine, (prefill("a", 1, 9, 2, 0, 3200),), bytes(3200))
+    materialized = cache_bytes(engine.sessions["a"].cache, engine.model.text_config)
+    engine.configuration = WorkerConfig(
+        model=engine.configuration.model,
+        device="cuda:0",
+        cache_budget_bytes=engine.reservation * 10,
+        workspace_reserve_bytes=1,
+    )
+    available = 2 * engine.reservation - materialized + 1
+
+    def free_memory(device: torch.device) -> tuple[int, int]:
+        return available, available
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", free_memory)
+    response = execute(
+        engine,
+        (Open(operation_id=2, session_id="b"), Open(operation_id=3, session_id="c")),
+    )
+    assert isinstance(response.results[0].outcome, Opened)
+    assert isinstance(response.results[1].outcome, Failed)
+    assert set(engine.sessions) == {"a", "b"}
+
+
+def test_batch_requires_transient_cache_workspace_in_addition_to_session_reservations(
+    engine: PyTorchEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    execute(engine, (Open(operation_id=0, session_id="a"), Open(operation_id=1, session_id="b")))
+    appended = 3 + pseudo_token_count(1600) + 9
+    workspace = batch_workspace_bytes(engine.model.text_config, (0, 0), appended)
+    available = (
+        engine.configuration.workspace_reserve_bytes + 2 * engine.reservation + workspace - 1
+    )
+
+    def free_memory(device: torch.device) -> tuple[int, int]:
+        return available, available
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", free_memory)
+    response = execute(
+        engine,
+        (prefill("a", 2, 1, 1, 0, 3200), prefill("b", 3, 1, 1, 3200, 3200)),
+        bytes(6400),
+    )
+    assert all(isinstance(result.outcome, Failed) for result in response.results)
+    assert all(session.cache.get_seq_length() == 0 for session in engine.sessions.values())
+
+
+def test_invalid_utf8_model_tokens_do_not_invalidate_any_session(
+    engine: PyTorchEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def invalid_piece(token_id: int) -> bytes:
+        return b"\xff"
+
+    monkeypatch.setattr(engine.model, "token_piece", invalid_piece)
+    execute(engine, (Open(operation_id=0, session_id="a"), Open(operation_id=1, session_id="b")))
+    response = execute(
+        engine,
+        (prefill("a", 2, 1, 1, 0, 3200), prefill("b", 3, 1, 1, 3200, 3200)),
+        bytes(6400),
+    )
+    for result in response.results:
+        assert isinstance(result.outcome, Token)
+        assert result.outcome.text_delta == "�"
+    assert set(engine.sessions) == {"a", "b"}
