@@ -4,7 +4,7 @@ A Tokio gateway schedules persistent audio conversations across a configurable l
 
 The model is Whisper Small, a speech projection layer and Qwen3.5-2B. Complete utterances are encoded at commit because Whisper is bidirectional. Prior audio embeddings and accepted assistant tokens stay in the worker's cache across turns. The initial deployment may have two GPUs; the endpoint list controls GPU count.
 
-The agreed design is in [PLAN.md](PLAN.md), implementation evidence in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md), and tomorrow's checks in [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md). [PERFORMANCE.md](PERFORMANCE.md) preserves measurements of the superseded periodic audio-echo workload; those results do not establish this model's capacity. The old TCP echo transport and simulator have been replaced.
+The agreed design is in [PLAN.md](PLAN.md), implementation decisions in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md), measured local results in [docs/LOCAL_VALIDATION.md](docs/LOCAL_VALIDATION.md), and tomorrow's checks in [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md). [PERFORMANCE.md](PERFORMANCE.md) preserves measurements of the superseded periodic audio-echo workload; those results do not establish this model's capacity. The old TCP echo transport and simulator have been replaced.
 
 ## Run the pipeline
 

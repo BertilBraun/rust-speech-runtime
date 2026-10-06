@@ -35,11 +35,11 @@ The public transport is WebSocket: strict JSON control/event variants and binary
 - [x] Persistent cache lifecycle, interruption fences and dynamic batch membership.
 - [x] Clean WebSocket gateway, binary packet validation and slow-client isolation.
 - [x] Persistent Python worker, injectable test backend and real model adapter.
-- [x] Per-session bounded records and asynchronous archives with visible failures.
+- [x] Per-session bounded records, asynchronous archives and bounded teardown backpressure with visible disk failures.
 - [x] Ordinary WebSocket workload runner, multi-turn/churn/interruption/overload scenarios.
 - [x] TTFT, token gaps/rates, queue/stage latency distributions, utilization and rejection metrics.
 - [x] Independent architectural and correctness reviews; fix reported issues.
-- [ ] Rust fmt, strict clippy, tests and documentation; Python ruff and pytest.
+- [x] Rust fmt, strict clippy, tests and documentation; Python ruff and pytest.
 - [x] Linux deployment/runbook and tomorrow's GPU/cache-parity benchmark checklist.
 
 ## Assumptions and validation limits

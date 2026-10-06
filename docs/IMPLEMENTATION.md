@@ -21,6 +21,18 @@ Already admitted prefills have a configurable maximum queue wait (2000 ms initia
 
 Release-CLI validation found an idle worker transport timeout not caught by the original tests. Commit `8f63afb` preserves idle persistent connections and cache ownership while retaining a single timeout for a partial header/metadata/body. The expanded Python suite passes 52 CPU tests, with two hardware tests skipped. `54ecefa` clarifies device-stage timing boundaries. Final full-pipeline measurements and their failures are recorded in docs/LOCAL_VALIDATION.md.
 
+The aligned overload run also exposed archive queue loss during simultaneous session closes. Commit `392deae` replaces lossy enqueue with bounded teardown backpressure: a closing connection retains its record and connection permit while waiting for the archive writer. Pending teardown records therefore remain bounded by the gateway connection limit, in addition to the archive mailbox and one writer. Disk failures remain explicit. The same change completes WebSocket close after a rejected session open and routes fatal gateway accept/setup/join errors through session, archive and runtime cleanup before returning the original error. An independent review found no remaining blocking issue and passed both new regressions. Fatal listener-error cleanup was assessed from source rather than an injected OS listener failure.
+
+A subsequent release audit exposed a WebSocket close race: generation completed but the server dropped its reader before consuming the peer's acknowledgement. Commit `e010a42` completes the close handshake with one bounded deadline. Independent review passed both close regressions and verified that session archiving, writer flushing and peer close occur in order.
+
+Commit `055aa05` extracts session cleanup and archiving from the connection entry point. The final cross-language process audit also found that terminating a Windows `uv run` launcher could leave its Python fixture child alive. Fixture commit `0507388` supports natural exit after the owning gateway disconnects; Rust test commit `74a5553` directly owns the resolved Python interpreter and waits for that exit. These changes are test infrastructure only, and the successful rerun left no fixture processes or listener ports behind.
+
+## Verified local result
+
+The final Windows suite passes 47 Rust tests; the separately enabled Python-process/WebSocket test passes four sessions and eight turns with 104 accepted tokens. Python passes 54 CPU tests with two GPU tests skipped. Formatting, strict Clippy, Rustdoc, release build and Ruff gates pass. Ubuntu/WSL passed the earlier full Rust suite and the affected final transport and archive tests. See [LOCAL_VALIDATION.md](LOCAL_VALIDATION.md) for exact commands, revisions, measurements and failures found during validation.
+
+The final aligned-overload release audit saved all 48 admitted session archives, with 21 bounded archive backpressure events and no archive, connection or backend failures. All 6,176 accepted tokens matched client, runtime and archive counts. The deliberate 350 ms decode run exposed token-gap and rolling-rate violations and rejected the next turn after profiling. These results validate orchestration with fixed-cost synthetic workers; they do not establish GPU throughput.
+
 ## Pending hardware validation
 
 Real checkpoint loading, GPU cache continuation parity, CUDA timing, peak VRAM, speech correctness, batching efficiency and concurrency at four generated tokens/second/session require the trained model and GPU node. No local mock result establishes those properties.
