@@ -1,0 +1,22 @@
+{
+  "model": {
+    "projector_checkpoint": "/workspace/speech-projector/results_teacher/teacher_20000_mlp_10hz/checkpoint/projector.safetensors",
+    "projector_sha256": "018209b9ca336619cfd695e40693c621ac8455d6146509042c1eab162455389b",
+    "language_model": "Qwen/Qwen3.5-2B",
+    "language_revision": "15852e8c16360a2fea060d615a32b45270f8a8fc",
+    "encoder_model": "openai/whisper-small",
+    "encoder_revision": "973afd24965f72e36ca33b3055d56a652f456b4d",
+    "prompt_policy": "persistent-speech-chat-v1",
+    "decoding_policy": "greedy-v1"
+  },
+  "device": "cuda:0",
+  "host": "127.0.0.1",
+  "port": 9100,
+  "max_sessions": 64,
+  "max_context_tokens": 4096,
+  "max_batch_size": 16,
+  "cache_budget_bytes": 8589934592,
+  "workspace_reserve_bytes": 2147483648,
+  "max_metadata_bytes": 1048576,
+  "connection_timeout_seconds": 300.0
+}

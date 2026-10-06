@@ -1,0 +1,39 @@
+[project]
+name = "voice-model-worker"
+version = "0.1.0"
+description = "Persistent PyTorch speech inference worker for the Rust gateway"
+requires-python = ">=3.10"
+dependencies = [
+  "pydantic>=2.12,<3",
+  "numpy>=2.2,<3",
+  "torch>=2.8,<3",
+  "transformers==5.13.0",
+  "safetensors>=0.6,<1",
+  "accelerate>=1.10,<2",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.4,<10", "pytest-asyncio>=1.2,<2", "ruff>=0.14,<1"]
+
+[project.scripts]
+voice-model-worker = "voice_worker.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/voice_worker"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["integration: requires configured trained checkpoint and CUDA hardware"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ANN"]
+
