@@ -44,6 +44,7 @@ impl ClientEchoTrace {
 pub enum ClientPacketTrace {
     Echo(ClientEchoTrace),
     LateEcho(ClientEchoTrace),
+    ExpiredEcho(ClientEchoTrace),
     Failure {
         session_id: SessionId,
         sequence: PacketSequence,
@@ -55,7 +56,7 @@ pub enum ClientPacketTrace {
 impl ClientPacketTrace {
     fn round_trip(&self) -> Duration {
         match self {
-            Self::Echo(echo) | Self::LateEcho(echo) => echo.round_trip,
+            Self::Echo(echo) | Self::LateEcho(echo) | Self::ExpiredEcho(echo) => echo.round_trip,
             Self::Failure { round_trip, .. } => *round_trip,
         }
     }
@@ -81,6 +82,12 @@ impl PacketMeasurements {
                 }
                 ClientPacketTrace::LateEcho(echo) => {
                     self.round_trip.record(echo.round_trip);
+                    self.failed_round_trip.record(echo.round_trip);
+                    self.deadline_lateness.record(echo.lateness);
+                    self.client_start_delay.record(echo.client_start_delay);
+                    self.outside_server.record(echo.outside_server);
+                }
+                ClientPacketTrace::ExpiredEcho(echo) => {
                     self.failed_round_trip.record(echo.round_trip);
                     self.deadline_lateness.record(echo.lateness);
                     self.client_start_delay.record(echo.client_start_delay);

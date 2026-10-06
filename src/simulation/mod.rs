@@ -312,7 +312,9 @@ fn pace(
 
 fn classify(error: ClientError) -> FailureReason {
     match error {
-        ClientError::DeadlineExceeded | ClientError::LateEcho(_) => FailureReason::DeadlineExceeded,
+        ClientError::DeadlineExceeded | ClientError::LateEcho(_) | ClientError::ExpiredEcho(_) => {
+            FailureReason::DeadlineExceeded
+        }
         ClientError::Rejected(reason) => FailureReason::ServerRejected(reason),
         ClientError::Wire(_) => FailureReason::Connection,
         ClientError::Protocol(_) => FailureReason::Protocol,
@@ -359,6 +361,14 @@ async fn run_session(
         let outcome = session.infer_audio(payload.clone(), captured_at).await;
         let round_trip = captured_at.elapsed();
         let outcome = match outcome {
+            Ok(audio) if round_trip > session.packet_completion_budget() => {
+                Err(ClientError::ExpiredEcho(Box::new(audio)))
+            }
+            Err(ClientError::LateEcho(audio))
+                if round_trip > session.packet_completion_budget() =>
+            {
+                Err(ClientError::ExpiredEcho(audio))
+            }
             Ok(audio) if round_trip > session.packet_deadline() => {
                 Err(ClientError::LateEcho(Box::new(audio)))
             }
@@ -368,17 +378,32 @@ async fn run_session(
             Ok(audio) => (audio, false),
             Err(ClientError::LateEcho(audio)) => (*audio, true),
             Err(error) => {
-                let reason = classify(error);
-                if metrics
-                    .try_send(ClientPacketTrace::Failure {
-                        session_id,
-                        sequence,
-                        round_trip,
-                        client_start_delay,
-                        reason,
-                    })
-                    .is_err()
-                {
+                let (reason, trace) = match error {
+                    ClientError::ExpiredEcho(audio) => (
+                        FailureReason::DeadlineExceeded,
+                        ClientPacketTrace::ExpiredEcho(ClientEchoTrace::new(
+                            session_id,
+                            &audio,
+                            round_trip,
+                            client_start_delay,
+                            session.packet_deadline(),
+                        )),
+                    ),
+                    error => {
+                        let reason = classify(error);
+                        (
+                            reason,
+                            ClientPacketTrace::Failure {
+                                session_id,
+                                sequence,
+                                round_trip,
+                                client_start_delay,
+                                reason,
+                            },
+                        )
+                    }
+                };
+                if metrics.try_send(trace).is_err() {
                     counters.metric_samples_dropped += 1;
                 }
                 counters.failure(reason);

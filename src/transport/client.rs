@@ -17,6 +17,8 @@ pub enum ClientError {
     DeadlineExceeded,
     #[error("audio echo arrived after its end-to-end packet deadline")]
     LateEcho(Box<AudioResult>),
+    #[error("audio echo arrived beyond its recovery budget")]
+    ExpiredEcho(Box<AudioResult>),
     #[error("server rejected packet: {0:?}")]
     Rejected(FrameRejection),
     #[error("invalid server response: {0}")]
@@ -71,6 +73,9 @@ impl AudioSession {
     }
     pub fn packet_deadline(&self) -> Duration {
         self.admission.packet_deadline
+    }
+    pub fn packet_completion_budget(&self) -> Duration {
+        self.admission.packet_deadline + self.admission.packet_lateness_grace
     }
     pub fn next_sequence(&self) -> PacketSequence {
         PacketSequence(self.prefix.packets)
@@ -139,6 +144,9 @@ impl AudioSession {
                 {
                     return Err(ClientError::EchoMismatch);
                 }
+                if Instant::now() > completion_deadline {
+                    return Err(ClientError::ExpiredEcho(Box::new(audio)));
+                }
                 self.history.0.push(payload);
                 self.prefix = expected;
                 if Instant::now() > deadline {
@@ -170,7 +178,7 @@ impl AudioSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientError, ConnectOutcome, connect_session};
+    use super::{AudioSession, ClientError, ConnectOutcome, connect_session};
     use crate::{
         config::AudioLimits,
         metrics::profile::PacketTimings,
@@ -184,8 +192,9 @@ mod tests {
     use std::time::Duration;
     use tokio::{net::TcpListener, time::Instant};
 
-    #[tokio::test]
-    async fn received_late_echo_preserves_profile_and_advances_audio_history() {
+    async fn delayed_echo(
+        delay: Duration,
+    ) -> (Result<AudioResult, ClientError>, Box<AudioSession>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let assignment = Assignment {
@@ -212,7 +221,7 @@ mod tests {
             let Some(ClientRequest::Audio { packet, .. }) = peer.receive().await.unwrap() else {
                 panic!("expected audio request");
             };
-            tokio::time::advance(Duration::from_millis(60)).await;
+            tokio::time::advance(delay).await;
             peer.send(ServerReply::Audio(AudioResult {
                 assignment,
                 sequence: packet.sequence,
@@ -235,13 +244,20 @@ mod tests {
             panic!("expected admission");
         };
         tokio::time::pause();
-        let error = session
+        let outcome = session
             .exchange_audio(
                 Bytes::from_static(b"audio"),
                 Instant::now() + Duration::from_millis(50),
             )
-            .await
-            .unwrap_err();
+            .await;
+        server.await.unwrap();
+        (outcome, session)
+    }
+
+    #[tokio::test]
+    async fn received_late_echo_preserves_profile_and_advances_audio_history() {
+        let (outcome, session) = delayed_echo(Duration::from_millis(55)).await;
+        let error = outcome.unwrap_err();
         let ClientError::LateEcho(audio) = error else {
             panic!("received late audio must retain its profile");
         };
@@ -249,6 +265,16 @@ mod tests {
         assert_eq!(audio.timings.device_execution, Duration::from_millis(12));
         assert_eq!(session.prefix, PrefixState::default().append(b"audio"));
         assert_eq!(session.history.0, vec![Bytes::from_static(b"audio")]);
-        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn received_echo_beyond_recovery_budget_is_fatal_and_retains_its_profile() {
+        let (outcome, session) = delayed_echo(Duration::from_millis(65)).await;
+        let ClientError::ExpiredEcho(audio) = outcome.unwrap_err() else {
+            panic!("expired echo must not be recoverable");
+        };
+        assert_eq!(audio.timings.device_execution, Duration::from_millis(12));
+        assert_eq!(session.prefix, PrefixState::default());
+        assert!(session.history.0.is_empty());
     }
 }
