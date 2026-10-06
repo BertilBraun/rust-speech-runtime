@@ -99,6 +99,33 @@ pub(crate) async fn run(
     if let Err(error) = result {
         eprintln!("WebSocket connection closed: {error}");
     }
+    close_session_and_archive(&mut connection, archives, &mut report).await;
+    drop(connection.outbound);
+    match writer_task.await {
+        Ok(Ok(())) => {}
+        failure => {
+            report.failed = true;
+            eprintln!("WebSocket writer failed: {failure:?}");
+        }
+    }
+    if connection.application_close_requested
+        && let Err(error) = finish_close_handshake(
+            &mut connection.reader,
+            connection.configuration.write_timeout,
+        )
+        .await
+    {
+        report.failed = true;
+        eprintln!("WebSocket close handshake failed: {error}");
+    }
+    report
+}
+
+async fn close_session_and_archive(
+    connection: &mut Connection,
+    archives: Option<ArchiveSender>,
+    report: &mut ConnectionReport,
+) {
     if let Some(mut session) = connection.session.take() {
         match session.close().await {
             Ok(conversation) => {
@@ -130,25 +157,6 @@ pub(crate) async fn run(
             }
         }
     }
-    drop(connection.outbound);
-    match writer_task.await {
-        Ok(Ok(())) => {}
-        failure => {
-            report.failed = true;
-            eprintln!("WebSocket writer failed: {failure:?}");
-        }
-    }
-    if connection.application_close_requested
-        && let Err(error) = finish_close_handshake(
-            &mut connection.reader,
-            connection.configuration.write_timeout,
-        )
-        .await
-    {
-        report.failed = true;
-        eprintln!("WebSocket close handshake failed: {error}");
-    }
-    report
 }
 
 impl Connection {
