@@ -19,6 +19,7 @@ serde_json = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "fs", "net", "io-util", "io-std", "process"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+tokio-tungstenite = "0.30"
 
 [dev-dependencies]
 tokio = { version = "1.47", features = ["test-util"] }
