@@ -195,6 +195,7 @@ impl Gateway {
         self,
         cancellation: CancellationToken,
     ) -> Result<GatewayReport, GatewayError> {
+        let _connection_cleanup = cancellation.clone().drop_guard();
         let cpu = ProcessCpuMeasurement::start()?;
         let mut tasks: JoinSet<Result<(), GatewayError>> = JoinSet::new();
         let permits = Arc::new(Semaphore::new(self.configuration.maximum_connections));

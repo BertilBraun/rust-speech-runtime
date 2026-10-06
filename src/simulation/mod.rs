@@ -508,6 +508,8 @@ pub async fn run(
     configuration: SimulationConfig,
 ) -> Result<SimulationReport, SimulationError> {
     configuration.validate()?;
+    let cancellation = CancellationToken::new();
+    let _workload_cleanup = cancellation.clone().drop_guard();
     let cpu = crate::metrics::cpu::ProcessCpuMeasurement::start()?;
     let admission_start = Instant::now();
     let mut connections = JoinSet::new();
@@ -539,12 +541,12 @@ pub async fn run(
     let collector = tokio::spawn(PacketMeasurements::default().collect(packet_mailbox));
     for (session_id, session) in admitted {
         let (sender, receiver) = mpsc::channel(CAPTURE_QUEUE_CAPACITY);
-        let cancellation = CancellationToken::new();
+        let session_cancellation = cancellation.child_token();
         let (ready, initialized) = tokio::sync::oneshot::channel();
         readiness.push(initialized);
         slots.push(PacerSlot {
             sender,
-            cancellation: cancellation.clone(),
+            cancellation: session_cancellation.clone(),
         });
         tasks.spawn(run_session(
             session,
@@ -553,7 +555,7 @@ pub async fn run(
             configuration.clone(),
             SessionInput {
                 ticks: receiver,
-                cancellation,
+                cancellation: session_cancellation,
                 ready,
             },
             metrics.clone(),
@@ -565,12 +567,11 @@ pub async fn run(
     }
     let setup_secs = setup_start.elapsed().as_secs_f64();
     let started = Instant::now();
-    let monitor_cancellation = CancellationToken::new();
+    let monitor_cancellation = cancellation.child_token();
     let monitor = monitor_runtime(monitor_cancellation.clone());
     let pacing_configuration = configuration.clone();
-    let pacer = tokio::task::spawn_blocking(move || {
-        pace(slots, pacing_configuration, CancellationToken::new())
-    });
+    let pacer =
+        tokio::task::spawn_blocking(move || pace(slots, pacing_configuration, cancellation));
     while let Some(result) = tasks.join_next().await {
         counters.merge(result?);
     }

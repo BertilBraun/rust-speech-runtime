@@ -40,6 +40,7 @@ impl SessionManager {
         ingress_measurements: Arc<IngressMeasurements>,
     ) -> Result<Self, RuntimeError> {
         let worker_cancellation = CancellationToken::new();
+        let startup_cleanup = worker_cancellation.clone().drop_guard();
         let mut workers = Vec::new();
         let mut ready = Vec::new();
         for index in 0..configuration.workers {
@@ -54,6 +55,7 @@ impl SessionManager {
         for response in ready {
             response.await.map_err(|_| RuntimeError::Stopped)?;
         }
+        startup_cleanup.disarm();
         Ok(Self {
             configuration,
             sessions: HashMap::new(),
@@ -70,7 +72,9 @@ impl SessionManager {
         mut commands: mpsc::Receiver<Command>,
         cancellation: CancellationToken,
     ) -> Result<Report, RuntimeError> {
+        let _worker_cleanup = self.worker_cancellation.clone().drop_guard();
         let monitor_cancellation = CancellationToken::new();
+        let _monitor_cleanup = monitor_cancellation.clone().drop_guard();
         let monitor = monitor_runtime(monitor_cancellation.clone());
         let mut maintenance = tokio::time::interval(
             self.configuration

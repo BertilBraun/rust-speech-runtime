@@ -72,6 +72,9 @@ impl Ingress {
         target: impl Into<SessionTarget>,
         input: InputFrame,
     ) -> Result<InputOutcome, RuntimeError> {
+        if self.cancellation.is_cancelled() {
+            return Err(RuntimeError::Stopped);
+        }
         let target = target.into();
         if input.packet.payload.len() > self.configuration.audio_limits.max_frame_bytes {
             return Err(RuntimeError::InvalidFrame(
@@ -130,6 +133,9 @@ impl Ingress {
         response.await.map_err(|_| RuntimeError::Stopped)
     }
     async fn send_control(&self, command: Command) -> Result<(), RuntimeError> {
+        if self.cancellation.is_cancelled() {
+            return Err(RuntimeError::Stopped);
+        }
         match self.commands.try_send(command) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(command)) => {

@@ -11,6 +11,47 @@ use voice_scheduler::{
     },
 };
 
+#[tokio::test(start_paused = true)]
+async fn dropping_node_cancels_inflight_input_and_stops_control_ingress() {
+    let node = Node::start(RuntimeConfig {
+        inference_latency: Duration::from_millis(100),
+        ..configuration()
+    })
+    .await
+    .unwrap();
+    admit(&node, 1).await;
+    let ingress = node.ingress.clone();
+    let packet_ingress = ingress.clone();
+    let packet = tokio::spawn(async move {
+        packet_ingress
+            .input_frame(
+                SessionId(1),
+                frame(
+                    0,
+                    PrefixState::default(),
+                    Bytes::from_static(b"voice"),
+                    Duration::from_millis(200),
+                ),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!packet.is_finished());
+    drop(node);
+    assert!(matches!(
+        ingress.create_session(SessionId(2)).await,
+        Err(RuntimeError::Stopped)
+    ));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_millis(150), packet)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        InputOutcome::Rejected(FrameRejection::Cancelled)
+    ));
+}
+
 fn configuration() -> RuntimeConfig {
     RuntimeConfig {
         workers: 1,
