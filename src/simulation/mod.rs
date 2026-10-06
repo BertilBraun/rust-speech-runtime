@@ -1,98 +1,29 @@
-use std::{cmp::Reverse, collections::BinaryHeap, net::SocketAddr, time::Duration};
-
-mod measurements;
-mod quality;
-use measurements::PacketMeasurements;
-pub use measurements::{ClientEchoTrace, ClientPacketTrace};
-use quality::PacketQuality;
-pub use quality::PacketQualityPolicy;
-
-const CAPTURE_QUEUE_CAPACITY: usize = 4;
-
-use bytes::Bytes;
-use rand::{Rng, SeedableRng, rngs::SmallRng};
-use serde::{Deserialize, Serialize};
+use crate::{
+    metrics::profile::monitor_runtime,
+    protocol::SessionId,
+    transport::{ConnectOutcome, connect_session},
+};
+use std::net::SocketAddr;
 use tokio::{sync::mpsc, task::JoinSet, time::Instant};
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    metrics::profile::{RuntimeLagReport, monitor_runtime},
-    metrics::{LatencyDistribution, LatencyHistogram},
-    protocol::{CacheOutcome, CreateRejection, FrameRejection, SessionId},
-    transport::{AudioDelivery, AudioSession, ClientError, ConnectOutcome, connect_session},
-};
+mod config;
+mod measurements;
+mod pacing;
+mod quality;
+mod report;
+mod session;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, clap::ValueEnum)]
-pub enum ArrivalPhase {
-    Aligned,
-    Random,
-}
+pub use config::{ArrivalPhase, SimulationConfig};
+use measurements::PacketMeasurements;
+pub use measurements::{ClientEchoTrace, ClientPacketTrace};
+use pacing::{PacerSlot, pace};
+pub use quality::PacketQualityPolicy;
+pub use report::{ClientCounters, FailureCount, FailureReason, SimulationReport};
+use session::{SessionInput, SimulatedSession, classify};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SimulationConfig {
-    pub sessions: usize,
-    pub duration: Duration,
-    pub minimum_interval: Duration,
-    pub maximum_interval: Duration,
-    pub payload_bytes: usize,
-    pub phase: ArrivalPhase,
-    pub seed: u64,
-    pub evict_every: Option<u64>,
-    pub churn_after: Option<Duration>,
-    pub io_timeout: Duration,
-    pub metric_channel_capacity: usize,
-    pub quality: PacketQualityPolicy,
-}
-impl Default for SimulationConfig {
-    fn default() -> Self {
-        Self {
-            sessions: 400,
-            duration: Duration::from_secs(10),
-            minimum_interval: Duration::from_millis(48),
-            maximum_interval: Duration::from_millis(55),
-            payload_bytes: 1600,
-            phase: ArrivalPhase::Random,
-            seed: 42,
-            evict_every: None,
-            churn_after: None,
-            io_timeout: Duration::from_secs(5),
-            metric_channel_capacity: 4096,
-            quality: PacketQualityPolicy::default(),
-        }
-    }
-}
-impl SimulationConfig {
-    pub fn validate(&self) -> Result<(), SimulationError> {
-        if self.sessions == 0
-            || self.sessions > 10_000
-            || self.duration.is_zero()
-            || self.duration > Duration::from_secs(86400)
-            || self.minimum_interval < Duration::from_millis(1)
-            || self.maximum_interval < self.minimum_interval
-            || self.maximum_interval > Duration::from_secs(1)
-            || self.payload_bytes == 0
-            || self.payload_bytes > 4096
-            || self.io_timeout.is_zero()
-            || self.io_timeout > Duration::from_secs(86400)
-            || self.evict_every == Some(0)
-            || self.metric_channel_capacity == 0
-            || self.metric_channel_capacity > 1_000_000
-            || self.quality.window_packets == 0
-            || self.quality.window_packets > 10_000
-            || self.quality.miss_limit == 0
-            || self.quality.miss_limit > self.quality.window_packets
-            || self
-                .churn_after
-                .is_some_and(|duration| duration.is_zero() || duration > Duration::from_secs(86400))
-        {
-            return Err(SimulationError::Configuration(
-                "invalid bounded workload configuration",
-            ));
-        }
-        Ok(())
-    }
-}
+const CAPTURE_QUEUE_CAPACITY: usize = 4;
+
 #[derive(Debug, thiserror::Error)]
 pub enum SimulationError {
     #[error("session task exited before the workload was ready: {0}")]
@@ -104,405 +35,6 @@ pub enum SimulationError {
     #[error(transparent)]
     Task(#[from] tokio::task::JoinError),
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum FailureReason {
-    DeadlineExceeded,
-    ServerRejected(FrameRejection),
-    Connection,
-    PrefixCapacity,
-    InvalidEcho,
-    Protocol,
-    GeneratorOverrun,
-    DeadlineMissBurst,
-}
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FailureCount {
-    pub reason: FailureReason,
-    pub count: u64,
-}
-#[derive(Default, Debug, Serialize, Deserialize)]
-pub struct ClientCounters {
-    pub admitted_sessions: u64,
-    pub rejected_capacity: u64,
-    pub rejected_duplicate: u64,
-    pub closed_sessions: u64,
-    pub failed_sessions: u64,
-    pub attempted_frames: u64,
-    pub echoed_frames: u64,
-    pub late_frames: u64,
-    pub discarded_output_frames: u64,
-    pub unrecovered_deadline_frames: u64,
-    pub quality_failed_sessions: u64,
-    pub maximum_consecutive_misses: u64,
-    pub maximum_window_misses: u64,
-    pub cache_hits: u64,
-    pub replayed_frames: u64,
-    pub replayed_packets: u64,
-    pub replayed_bytes: u64,
-    pub metric_samples_dropped: u64,
-    pub failures: Vec<FailureCount>,
-}
-impl ClientCounters {
-    fn failure(&mut self, reason: FailureReason) {
-        self.failed_sessions += 1;
-        if matches!(
-            reason,
-            FailureReason::DeadlineExceeded
-                | FailureReason::ServerRejected(FrameRejection::DeadlineExceeded)
-        ) {
-            self.unrecovered_deadline_frames += 1;
-        }
-        if let Some(entry) = self
-            .failures
-            .iter_mut()
-            .find(|entry| entry.reason == reason)
-        {
-            entry.count += 1;
-        } else {
-            self.failures.push(FailureCount { reason, count: 1 });
-        }
-    }
-    fn merge(&mut self, other: Self) {
-        self.admitted_sessions += other.admitted_sessions;
-        self.rejected_capacity += other.rejected_capacity;
-        self.rejected_duplicate += other.rejected_duplicate;
-        self.closed_sessions += other.closed_sessions;
-        self.failed_sessions += other.failed_sessions;
-        self.attempted_frames += other.attempted_frames;
-        self.echoed_frames += other.echoed_frames;
-        self.late_frames += other.late_frames;
-        self.discarded_output_frames += other.discarded_output_frames;
-        self.unrecovered_deadline_frames += other.unrecovered_deadline_frames;
-        self.quality_failed_sessions += other.quality_failed_sessions;
-        self.maximum_consecutive_misses = self
-            .maximum_consecutive_misses
-            .max(other.maximum_consecutive_misses);
-        self.maximum_window_misses = self.maximum_window_misses.max(other.maximum_window_misses);
-        self.cache_hits += other.cache_hits;
-        self.replayed_frames += other.replayed_frames;
-        self.replayed_packets += other.replayed_packets;
-        self.replayed_bytes += other.replayed_bytes;
-        self.metric_samples_dropped += other.metric_samples_dropped;
-        for failure in other.failures {
-            if let Some(entry) = self
-                .failures
-                .iter_mut()
-                .find(|entry| entry.reason == failure.reason)
-            {
-                entry.count += failure.count;
-            } else {
-                self.failures.push(failure);
-            }
-        }
-    }
-    fn admission(&mut self, reason: CreateRejection) {
-        match reason {
-            CreateRejection::Capacity => self.rejected_capacity += 1,
-            CreateRejection::AlreadyExists => self.rejected_duplicate += 1,
-        }
-    }
-}
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SimulationReport {
-    pub process_cpu: crate::metrics::cpu::CpuUsage,
-    pub configuration: SimulationConfig,
-    pub elapsed_secs: f64,
-    pub admission_secs: f64,
-    pub setup_secs: f64,
-    pub counters: ClientCounters,
-    pub throughput_frames_per_sec: f64,
-    pub round_trip_latency: LatencyDistribution,
-    pub failed_round_trip_latency: LatencyDistribution,
-    pub deadline_lateness: LatencyDistribution,
-    pub generator_delay: LatencyDistribution,
-    pub generated_intervals: LatencyDistribution,
-    pub generator_overruns: u64,
-    pub client_start_delay: LatencyDistribution,
-    pub outside_server_latency: LatencyDistribution,
-    pub runtime_lag: RuntimeLagReport,
-    pub slowest_packets: Vec<ClientPacketTrace>,
-}
-struct PacerSlot {
-    sender: mpsc::Sender<Instant>,
-    cancellation: CancellationToken,
-}
-struct SessionInput {
-    ticks: mpsc::Receiver<Instant>,
-    cancellation: CancellationToken,
-    ready: tokio::sync::oneshot::Sender<()>,
-}
-#[derive(Default)]
-struct PacerMeasurements {
-    delay: LatencyHistogram,
-    intervals: LatencyHistogram,
-    overruns: u64,
-}
-
-fn pace(
-    slots: Vec<PacerSlot>,
-    configuration: SimulationConfig,
-    cancellation: CancellationToken,
-) -> PacerMeasurements {
-    let mut random = SmallRng::seed_from_u64(configuration.seed);
-    let mut events = BinaryHeap::new();
-    let start = std::time::Instant::now();
-    let stop = start + configuration.duration;
-    for index in 0..slots.len() {
-        let offset = match configuration.phase {
-            ArrivalPhase::Aligned => Duration::ZERO,
-            ArrivalPhase::Random => Duration::from_micros(
-                random.random_range(0..configuration.maximum_interval.as_micros() as u64),
-            ),
-        };
-        events.push(Reverse((start + offset, index)));
-    }
-    let mut measurements = PacerMeasurements::default();
-    let mut last_captures = vec![None; slots.len()];
-    let mut capture_group = Vec::with_capacity(slots.len());
-    while let Some(Reverse((scheduled, index))) = events.pop() {
-        if scheduled >= stop || cancellation.is_cancelled() {
-            break;
-        }
-        capture_group.clear();
-        capture_group.push(index);
-        while events
-            .peek()
-            .is_some_and(|Reverse((time, _))| *time == scheduled)
-        {
-            let Reverse((_, index)) = events.pop().expect("matching capture exists");
-            capture_group.push(index);
-        }
-        let remaining = scheduled.saturating_duration_since(std::time::Instant::now());
-        if !remaining.is_zero() {
-            std::thread::sleep(remaining);
-        }
-        let captured = std::time::Instant::now();
-        if captured >= stop {
-            break;
-        }
-        for &index in &capture_group {
-            let slot = &slots[index];
-            if slot.cancellation.is_cancelled() {
-                continue;
-            }
-            measurements
-                .delay
-                .record(captured.saturating_duration_since(scheduled));
-            match slot.sender.try_send(Instant::from_std(captured)) {
-                Ok(()) => {
-                    if let Some(previous) = last_captures[index] {
-                        measurements
-                            .intervals
-                            .record(captured.duration_since(previous));
-                    }
-                    last_captures[index] = Some(captured);
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => continue,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    measurements.overruns += 1;
-                    slot.cancellation.cancel();
-                    continue;
-                }
-            }
-            let interval = Duration::from_micros(random.random_range(
-                configuration.minimum_interval.as_micros() as u64
-                    ..=configuration.maximum_interval.as_micros() as u64,
-            ));
-            events.push(Reverse((captured + interval, index)));
-        }
-    }
-    measurements
-}
-
-fn classify(error: ClientError) -> FailureReason {
-    match error {
-        ClientError::DeadlineExceeded | ClientError::RecoveryExceeded(_) => {
-            FailureReason::DeadlineExceeded
-        }
-        ClientError::Rejected(reason) => FailureReason::ServerRejected(reason),
-        ClientError::Wire(_) => FailureReason::Connection,
-        ClientError::Protocol(_) => FailureReason::Protocol,
-        ClientError::PrefixCapacity => FailureReason::PrefixCapacity,
-        ClientError::EchoMismatch => FailureReason::InvalidEcho,
-    }
-}
-async fn run_session(
-    mut session: Box<AudioSession>,
-    session_id: SessionId,
-    address: SocketAddr,
-    configuration: SimulationConfig,
-    input: SessionInput,
-    metrics: mpsc::Sender<ClientPacketTrace>,
-) -> ClientCounters {
-    let SessionInput {
-        mut ticks,
-        cancellation,
-        ready,
-    } = input;
-    let mut counters = ClientCounters {
-        admitted_sessions: 1,
-        ..ClientCounters::default()
-    };
-    let payload = Bytes::from(vec![42; configuration.payload_bytes]);
-    let mut random = SmallRng::seed_from_u64(configuration.seed.wrapping_add(session_id.0));
-    let mut created = Instant::now();
-    let mut lifetime = configuration
-        .churn_after
-        .map(|duration| duration.mul_f64(random.random_range(0.5..=1.0)));
-    let _ = ready.send(());
-    let mut quality = PacketQuality::new(configuration.quality);
-    loop {
-        let captured_at = tokio::select! {
-            _ = cancellation.cancelled() => {
-                counters.failure(FailureReason::GeneratorOverrun);
-                return counters;
-            }
-            tick = ticks.recv() => match tick { Some(tick) => tick, None => break },
-        };
-        counters.attempted_frames += 1;
-        let sequence = session.next_sequence();
-        let client_start_delay = captured_at.elapsed();
-        let outcome = session.infer_audio(payload.clone(), captured_at).await;
-        let round_trip = captured_at.elapsed();
-        let outcome =
-            outcome.and_then(|delivery| session.classify_echo(delivery.into_audio(), round_trip));
-        let delivery = match outcome {
-            Ok(delivery) => delivery,
-            Err(error) => {
-                let (reason, trace) = match error {
-                    ClientError::RecoveryExceeded(audio) => (
-                        FailureReason::DeadlineExceeded,
-                        ClientPacketTrace::UnrecoveredEcho(ClientEchoTrace::new(
-                            session_id,
-                            &audio,
-                            round_trip,
-                            client_start_delay,
-                            session.packet_deadline(),
-                        )),
-                    ),
-                    error => {
-                        let reason = classify(error);
-                        (
-                            reason,
-                            ClientPacketTrace::Failure {
-                                session_id,
-                                sequence,
-                                round_trip,
-                                client_start_delay,
-                                reason,
-                            },
-                        )
-                    }
-                };
-                if metrics.try_send(trace).is_err() {
-                    counters.metric_samples_dropped += 1;
-                }
-                counters.failure(reason);
-                return counters;
-            }
-        };
-        {
-            let late = !matches!(delivery, AudioDelivery::OnTime(_));
-            let discarded = matches!(delivery, AudioDelivery::Discarded(_));
-            let audio = delivery.into_audio();
-            let trace = ClientEchoTrace::new(
-                session_id,
-                &audio,
-                round_trip,
-                client_start_delay,
-                session.packet_deadline(),
-            );
-            let trace = if discarded {
-                counters.discarded_output_frames += 1;
-                ClientPacketTrace::ExpiredEcho(trace)
-            } else if late {
-                ClientPacketTrace::LateEcho(trace)
-            } else {
-                ClientPacketTrace::Echo(trace)
-            };
-            if metrics.try_send(trace).is_err() {
-                counters.metric_samples_dropped += 1;
-            }
-            counters.echoed_frames += 1;
-            counters.late_frames += u64::from(late);
-            let burst = quality.observe(late);
-            counters.maximum_consecutive_misses = counters
-                .maximum_consecutive_misses
-                .max(quality.consecutive_misses);
-            counters.maximum_window_misses =
-                counters.maximum_window_misses.max(quality.window_misses);
-            match audio.cache {
-                CacheOutcome::Hit => counters.cache_hits += 1,
-                CacheOutcome::Replayed { packets, bytes } => {
-                    counters.replayed_frames += 1;
-                    counters.replayed_packets += packets;
-                    counters.replayed_bytes += bytes;
-                }
-            }
-            if burst {
-                counters.quality_failed_sessions += 1;
-                counters.failure(FailureReason::DeadlineMissBurst);
-                if matches!(
-                    tokio::time::timeout(configuration.io_timeout, session.close()).await,
-                    Ok(Ok(_))
-                ) {
-                    counters.closed_sessions += 1;
-                }
-                return counters;
-            }
-            if configuration
-                .evict_every
-                .is_some_and(|period| (audio.sequence.0 + 1) % period == 0)
-            {
-                match tokio::time::timeout(configuration.io_timeout, session.evict_cache()).await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => {
-                        counters.failure(classify(error));
-                        return counters;
-                    }
-                    Err(_) => {
-                        counters.failure(FailureReason::Connection);
-                        return counters;
-                    }
-                }
-            }
-        }
-        if lifetime.is_some_and(|duration| created.elapsed() >= duration) {
-            match tokio::time::timeout(configuration.io_timeout, session.close()).await {
-                Ok(Ok(_)) => counters.closed_sessions += 1,
-                _ => {
-                    counters.failure(FailureReason::Connection);
-                    return counters;
-                }
-            }
-            match connect_session(address, session_id, configuration.io_timeout).await {
-                Ok(ConnectOutcome::Admitted(new_session)) => {
-                    session = new_session;
-                    counters.admitted_sessions += 1;
-                    quality = PacketQuality::new(configuration.quality);
-                }
-                Ok(ConnectOutcome::Rejected(reason)) => {
-                    counters.admission(reason);
-                    return counters;
-                }
-                Err(error) => {
-                    counters.failure(classify(error));
-                    return counters;
-                }
-            }
-            created = Instant::now();
-            lifetime = configuration
-                .churn_after
-                .map(|duration| duration.mul_f64(random.random_range(0.5..=1.0)));
-        }
-    }
-    match tokio::time::timeout(configuration.io_timeout, session.close()).await {
-        Ok(Ok(_)) => counters.closed_sessions += 1,
-        _ => counters.failure(FailureReason::Connection),
-    }
-    counters
-}
-
 pub async fn run(
     address: SocketAddr,
     configuration: SimulationConfig,
@@ -548,18 +80,18 @@ pub async fn run(
             sender,
             cancellation: session_cancellation.clone(),
         });
-        tasks.spawn(run_session(
+        let workload = SimulatedSession::new(
             session,
             session_id,
             address,
             configuration.clone(),
-            SessionInput {
-                ticks: receiver,
-                cancellation: session_cancellation,
-                ready,
-            },
             metrics.clone(),
-        ));
+        );
+        tasks.spawn(workload.run(SessionInput {
+            ticks: receiver,
+            cancellation: session_cancellation,
+            ready,
+        }));
     }
     drop(metrics);
     for initialized in readiness {
@@ -599,48 +131,4 @@ pub async fn run(
         slowest_packets: totals.slowest_packets,
         runtime_lag,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ArrivalPhase, PacerSlot, SimulationConfig, pace};
-    use std::time::Duration;
-    use tokio::sync::mpsc;
-    use tokio_util::sync::CancellationToken;
-
-    #[tokio::test]
-    async fn aligned_capture_waves_keep_identical_timestamps_across_sessions() {
-        let mut slots = Vec::new();
-        let mut captures = Vec::new();
-        for _ in 0..4 {
-            let (sender, receiver) = mpsc::channel(16);
-            slots.push(PacerSlot {
-                sender,
-                cancellation: CancellationToken::new(),
-            });
-            captures.push(receiver);
-        }
-        let measurements = tokio::task::spawn_blocking(move || {
-            pace(
-                slots,
-                SimulationConfig {
-                    phase: ArrivalPhase::Aligned,
-                    minimum_interval: Duration::from_millis(20),
-                    maximum_interval: Duration::from_millis(20),
-                    duration: Duration::from_millis(100),
-                    ..SimulationConfig::default()
-                },
-                CancellationToken::new(),
-            )
-        })
-        .await
-        .unwrap();
-        let waves: Vec<Vec<_>> = captures
-            .iter_mut()
-            .map(|receiver| std::iter::from_fn(|| receiver.try_recv().ok()).collect())
-            .collect();
-        assert!(waves[0].len() >= 2);
-        assert!(waves.iter().all(|wave| *wave == waves[0]));
-        assert_eq!(measurements.overruns, 0);
-    }
 }
