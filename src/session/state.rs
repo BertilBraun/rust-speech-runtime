@@ -4,13 +4,7 @@ use crate::{
     },
     runtime::RuntimeError,
 };
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::time::Duration;
 use tokio::{sync::mpsc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -31,7 +25,7 @@ pub(crate) struct SessionState {
     pub record: SessionRecord,
     pub events: mpsc::Sender<SessionEvent>,
     pub cancellation: CancellationToken,
-    pub fence: Arc<AtomicU64>,
+    pub generation: u64,
     pub stage: Stage,
     pub opened: bool,
     pub closing: bool,
@@ -52,7 +46,6 @@ impl SessionState {
         model_id: String,
         events: mpsc::Sender<SessionEvent>,
         cancellation: CancellationToken,
-        fence: Arc<AtomicU64>,
     ) -> Self {
         Self {
             record: SessionRecord {
@@ -63,7 +56,7 @@ impl SessionState {
             },
             events,
             cancellation,
-            fence,
+            generation: 0,
             stage: Stage::Idle,
             opened: false,
             closing: false,
@@ -82,7 +75,7 @@ impl SessionState {
         !self.closing && !matches!(self.stage, Stage::Idle)
     }
     pub fn generation(&self) -> u64 {
-        self.fence.load(Ordering::Acquire)
+        self.generation
     }
     pub fn turn(&self) -> Option<&TurnRecord> {
         self.record.turns.last()
@@ -94,7 +87,7 @@ impl SessionState {
         if self.active() {
             self.finish(FinishReason::Cancelled);
         }
-        self.fence.store(next_generation, Ordering::Release);
+        self.generation = next_generation;
     }
     pub fn finish(&mut self, reason: FinishReason) {
         let generation = self.generation();
@@ -106,7 +99,11 @@ impl SessionState {
                 reason,
                 generated_tokens: turn.tokens.len(),
             };
-            let _ = self.events.try_send(event);
+            if self.events.try_send(event).is_err() {
+                self.turn_mut().expect("finished turn").finish_reason =
+                    Some(FinishReason::SlowConsumer);
+                self.cancellation.cancel();
+            }
         }
         self.stage = Stage::Idle;
     }

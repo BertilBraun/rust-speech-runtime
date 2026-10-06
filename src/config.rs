@@ -8,6 +8,22 @@ pub struct WorkerConfig {
     pub endpoint: SocketAddr,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn invalid_token_intervals_fail_at_configuration_boundary() {
+        for rate in [f64::NAN, f64::INFINITY, 0.0, -1.0, 1e-300, 1e300] {
+            let configuration = RuntimeConfig {
+                target_tokens_per_second: rate,
+                ..RuntimeConfig::default()
+            };
+            assert!(configuration.validate().is_err(), "rate {rate}");
+        }
+        assert!(RuntimeConfig::default().validate().is_ok());
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
@@ -89,6 +105,13 @@ impl RuntimeConfig {
             || self.backend_timeout_ms == 0
         {
             return Err(ConfigError("invalid throughput, timing or headroom".into()));
+        }
+        let interval = std::time::Duration::try_from_secs_f64(1.0 / self.target_tokens_per_second)
+            .map_err(|_| ConfigError("token interval exceeds representable duration".into()))?;
+        if interval.is_zero() {
+            return Err(ConfigError(
+                "token interval must be a nonzero representable duration".into(),
+            ));
         }
         if self.max_active_turns_per_worker > self.max_sessions_per_worker {
             return Err(ConfigError(

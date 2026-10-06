@@ -13,7 +13,6 @@ impl WorkerActor {
                 key,
                 session_id,
                 events,
-                generation,
                 cancellation,
                 reply,
             } => {
@@ -31,7 +30,6 @@ impl WorkerActor {
                         self.ready.model_id.clone(),
                         events,
                         cancellation,
-                        generation,
                     );
                     session.open_reply = Some(reply);
                     self.sessions.insert(key, session);
@@ -107,12 +105,24 @@ impl WorkerActor {
         }
     }
     fn session(&mut self, key: &str) -> Result<&mut SessionState, RuntimeError> {
+        if !self.available.load(Ordering::Acquire) {
+            return Err(error(
+                ErrorCode::BackendUnavailable,
+                "worker connection failed",
+            ));
+        }
         self.sessions
             .get_mut(key)
             .filter(|session| !session.closing)
             .ok_or_else(|| error(ErrorCode::SessionNotFound, "session unavailable"))
     }
     fn begin(&mut self, key: &str, turn_id: TurnId) -> Result<(), RuntimeError> {
+        if !self.available.load(Ordering::Acquire) {
+            return Err(error(
+                ErrorCode::BackendUnavailable,
+                "worker connection failed",
+            ));
+        }
         let active = self
             .sessions
             .values()
@@ -134,14 +144,23 @@ impl WorkerActor {
             ));
         }
         let reserved = active + usize::from(!previous.active());
+        let context = self
+            .sessions
+            .values()
+            .filter(|session| session.active())
+            .map(|session| session.context_tokens)
+            .chain(std::iter::once(previous.context_tokens))
+            .max()
+            .unwrap_or(0);
         if reserved > self.config.max_active_turns_per_worker
-            || !self.costs.admits(
-                reserved,
-                self.config.max_batch_size.min(self.ready.max_batch_size),
-                previous.context_tokens,
-                1000.0 / self.config.target_tokens_per_second,
-                self.config.admission_headroom,
-            )
+            || (!previous.active()
+                && !self.costs.admits(
+                    reserved,
+                    self.config.max_batch_size.min(self.ready.max_batch_size),
+                    context,
+                    1000.0 / self.config.target_tokens_per_second,
+                    self.config.admission_headroom,
+                ))
         {
             return Err(error(
                 ErrorCode::CapacityExceeded,

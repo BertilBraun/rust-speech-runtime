@@ -154,7 +154,6 @@ pub struct SessionHandle {
     pub(crate) worker_id: usize,
     pub(crate) worker: WorkerHandle,
     pub(crate) events: mpsc::Receiver<SessionEvent>,
-    pub(crate) generation: Arc<AtomicU64>,
     pub(crate) cancellation: CancellationToken,
     pub(crate) manager: mpsc::Sender<ManagerCommand>,
     pub(crate) session_id: SessionId,
@@ -162,12 +161,6 @@ pub struct SessionHandle {
 impl SessionHandle {
     pub fn worker_id(&self) -> usize {
         self.worker_id
-    }
-    pub fn current_generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
-    }
-    pub fn generation_fence(&self) -> Arc<AtomicU64> {
-        self.generation.clone()
     }
     pub async fn begin_turn(&self, turn_id: TurnId) -> Result<(), RuntimeError> {
         self.request(|reply| Command::Begin {

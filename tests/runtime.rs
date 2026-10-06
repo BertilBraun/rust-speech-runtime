@@ -28,6 +28,12 @@ struct Fixture {
 }
 impl Fixture {
     async fn start(delay_ms: u64) -> Self {
+        Self::limited(delay_ms, usize::MAX).await
+    }
+    async fn limited(delay_ms: u64, maximum_sessions: usize) -> Self {
+        Self::configured(delay_ms, maximum_sessions, false).await
+    }
+    async fn configured(delay_ms: u64, maximum_sessions: usize, fail_decode: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = listener.local_addr().unwrap();
         let operations = Arc::new(Mutex::new(Vec::new()));
@@ -67,8 +73,19 @@ impl Fixture {
                     let session_id = operation.session_id().to_string();
                     let (turn_id, generation, outcome) = match operation {
                         Operation::Open { .. } => {
-                            contexts.insert(session_id.clone(), 0);
-                            (None, None, Outcome::Opened)
+                            if contexts.len() >= maximum_sessions {
+                                (
+                                    None,
+                                    None,
+                                    Outcome::Failed {
+                                        code: ErrorCode::CapacityExceeded,
+                                        message: "fixture cache full".into(),
+                                    },
+                                )
+                            } else {
+                                contexts.insert(session_id.clone(), 0);
+                                (None, None, Outcome::Opened)
+                            }
                         }
                         Operation::Close { .. } => {
                             contexts.remove(&session_id);
@@ -101,22 +118,34 @@ impl Fixture {
                             accepted,
                             ..
                         } => {
-                            let context = contexts.get_mut(&session_id).unwrap();
-                            *context += 1;
-                            (
-                                Some(turn_id),
-                                Some(generation),
-                                Outcome::Token {
-                                    token_id: 101 + accepted.index as u32,
-                                    text_delta: if accepted.index >= 3 {
-                                        String::new()
-                                    } else {
-                                        "b".into()
+                            if fail_decode {
+                                (
+                                    Some(turn_id),
+                                    Some(generation),
+                                    Outcome::Failed {
+                                        code: ErrorCode::CapacityExceeded,
+                                        message: "fixture rejected decode before consuming token"
+                                            .into(),
                                     },
-                                    eos: accepted.index >= 3,
-                                    context_tokens: *context,
-                                },
-                            )
+                                )
+                            } else {
+                                let context = contexts.get_mut(&session_id).unwrap();
+                                *context += 1;
+                                (
+                                    Some(turn_id),
+                                    Some(generation),
+                                    Outcome::Token {
+                                        token_id: 101 + accepted.index as u32,
+                                        text_delta: if accepted.index >= 3 {
+                                            String::new()
+                                        } else {
+                                            "b".into()
+                                        },
+                                        eos: accepted.index >= 3,
+                                        context_tokens: *context,
+                                    },
+                                )
+                            }
                         }
                     };
                     results.push(OperationResult {
@@ -505,5 +534,159 @@ async fn stalled_consumer_stops_generation_and_retains_record_for_explicit_archi
     );
     assert!(record.turns[0].tokens.is_empty());
     assert!(node.metrics().channel_saturation_events > 0);
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn backend_cache_rejection_isolated_from_existing_session() {
+    let backend = Fixture::limited(0, 1).await;
+    let node = Node::start(backend.config()).await.unwrap();
+    let mut existing = node
+        .ingress()
+        .open_session(SessionId("existing".into()))
+        .await
+        .unwrap();
+    let rejected = node
+        .ingress()
+        .open_session(SessionId("rejected".into()))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(rejected.code(), ErrorCode::CapacityExceeded);
+    assert_eq!(node.metrics().active_sessions, 1);
+    start_turn(&existing, 1).await;
+    assert_eq!(finish_turn(&mut existing).await, 5);
+    existing.close().await.unwrap();
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn backend_disconnect_retains_accepted_history_for_archive() {
+    let backend = Fixture::start(25).await;
+    let node = Node::start(backend.config()).await.unwrap();
+    let mut session = node
+        .ingress()
+        .open_session(SessionId("disconnect".into()))
+        .await
+        .unwrap();
+    start_turn(&session, 1).await;
+    loop {
+        if matches!(
+            session.next_event().await,
+            Some(SessionEvent::TextDelta { .. })
+        ) {
+            break;
+        }
+    }
+    backend.task.abort();
+    loop {
+        if matches!(
+            tokio::time::timeout(Duration::from_secs(2), session.next_event())
+                .await
+                .unwrap(),
+            Some(SessionEvent::Failed { .. })
+        ) {
+            break;
+        }
+    }
+    assert_eq!(
+        session.begin_turn(TurnId(2)).await.unwrap_err().code(),
+        ErrorCode::BackendUnavailable
+    );
+    let record = session.close().await.unwrap();
+    assert!(!record.turns[0].tokens.is_empty());
+    assert_eq!(
+        record.turns[0].finish_reason,
+        Some(FinishReason::BackendFailed)
+    );
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn slowdown_exposes_token_gaps_and_rejects_new_turn_reservations() {
+    let backend = Fixture::start(300).await;
+    let node = Node::start(backend.config()).await.unwrap();
+    let mut generating = node
+        .ingress()
+        .open_session(SessionId("generating".into()))
+        .await
+        .unwrap();
+    let mut waiting = node
+        .ingress()
+        .open_session(SessionId("waiting".into()))
+        .await
+        .unwrap();
+    start_turn(&generating, 1).await;
+    assert_eq!(finish_turn(&mut generating).await, 5);
+    assert!(node.metrics().token_deadline_misses >= 1);
+    assert!(node.metrics().token_gap.p50_ms > 250.0);
+    assert_eq!(
+        waiting.begin_turn(TurnId(1)).await.unwrap_err().code(),
+        ErrorCode::CapacityExceeded
+    );
+    generating.close().await.unwrap();
+    waiting.close().await.unwrap();
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn closed_handle_rejects_future_commands_and_duplicate_commit_metadata_changes() {
+    let backend = Fixture::start(0).await;
+    let node = Node::start(backend.config()).await.unwrap();
+    let mut session = node
+        .ingress()
+        .open_session(SessionId("closed".into()))
+        .await
+        .unwrap();
+    start_turn(&session, 1).await;
+    assert_eq!(
+        session.commit(TurnId(1), 2, 800).await.unwrap_err().code(),
+        ErrorCode::InvalidInput
+    );
+    session.cancel(TurnId(1)).await.unwrap();
+    let record = session.close().await.unwrap();
+    assert_eq!(record.turns[0].finish_reason, Some(FinishReason::Cancelled));
+    assert_eq!(
+        session.close().await.unwrap_err().code(),
+        ErrorCode::SessionNotFound
+    );
+    assert_eq!(
+        session.begin_turn(TurnId(2)).await.unwrap_err().code(),
+        ErrorCode::SessionNotFound
+    );
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_decode_makes_cache_terminal_without_losing_accepted_record() {
+    let backend = Fixture::configured(0, 64, true).await;
+    let node = Node::start(backend.config()).await.unwrap();
+    let mut session = node
+        .ingress()
+        .open_session(SessionId("failed-decode".into()))
+        .await
+        .unwrap();
+    start_turn(&session, 1).await;
+    loop {
+        if matches!(
+            session.next_event().await,
+            Some(SessionEvent::Failed {
+                code: ErrorCode::CapacityExceeded,
+                ..
+            })
+        ) {
+            break;
+        }
+    }
+    assert_eq!(
+        session.begin_turn(TurnId(2)).await.unwrap_err().code(),
+        ErrorCode::SessionNotFound
+    );
+    let record = session.close().await.unwrap();
+    assert_eq!(record.turns[0].tokens.len(), 1);
+    assert_eq!(
+        record.turns[0].finish_reason,
+        Some(FinishReason::BackendFailed)
+    );
     node.shutdown().await.unwrap();
 }

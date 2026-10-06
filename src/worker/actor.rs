@@ -92,10 +92,22 @@ impl WorkerActor {
         let mut reap = tokio::time::interval(Duration::from_millis(50));
         loop {
             tokio::select! {
-                _ = cancellation.cancelled()=>break,
-                command = commands.recv()=>match command {Some(command)=>self.command(command),None=>break},
-                result = results.recv(),if self.active.is_some()=>match result {Some(completion)=>{if let Err(error)=self.complete(completion){self.fail(error);}},None=>{self.fail(RuntimeError::new(ErrorCode::BackendUnavailable,"execution task stopped"));}},
-                _ = reap.tick()=>self.reap(),
+                _ = cancellation.cancelled() => break,
+                command = commands.recv() => {
+                    match command {
+                        Some(command) => self.command(command),
+                        None => break,
+                    }
+                }
+                result = results.recv(), if self.active.is_some() => {
+                    match result {
+                        Some(completion) => {
+                            if let Err(error) = self.complete(completion) {self.fail(error);}
+                        }
+                        None => self.fail(RuntimeError::new(ErrorCode::BackendUnavailable,"execution task stopped")),
+                    }
+                }
+                _ = reap.tick() => self.reap(),
             }
             if self.available.load(Ordering::Acquire)
                 && self.active.is_none()
@@ -199,9 +211,19 @@ async fn run_backend(
     cancellation: CancellationToken,
 ) {
     loop {
-        let job = tokio::select! {_=cancellation.cancelled()=>break,job=jobs.recv()=>match job{Some(job)=>job,None=>break}};
+        let job = tokio::select! {
+            _ = cancellation.cancelled() => break,
+            job = jobs.recv() => {
+                match job {Some(job) => job, None => break}
+            }
+        };
         let started = Instant::now();
-        let response = tokio::select! {_=cancellation.cancelled()=>break,result=tokio::time::timeout(timeout,connection.execute(&job.request,&job.audio))=>result.unwrap_or_else(|_|Err(RuntimeError::new(ErrorCode::BackendUnavailable,"worker execution timeout")))};
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => break,
+            result = tokio::time::timeout(timeout, connection.execute(&job.request, &job.audio)) => {
+                result.unwrap_or_else(|_| Err(RuntimeError::new(ErrorCode::BackendUnavailable, "worker execution timeout")))
+            }
+        };
         let failed = response.is_err();
         if results
             .send(Completion {

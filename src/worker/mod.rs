@@ -1,7 +1,9 @@
 mod actor;
 mod backend;
+mod batch;
 mod commands;
-mod execution;
+mod completion;
+mod output;
 
 use crate::{
     config::{RuntimeConfig, WorkerConfig},
@@ -25,7 +27,6 @@ pub(crate) enum Command {
         key: String,
         session_id: SessionId,
         events: mpsc::Sender<SessionEvent>,
-        generation: Arc<AtomicU64>,
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
@@ -57,6 +58,40 @@ pub(crate) enum Command {
         key: String,
         reply: Option<oneshot::Sender<Result<SessionRecord, RuntimeError>>>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn bounded_worker_mailbox_rejects_without_allocating_more_queue_slots() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let metrics = Arc::new(Metrics::default());
+        let worker = WorkerHandle {
+            id: 0,
+            sender,
+            load: Arc::new(AtomicUsize::new(0)),
+            available: Arc::new(AtomicBool::new(true)),
+            metrics: metrics.clone(),
+        };
+        worker
+            .send(Command::Close {
+                key: "first".into(),
+                reply: None,
+            })
+            .unwrap();
+        assert_eq!(
+            worker
+                .send(Command::Close {
+                    key: "second".into(),
+                    reply: None
+                })
+                .unwrap_err()
+                .code(),
+            ErrorCode::ChannelSaturated
+        );
+        assert_eq!(metrics.snapshot().channel_saturation_events, 1);
+    }
 }
 #[derive(Clone)]
 pub(crate) struct WorkerHandle {

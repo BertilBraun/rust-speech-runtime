@@ -147,10 +147,26 @@ pub(crate) fn select_batch(
     decode.sort();
     prefill.sort();
     let choose_prefill = if let Some((_, key)) = prefill.first() {
-        let context = sessions[key].context_tokens;
+        let session = &sessions[key];
+        let audio_tokens = session
+            .turn()
+            .expect("prefill turn")
+            .audio_pcm16
+            .len()
+            .div_ceil(3200);
+        let context = session.context_tokens.saturating_add(audio_tokens + 32);
         let predicted_prefill = costs.estimate(BatchKind::Prefill, 1, context);
-        let predicted_decode =
-            costs.estimate(BatchKind::Decode, decode.len().min(maximum).max(1), context);
+        let decode_context = decode
+            .iter()
+            .take(maximum)
+            .map(|(_, key)| sessions[key].context_tokens)
+            .max()
+            .unwrap_or(0);
+        let predicted_decode = costs.estimate(
+            BatchKind::Decode,
+            decode.len().min(maximum).max(1),
+            decode_context,
+        );
         let available = decode
             .first()
             .map(|(deadline, _)| {
