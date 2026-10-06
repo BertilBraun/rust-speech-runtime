@@ -42,6 +42,8 @@ The random five-minute run used about 0.229 gateway CPU cores and 0.326 simulato
 
 Revision `44471d3` closes a final admission gap: current configured device cost is a lower bound on admission and published capacity estimates, including host slack, before the first slower result arrives. Steady fixed-12-ms service uses the same cost as in the table. All 57 tests pass on Windows and WSL. `cargo test --locked`, `cargo clippy --all-targets --locked -- -D warnings` and `cargo fmt --check` pass on Windows; Linux uses the same locked dependencies and passes `cargo test --locked`.
 
+Both release binaries were rebuilt after this fix. A ten-second Windows smoke run admitted 256 sessions, rejected 144 and echoed all 49,411 packets without failures. The current WSL suite again completed every ordinary load/arrival/churn scenario without failures; deliberate replay, slowdown and saturation stress failed 92, 120 and 128 sessions. Local reports are `final-windows-smoke-10s.json` and `final-current-linux-suite-5s.json`. This short smoke run does not supersede the Windows failures in the longer runs.
+
 Raw reports are `final-observation-windows-300s.json`, `final-linux-default-300s.json`, `final-linux-aligned-60s.json`, `final-linux-churn-60s.json`, `final-linux-cache-churn-60s.json` and `final-linux-suite-5s.json`, under the ignored local `benchmark-results/` directory. Server stage profiles are retained when a late echo is actually received; timeouts and server rejections cannot provide an unavailable echo's stage breakdown. Admission rejection, prelaunch rejection, physical completion overruns and client deadline failures are distinct outcomes.
 
 ## Earlier validation before strict simulator observation checks
