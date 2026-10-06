@@ -15,7 +15,11 @@ The agreed target and acceptance checklist are in PLAN.md. This file records imp
 
 The Python review verified hybrid cache isolation and continuation and identified two concrete issues: admission omitted earlier unmaterialized cache reservations, and invalid byte-token UTF-8 could terminate a batch. Commit `c47d55c` fixes both, including padded workspace accounting and deterministic incremental replacement decoding. The post-fix Python suite reports 46 CPU tests passing and two hardware integration tests skipped.
 
-The Rust review identified prefill starvation, a lost reservation when acceptance output is saturated, archive loss when close encounters a saturated worker mailbox, generation failures counted as successful benchmark turns, and cancellation delayed during opening. These fixes and final integration validation are in progress; their final evidence will be recorded below and in docs/LOCAL_VALIDATION.md.
+The Rust review identified prefill starvation, a lost reservation when acceptance output is saturated, archive loss when close encounters a saturated worker mailbox, generation failures counted as successful benchmark turns, and cancellation delayed during opening. Commits `734d3d3` and `e85feeb` fix these issues. An independent follow-up reran seven focused regressions successfully. Commit `9cc4da3` also fixes cost attribution after an interrupted prefill and adds its regression.
+
+Already admitted prefills have a configurable maximum queue wait (2000 ms initially), after which they run despite a possible token-gap violation. This prevents indefinite starvation by a long nonpreemptive forward and reports the tradeoff in metrics. Solo-turn admission evaluates decode capacity separately from TTFT: a 300 ms prefill does not permanently block new turns when decode is fast.
+
+Release-CLI validation found an idle worker transport timeout not caught by the original tests. Commit `8f63afb` preserves idle persistent connections and cache ownership while retaining a single timeout for a partial header/metadata/body. The expanded Python suite passes 52 CPU tests, with two hardware tests skipped. `54ecefa` clarifies device-stage timing boundaries. Final full-pipeline measurements and their failures are recorded in docs/LOCAL_VALIDATION.md.
 
 ## Pending hardware validation
 

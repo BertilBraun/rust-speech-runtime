@@ -30,17 +30,17 @@ The public transport is WebSocket: strict JSON control/event variants and binary
 
 ## Implementation checklist
 
-- [ ] Canonical protocols/configuration and typed backend boundary.
-- [ ] Bounded Rust session/worker actors, placement/admission and fair reactive batching.
-- [ ] Persistent cache lifecycle, interruption fences and dynamic batch membership.
-- [ ] Clean WebSocket gateway, binary packet validation and slow-client isolation.
-- [ ] Persistent Python worker, injectable test backend and real model adapter.
-- [ ] Per-session bounded records and asynchronous archives with visible failures.
-- [ ] Ordinary WebSocket workload runner, multi-turn/churn/interruption/overload scenarios.
-- [ ] TTFT, token gaps/rates, queue/stage latency distributions, utilization and rejection metrics.
-- [ ] Independent architectural and correctness reviews; fix reported issues.
+- [x] Canonical protocols/configuration and typed backend boundary.
+- [x] Bounded Rust session/worker actors, placement/admission and fair reactive batching.
+- [x] Persistent cache lifecycle, interruption fences and dynamic batch membership.
+- [x] Clean WebSocket gateway, binary packet validation and slow-client isolation.
+- [x] Persistent Python worker, injectable test backend and real model adapter.
+- [x] Per-session bounded records and asynchronous archives with visible failures.
+- [x] Ordinary WebSocket workload runner, multi-turn/churn/interruption/overload scenarios.
+- [x] TTFT, token gaps/rates, queue/stage latency distributions, utilization and rejection metrics.
+- [x] Independent architectural and correctness reviews; fix reported issues.
 - [ ] Rust fmt, strict clippy, tests and documentation; Python ruff and pytest.
-- [ ] Linux deployment/runbook and tomorrow's GPU/cache-parity benchmark checklist.
+- [x] Linux deployment/runbook and tomorrow's GPU/cache-parity benchmark checklist.
 
 ## Assumptions and validation limits
 
