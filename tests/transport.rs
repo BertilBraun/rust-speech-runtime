@@ -1,10 +1,15 @@
 mod support;
 
-use std::time::Duration;
+use std::{ffi::OsString, path::PathBuf, time::Duration};
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use tokio::{net::TcpStream, task::JoinHandle, time::timeout};
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    net::TcpStream,
+    task::JoinHandle,
+    time::timeout,
+};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 use voice_scheduler::{
@@ -432,23 +437,23 @@ async fn python_worker_process_to_websocket_client_full_pipeline() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve fixture port");
     let address = listener.local_addr().expect("fixture address");
     drop(listener);
-    let mut worker = tokio::process::Command::new("uv")
+    let (python_executable, python_path) = fixture_python().await;
+    let mut worker = tokio::process::Command::new(python_executable)
         .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/backend"))
+        .env("PYTHONPATH", python_path)
         .args([
-            "run",
-            "python",
             "tests/fixture_worker.py",
             "--port",
             &address.port().to_string(),
             "--response-tokens",
             "12",
+            "--exit-on-disconnect",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
         .expect("Python fixture process starts");
-    use tokio::io::{AsyncBufReadExt, BufReader};
     let mut lines = BufReader::new(worker.stdout.take().expect("piped stdout")).lines();
     let line = timeout(Duration::from_secs(60), lines.next_line())
         .await
@@ -478,8 +483,33 @@ async fn python_worker_process_to_websocket_client_full_pipeline() {
     assert_eq!(report.failed_sessions, 0, "{:?}", report.sessions);
     assert_eq!(report.received_tokens, 104);
     assert_eq!(gateway.shutdown().await.runtime.backend_failures, 0);
-    worker.kill().await.expect("fixture stops");
-    worker.wait().await.expect("fixture reaped");
+    let status = timeout(Duration::from_secs(10), worker.wait())
+        .await
+        .expect("fixture shutdown bounded")
+        .expect("fixture reaped");
+    assert!(status.success(), "fixture shutdown status: {status}");
+}
+
+async fn fixture_python() -> (PathBuf, OsString) {
+    let output = timeout(Duration::from_secs(60), tokio::process::Command::new("uv")
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/backend"))
+        .args(["run", "python", "-c", "import json, site, sys; print(json.dumps((sys._base_executable, site.getsitepackages())))"])
+        .kill_on_drop(true)
+        .output()).await.expect("Python environment discovery bounded").expect("Python environment query");
+    assert!(
+        output.status.success(),
+        "Python environment discovery failed"
+    );
+    let (executable, mut site_packages): (PathBuf, Vec<PathBuf>) =
+        serde_json::from_slice(&output.stdout).expect("typed Python environment paths");
+    site_packages.push(PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/backend/src"
+    )));
+    (
+        executable,
+        std::env::join_paths(site_packages).expect("Python package search path"),
+    )
 }
 
 #[tokio::test]
