@@ -207,6 +207,51 @@ async fn simultaneous_inputs_form_one_full_batch_before_the_idle_device_starts()
     assert_eq!(report.batch_fill_ratio, 1.0);
 }
 
+#[tokio::test(start_paused = true)]
+async fn final_partial_batch_is_prequeued_when_every_session_has_outstanding_input() {
+    let node = Node::start(RuntimeConfig {
+        inference_latency: Duration::from_millis(50),
+        max_batch_wait: Duration::from_millis(200),
+        max_sessions_per_worker: 6,
+        cache_slots_per_worker: 6,
+        ..configuration()
+    })
+    .await
+    .unwrap();
+    for session_id in 0..6 {
+        admit(&node, session_id).await;
+    }
+    let first_ingress = node.ingress.clone();
+    let first = tokio::spawn(async move {
+        let requests = (0..4).map(|session_id| {
+            first_ingress.input_frame(
+                SessionId(session_id),
+                frame(
+                    0,
+                    PrefixState::default(),
+                    Bytes::from_static(b"burst"),
+                    Duration::from_millis(200),
+                ),
+            )
+        });
+        futures_util::future::join_all(requests).await
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let remaining = tokio::join!(first_packet(&node, 4), first_packet(&node, 5));
+    for outcome in [remaining.0, remaining.1] {
+        let InputOutcome::Processed(output) = outcome else {
+            panic!("expected partial successor");
+        };
+        assert!(output.audio.timings.device_queue >= Duration::from_millis(20));
+    }
+    for outcome in first.await.unwrap() {
+        assert!(matches!(outcome.unwrap(), InputOutcome::Processed(_)));
+    }
+    let report = node.shutdown().await.unwrap();
+    assert_eq!(report.inference.batches, 2);
+    assert_eq!(report.inference.queued_batch_launches, 1);
+}
+
 #[tokio::test]
 async fn batches_are_prepared_and_submitted_while_the_device_is_running() {
     let node = Node::start(RuntimeConfig {

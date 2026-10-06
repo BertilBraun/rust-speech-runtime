@@ -557,7 +557,12 @@ impl Worker {
         {
             return now + self.configuration.session_timeout;
         }
-        if self.prepared.len() == self.configuration.batch_size {
+        if self.prepared.len() == self.configuration.batch_size
+            || self
+                .sessions
+                .values()
+                .all(|session| !matches!(session.work, SessionWork::Idle))
+        {
             return now;
         }
         if let Some(previous) = self.submitted.back() {
