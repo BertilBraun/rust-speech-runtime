@@ -5,23 +5,20 @@ use std::{
 };
 
 use serde::Serialize;
-use tokio::{
-    net::{TcpListener, TcpStream},
-    sync::Semaphore,
-    task::JoinSet,
-    time::Instant,
-};
+use tokio::{net::TcpListener, sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use super::wire::{ClientRequest, MAX_MESSAGE_BYTES, ServerPeer, ServerReply, WireError};
+use super::{
+    connection::Connection,
+    wire::{MAX_MESSAGE_BYTES, WireError},
+};
 use crate::{
-    Ingress, Node, RuntimeError,
+    Node, RuntimeError,
     config::{AudioLimits, RuntimeConfig},
     metrics::{
         Report,
         cpu::{CpuUsage, ProcessCpuMeasurement},
     },
-    protocol::{CreateOutcome, FrameRejection, InputFrame, InputOutcome, SessionLease},
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -150,7 +147,7 @@ impl Gateway {
                             let signal = cancellation.clone();
                             tasks.spawn(async move {
                                 let _permit = permit;
-                                connection_loop(stream, ingress, runtime, configuration, signal).await
+                                Connection::new(stream, ingress, runtime, configuration, signal)?.run().await
                             });
                             metrics.accepted += 1;
                             metrics.peak_active = metrics.peak_active.max(tasks.len());
@@ -181,184 +178,6 @@ impl Gateway {
             connections: metrics,
             runtime,
         })
-    }
-}
-
-async fn connection_loop(
-    stream: TcpStream,
-    ingress: Ingress,
-    runtime: RuntimeConfig,
-    configuration: GatewayConfig,
-    cancellation: CancellationToken,
-) -> Result<(), GatewayError> {
-    let mut peer = ServerPeer::new(stream, configuration.message_limit)?;
-    let mut session = None;
-    let outcome = serve_connection(
-        &mut peer,
-        &ingress,
-        &runtime,
-        &configuration,
-        &cancellation,
-        &mut session,
-    )
-    .await;
-    if let Some(lease) = session {
-        ingress.close_session(lease).await?;
-    }
-    outcome
-}
-
-async fn send_reply(
-    peer: &mut ServerPeer,
-    reply: ServerReply,
-    configuration: &GatewayConfig,
-    cancellation: &CancellationToken,
-) -> Result<(), GatewayError> {
-    tokio::select! {
-        _ = cancellation.cancelled() => Ok(()),
-        outcome = tokio::time::timeout(configuration.io_timeout, peer.send(reply)) => {
-            outcome.map_err(|_| WireError::Timeout)??;
-            Ok(())
-        }
-    }
-}
-
-async fn serve_connection(
-    peer: &mut ServerPeer,
-    ingress: &Ingress,
-    runtime: &RuntimeConfig,
-    configuration: &GatewayConfig,
-    cancellation: &CancellationToken,
-    session: &mut Option<SessionLease>,
-) -> Result<(), GatewayError> {
-    loop {
-        let request = tokio::select! {
-            _ = cancellation.cancelled() => return Ok(()),
-            outcome = tokio::time::timeout(configuration.io_timeout, peer.receive()) => outcome.map_err(|_| WireError::Timeout)??,
-        };
-        let Some(request) = request else {
-            return Ok(());
-        };
-        match request {
-            ClientRequest::Open(session_id) if session.is_none() => {
-                let outcome = ingress.create_session(session_id).await?;
-                if let CreateOutcome::Admitted(admission) = outcome {
-                    *session = Some(SessionLease {
-                        session_id,
-                        generation: admission.assignment.generation,
-                    });
-                }
-                send_reply(
-                    peer,
-                    ServerReply::Opened(outcome),
-                    configuration,
-                    cancellation,
-                )
-                .await?;
-                if session.is_none() {
-                    return Ok(());
-                }
-            }
-            ClientRequest::Audio {
-                packet,
-                remaining_budget,
-            } => {
-                let Some(lease) = *session else {
-                    return Err(WireError::InvalidMessage("open a session before audio").into());
-                };
-                if remaining_budget.is_zero() || remaining_budget > runtime.packet_recovery_budget()
-                {
-                    send_reply(
-                        peer,
-                        ServerReply::Rejected(FrameRejection::DeadlineExceeded),
-                        configuration,
-                        cancellation,
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                let timestamp = Instant::now();
-                // Recovery preserves input state; EDF retains the original playback target.
-                let future = ingress.input_frame(
-                    lease,
-                    InputFrame {
-                        timestamp,
-                        deadline: timestamp + remaining_budget
-                            - (runtime.packet_recovery_budget() - runtime.packet_deadline),
-                        packet,
-                    },
-                );
-                tokio::pin!(future);
-                let outcome = {
-                    tokio::select! {
-                        _ = cancellation.cancelled() => return Ok(()),
-                        outcome = &mut future => outcome?,
-                        incoming = peer.receive() => {
-                            match incoming? {
-                                None => return Ok(()),
-                                Some(ClientRequest::Close) => {
-                                    let closed = ingress.close_session(lease).await?;
-                                    *session = None;
-                                    send_reply(peer, ServerReply::Closed(closed), configuration, cancellation).await?;
-                                    return Ok(());
-                                }
-                                _ => {
-                                    ingress.close_session(lease).await?;
-                                    *session = None;
-                                    send_reply(peer, ServerReply::Rejected(FrameRejection::Overloaded), configuration, cancellation).await?;
-                                    return Ok(());
-                                }
-                            }
-                        }
-                    }
-                };
-                let terminal = matches!(outcome, InputOutcome::Rejected(_));
-                let reply = match outcome {
-                    InputOutcome::Processed(mut output) => {
-                        output.audio.timings.gateway_return = Instant::now()
-                            .duration_since(output.completed_at)
-                            .saturating_sub(output.audio.timings.result_delivery);
-                        ServerReply::Audio(output.audio)
-                    }
-                    InputOutcome::CacheMiss => ServerReply::CacheMiss,
-                    InputOutcome::Rejected(reason) => ServerReply::Rejected(reason),
-                };
-                send_reply(peer, reply, configuration, cancellation).await?;
-                if terminal {
-                    return Ok(());
-                }
-            }
-            ClientRequest::EvictCache => {
-                let Some(lease) = *session else {
-                    return Err(WireError::InvalidMessage("open a session before eviction").into());
-                };
-                let removed = ingress.evict_cache(lease).await?;
-                send_reply(
-                    peer,
-                    ServerReply::CacheEvicted(removed),
-                    configuration,
-                    cancellation,
-                )
-                .await?;
-            }
-            ClientRequest::Close => {
-                let closed = match session.take() {
-                    Some(lease) => ingress.close_session(lease).await?,
-                    None => false,
-                };
-                send_reply(
-                    peer,
-                    ServerReply::Closed(closed),
-                    configuration,
-                    cancellation,
-                )
-                .await?;
-                return Ok(());
-            }
-            ClientRequest::Open(_) => {
-                return Err(WireError::InvalidMessage("connection already owns a session").into());
-            }
-        }
     }
 }
 

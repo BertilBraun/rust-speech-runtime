@@ -1,4 +1,5 @@
 mod client;
+mod connection;
 mod gateway;
 mod wire;
 
