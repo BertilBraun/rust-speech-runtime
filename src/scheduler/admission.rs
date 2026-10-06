@@ -141,6 +141,7 @@ mod tests {
     fn streaming_capacity_retains_fractional_cycles_and_whole_batch_burst_cost() {
         let configuration = RuntimeConfig {
             max_sessions_per_worker: 64,
+            admission_headroom: 0.9,
             ..RuntimeConfig::default()
         };
         assert_eq!(session_limit(&configuration, Duration::from_millis(12)), 51);
@@ -173,6 +174,7 @@ mod tests {
     fn host_spikes_pause_admission_without_changing_device_capacity() {
         let configuration = RuntimeConfig {
             max_sessions_per_worker: 48,
+            admission_headroom: 0.9,
             packet_lateness_grace: Duration::ZERO,
             ..RuntimeConfig::default()
         };
@@ -260,6 +262,7 @@ mod tests {
     fn known_device_cost_reserves_host_slack_before_slow_results_are_observed() {
         let configuration = RuntimeConfig {
             max_sessions_per_worker: 48,
+            admission_headroom: 0.9,
             packet_lateness_grace: Duration::ZERO,
             ..RuntimeConfig::default()
         };
@@ -293,6 +296,7 @@ mod tests {
     fn recovery_grace_absorbs_host_reserve_and_checks_the_burst_budget() {
         let mut configuration = RuntimeConfig {
             max_sessions_per_worker: 64,
+            admission_headroom: 0.9,
             packet_lateness_grace: Duration::ZERO,
             ..RuntimeConfig::default()
         };

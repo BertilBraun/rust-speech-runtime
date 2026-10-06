@@ -149,7 +149,7 @@ mod tests {
 
     #[tokio::test]
     async fn late_echo_is_counted_in_latency_and_lateness_statistics() {
-        let (events, mailbox) = mpsc::channel(2);
+        let (events, mailbox) = mpsc::channel(4);
         events
             .send(ClientPacketTrace::Echo(echo(20)))
             .await
@@ -158,17 +158,25 @@ mod tests {
             .send(ClientPacketTrace::LateEcho(echo(51)))
             .await
             .unwrap();
+        events
+            .send(ClientPacketTrace::ExpiredEcho(echo(70)))
+            .await
+            .unwrap();
+        events
+            .send(ClientPacketTrace::UnrecoveredEcho(echo(230)))
+            .await
+            .unwrap();
         drop(events);
         let measurements = PacketMeasurements::default().collect(mailbox).await;
-        assert_eq!(measurements.round_trip.summary().samples, 2);
-        assert_eq!(measurements.deadline_lateness.summary().samples, 1);
-        assert_eq!(measurements.failed_round_trip.summary().samples, 1);
-        assert_eq!(measurements.client_start_delay.summary().samples, 2);
-        assert_eq!(measurements.outside_server.summary().samples, 2);
-        let ClientPacketTrace::LateEcho(trace) = &measurements.slowest_packets[0] else {
-            panic!("late echo must remain the slowest trace");
+        assert_eq!(measurements.round_trip.summary().samples, 3);
+        assert_eq!(measurements.deadline_lateness.summary().samples, 3);
+        assert_eq!(measurements.failed_round_trip.summary().samples, 3);
+        assert_eq!(measurements.client_start_delay.summary().samples, 4);
+        assert_eq!(measurements.outside_server.summary().samples, 4);
+        let ClientPacketTrace::UnrecoveredEcho(trace) = &measurements.slowest_packets[0] else {
+            panic!("unrecovered echo must remain the slowest trace");
         };
         assert_eq!(trace.server.device_execution, Duration::from_millis(12));
-        assert_eq!(trace.outside_server, Duration::from_millis(38));
+        assert_eq!(trace.outside_server, Duration::from_millis(217));
     }
 }

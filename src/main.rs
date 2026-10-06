@@ -64,6 +64,8 @@ struct RuntimeArguments {
     #[arg(long)]
     admission_headroom: Option<f64>,
     #[arg(long)]
+    scheduling_margin_ms: Option<u64>,
+    #[arg(long)]
     batch_fill_reserve: Option<f64>,
     #[arg(long)]
     latency_safety_factor: Option<f64>,
@@ -111,6 +113,9 @@ impl RuntimeArguments {
         }
         if let Some(value) = self.admission_headroom {
             configuration.admission_headroom = value;
+        }
+        if let Some(value) = self.scheduling_margin_ms {
+            configuration.scheduling_margin = Duration::from_millis(value);
         }
         if let Some(value) = self.batch_fill_reserve {
             configuration.batch_fill_reserve = value;
@@ -273,7 +278,7 @@ async fn benchmark(
     let gateway = server.await??;
     let client = client?;
     eprintln!(
-        "admitted={} rejected={} failed={} echoed={} late={} discarded={} bursts={} RTT p50/p95/p99={:.1}/{:.1}/{:.1}ms batch fill={:.1}%",
+        "admitted={} rejected={} failed={} echoed={} late={} discarded={} bursts={} RTT p50/p95/p99/max={:.1}/{:.1}/{:.1}/{:.1}ms batch fill={:.1}%",
         client.counters.admitted_sessions,
         client.counters.rejected_capacity,
         client.counters.failed_sessions,
@@ -284,6 +289,7 @@ async fn benchmark(
         client.round_trip_latency.p50_ms,
         client.round_trip_latency.p95_ms,
         client.round_trip_latency.p99_ms,
+        client.round_trip_latency.max_ms,
         gateway.runtime.batch_fill_ratio * 100.0
     );
     Ok(BenchmarkReport { client, gateway })

@@ -85,6 +85,7 @@ async fn calibration_rejects_sessions_that_cannot_fit_realtime_budget() {
 async fn long_queued_device_work_pauses_new_admission_until_it_completes() {
     let node = Node::start(RuntimeConfig {
         packet_deadline: Duration::from_millis(500),
+        admission_headroom: 0.9,
         replay_latency_per_packet: Duration::from_millis(2),
         ..configuration()
     })
