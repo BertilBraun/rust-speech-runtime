@@ -16,6 +16,7 @@ pub enum ClientError {
     #[error("end-to-end packet deadline exceeded")]
     DeadlineExceeded,
     #[error("audio echo arrived after its end-to-end packet deadline")]
+    /// Both audio prefixes have advanced; the next packet can use this same session.
     LateEcho(Box<AudioResult>),
     #[error("audio echo arrived beyond its recovery budget")]
     ExpiredEcho(Box<AudioResult>),
@@ -81,6 +82,7 @@ impl AudioSession {
         PacketSequence(self.prefix.packets)
     }
 
+    /// Only `LateEcho` is recoverable; other errors require closing this connection.
     pub async fn infer_audio(
         &mut self,
         payload: Bytes,

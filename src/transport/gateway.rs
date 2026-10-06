@@ -341,6 +341,7 @@ async fn serve_connection(
                     return Ok(());
                 }
                 let timestamp = Instant::now();
+                // The wire budget includes recovery grace; EDF retains the original target.
                 let future = ingress.input_frame(
                     lease,
                     InputFrame {

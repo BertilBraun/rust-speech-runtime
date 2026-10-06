@@ -1,5 +1,35 @@
 # Device pipelining and timing experiments
 
+## Capacity with isolated-miss recovery
+
+The revised serving target keeps the 50 ms capture-to-echo deadline, allows up to 10 ms of recovery, and flags four misses in any ten-packet window **within the same session**. A late echo advances both audio prefixes, so subsequent packets keep their original worker and cache. The simulator preserves the original capture schedule and records every late echo; it does not shift deadlines to make results look timely. A hard timeout/rejection remains a separate session failure. These are serving-quality proxies, not a perceptual audio test.
+
+Default admission now caps each GPU at 48 sessions, or 384 across eight workers. The compute budget remains `(48 - 5) * 0.9 = 38.7 ms`, sufficient for three whole 12 ms batches; recovery grace does not add compute capacity. Grace absorbs measured host-delay reserve before excess host delay is subtracted from this budget. Queue pressure and cache availability can still lower admission. This removes the former unconditional 32-session cap and avoids reserving isolated host jitter twice, while retaining bounded queues and fixed batch cost.
+
+The following sequential runs used real loopback TCP, 1,600-byte packets, fixed 12 ms kernels, eight workers and the agreed quality policy:
+
+| Platform / workload | Duration | Admitted / rejected | Echoed packets | Late echoes | Session failures / quality bursts | RTT p50 / p95 / p99 / max, ms | Batch fill |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Windows, random; cap raised to 48 | 60 s | 336 / 64 | 389,209 | 0 | 0 / 0 | 20.9 / 26.3 / 27.2 / 37.0 | 60.8% |
+| WSL, random; cap raised to 48 | 60 s | 384 / 16 | 446,810 | 0 | 0 / 0 | 20.6 / 26.0 / 26.8 / 47.3 | 69.8% |
+| Windows, random; new defaults | 300 s | 368 / 32 | 2,130,422 | 13 | 0 / 0 | 20.9 / 26.3 / 27.9 / 51.3 | 66.7% |
+
+All admitted sessions survived these runs, every attempted packet was echoed, and no client metric samples were lost. The five-minute run's thirteen late packets arrived at most 1.285 ms beyond the target. Maximum consecutive misses and maximum misses within any ten-packet window were both **one**, so there were no four-packet clusters. Calibration limited one worker to 32 sessions while seven accepted 48; the 384-node cap is an upper bound, not a forced admission count. The former 256 cap is therefore too restrictive for this revised tolerance: the sustained Windows run served 44% more sessions, and the WSL minute run served 50% more.
+
+Perfectly synchronized 50 ms arrivals need a separate qualification. A 60-second Windows run with the new defaults admitted 320 sessions, then failed 71: 27 crossed the four-miss quality threshold and 44 hit unrecovered deadline failures. It recorded 2,811 recoverable late echoes. Its p99 of 49.4 ms and 91.4% fill do **not** make that a passing operating point. A dedicated-device-thread repeat admitted 384 but failed 97, including thirteen quality bursts and 84 unrecovered deadline failures. The scheduler still charged exactly 12 ms per nonempty batch in both modes. Burst traces include approximately 23 ms of device queue residence, 7–8 ms of host notification delay and additional client/network delays; dedicated device threads did not remove the problem. These failed runs lose offered load as sessions terminate, so their aggregate throughput and fill cannot establish sustained capacity.
+
+The 48-session-per-GPU cap therefore targets the tested random 48–55 ms workload and is not certified for arbitrary correlated arrival patterns. Keep admission headroom and quality counters, and use a lower configured cap when traffic is synchronized. Reports for this stress check are `quality-default-windows-aligned-60s.json` and `quality-sleep-windows-aligned-60s.json`. The model has no observability into a new client's future arrival pattern at admission; changing the numeric cap does not solve that uncertainty.
+
+A further 60-second aligned Windows run at the former 32-per-GPU cap admitted 256 sessions and echoed all 303,348 attempted packets, but recorded 2,329 late echoes and one four-miss cluster. It had no unrecovered deadline failures; maximum consecutive misses were two. RTT p99/max were 48.4/58.5 ms. This was much less severe than the higher-cap burst runs but still failed the agreed clustered-miss criterion, so the lower cap is not certified either. Its report is `quality-tokio-windows-aligned-256-60s.json`. Investigating correlated host/network scheduling remains separate from the demonstrated capacity increase for jittered traffic.
+
+Reports are `quality-host-grace-windows-384-60s.json`, `quality-host-grace-linux-384-60s.json` and `quality-default-windows-300s.json` under local `benchmark-results/`. The first two used revision `7c0e315`; the sustained run used the same fixed-cost scheduler plus `d7677fc` recovery-budget checks and the new cap in `a4b2f24`. The earlier `quality-windows-384-60s.json` attempted a raised cap before host reserve used grace, and admitted only 256; its zero failures are not evidence of 384-session service.
+
+Reproduce the current random workload with `cargo run --release -- benchmark --sessions 400 --duration-secs 300 --output benchmark-results/quality-default.json`. Pass `--lateness-grace-ms 0 --max-sessions-per-worker 32` for strict completion behavior with the former cap. RTT now includes all echoes accepted within the recovery budget, including late ones; lateness, unrecovered deadline failures and quality bursts are reported separately. Older reports below terminated sessions on the first missed deadline and cannot reveal whether misses would have clustered.
+
+Validation covers late-prefix recovery, replay after a late packet, rejection beyond the recovery budget, bounded miss windows and consecutive/nearby clusters, alongside existing placement, cancellation, overload and device pipeline tests. All 63 tests pass on Windows and WSL. Windows validation also passes `cargo clippy --all-targets --locked -- -D warnings` and `cargo fmt --check`; both platforms run `cargo test --locked` with the same toolchain and locked dependencies.
+
+## Previous strict-deadline experiments
+
 Every ordinary nonempty batch costs 12 ms, whether it contains one, eight or sixteen packets. EDF selection is maintained while earlier inference runs. The scheduler prequeues full batches and the final partial batch when every assigned session has outstanding input. Other partial successors use a configurable 2 ms launch lead. Device queues hold at most two waiting jobs plus one running job. Already submitted jobs execute serially on an autonomous simulated device timeline; delayed host observation remains part of the actual TCP round trip and can fail its deadline.
 
 The former multi-millisecond "batch overhead" included queue residence. Current profiles separate EDF selection, job assembly, scheduler waiting and device waiting. Typical EDF selection costs roughly 0.6–1.2 microseconds; assembly costs roughly 2.3–6.7 microseconds in the experiments below. This is not six milliseconds of CPU work before each kernel.
