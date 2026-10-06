@@ -124,6 +124,7 @@ pub struct SessionAdmission {
     pub assignment: Assignment,
     pub audio_limits: AudioLimits,
     pub packet_deadline: Duration,
+    pub packet_lateness_grace: Duration,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FrameRejection {

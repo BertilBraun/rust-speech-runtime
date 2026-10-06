@@ -56,6 +56,8 @@ struct RuntimeArguments {
     #[arg(long)]
     deadline_ms: Option<u64>,
     #[arg(long)]
+    lateness_grace_ms: Option<u64>,
+    #[arg(long)]
     batch_wait_ms: Option<u64>,
     #[arg(long)]
     max_sessions_per_worker: Option<usize>,
@@ -97,6 +99,9 @@ impl RuntimeArguments {
         }
         if let Some(value) = self.deadline_ms {
             configuration.packet_deadline = Duration::from_millis(value);
+        }
+        if let Some(value) = self.lateness_grace_ms {
+            configuration.packet_lateness_grace = Duration::from_millis(value);
         }
         if let Some(value) = self.batch_wait_ms {
             configuration.max_batch_wait = Duration::from_millis(value);
@@ -148,6 +153,10 @@ struct WorkloadArguments {
     evict_every: Option<u64>,
     #[arg(long)]
     churn_secs: Option<u64>,
+    #[arg(long)]
+    quality_window_packets: Option<usize>,
+    #[arg(long)]
+    quality_miss_limit: Option<usize>,
 }
 impl WorkloadArguments {
     fn configuration(&self) -> SimulationConfig {
@@ -175,6 +184,12 @@ impl WorkloadArguments {
         }
         configuration.evict_every = self.evict_every;
         configuration.churn_after = self.churn_secs.map(Duration::from_secs);
+        if let Some(value) = self.quality_window_packets {
+            configuration.quality.window_packets = value;
+        }
+        if let Some(value) = self.quality_miss_limit {
+            configuration.quality.miss_limit = value;
+        }
         configuration
     }
 }

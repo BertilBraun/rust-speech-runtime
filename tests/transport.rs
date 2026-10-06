@@ -8,8 +8,8 @@ use voice_scheduler::{
     protocol::{CacheOutcome, CreateRejection, PacketSequence, SessionId},
     simulation::{self, SimulationConfig},
     transport::{
-        AudioSession, ConnectOutcome, Gateway, GatewayConfig, GatewayError, GatewayReport,
-        connect_session,
+        AudioSession, ClientError, ConnectOutcome, Gateway, GatewayConfig, GatewayError,
+        GatewayReport, connect_session,
     },
 };
 
@@ -96,6 +96,48 @@ async fn tcp_echo_is_sticky_and_replays_complete_prefix_on_cache_miss() {
     assert_eq!(report.runtime.inference.replayed_packets, 3);
     assert_eq!(report.runtime.inference.cache_misses, 1);
     assert_eq!(report.runtime.profile.scheduler_queue.samples, 4);
+    assert_eq!(report.runtime.active_sessions_at_shutdown, 0);
+}
+
+#[tokio::test]
+async fn late_audio_recovers_on_the_same_session_and_retains_its_entire_prefix() {
+    let runtime = RuntimeConfig {
+        packet_lateness_grace: Duration::from_millis(100),
+        ..configuration()
+    };
+    let (address, signal, task) = start(runtime).await;
+    let mut session = connect(address, 1).await;
+    let assignment = session.assignment();
+    let payload = Bytes::from_static(b"voice");
+    for sequence in 0..3 {
+        let error = session
+            .infer_audio(payload.clone(), Instant::now() - Duration::from_millis(260))
+            .await
+            .unwrap_err();
+        let ClientError::LateEcho(audio) = error else {
+            panic!("expected recoverable late echo, got {error:?}");
+        };
+        assert_eq!(audio.assignment, assignment);
+        assert_eq!(audio.sequence.0, sequence);
+        assert_eq!(audio.cache, CacheOutcome::Hit);
+        assert_eq!(session.next_sequence().0, sequence + 1);
+    }
+    assert!(session.evict_cache().await.unwrap());
+    let audio = session.infer_audio(payload, Instant::now()).await.unwrap();
+    assert_eq!(audio.assignment, assignment);
+    assert_eq!(audio.prefix.packets, 4);
+    assert_eq!(
+        audio.cache,
+        CacheOutcome::Replayed {
+            packets: 3,
+            bytes: 15
+        }
+    );
+    session.close().await.unwrap();
+    signal.cancel();
+    let report = task.await.unwrap().unwrap();
+    assert_eq!(report.runtime.inference.deadline_misses, 3);
+    assert_eq!(report.runtime.inference.delivered_frames, 4);
     assert_eq!(report.runtime.active_sessions_at_shutdown, 0);
 }
 

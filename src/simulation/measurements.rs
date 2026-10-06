@@ -15,6 +15,7 @@ pub struct ClientEchoTrace {
     pub session_id: SessionId,
     pub sequence: PacketSequence,
     pub round_trip: Duration,
+    pub lateness: Duration,
     pub client_start_delay: Duration,
     pub outside_server: Duration,
     pub server: PacketTimings,
@@ -25,11 +26,13 @@ impl ClientEchoTrace {
         audio: &AudioResult,
         round_trip: Duration,
         client_start_delay: Duration,
+        packet_deadline: Duration,
     ) -> Self {
         Self {
             session_id,
             sequence: audio.sequence,
             round_trip,
+            lateness: round_trip.saturating_sub(packet_deadline),
             client_start_delay,
             outside_server: round_trip.saturating_sub(client_start_delay + audio.timings.total()),
             server: *audio.timings,
@@ -62,6 +65,7 @@ impl ClientPacketTrace {
 pub(super) struct PacketMeasurements {
     pub round_trip: LatencyHistogram,
     pub failed_round_trip: LatencyHistogram,
+    pub deadline_lateness: LatencyHistogram,
     pub client_start_delay: LatencyHistogram,
     pub outside_server: LatencyHistogram,
     pub slowest_packets: Vec<ClientPacketTrace>,
@@ -76,8 +80,11 @@ impl PacketMeasurements {
                     self.outside_server.record(echo.outside_server);
                 }
                 ClientPacketTrace::LateEcho(echo) => {
+                    self.round_trip.record(echo.round_trip);
                     self.failed_round_trip.record(echo.round_trip);
+                    self.deadline_lateness.record(echo.lateness);
                     self.client_start_delay.record(echo.client_start_delay);
+                    self.outside_server.record(echo.outside_server);
                 }
                 ClientPacketTrace::Failure {
                     round_trip,
@@ -112,6 +119,7 @@ mod tests {
             session_id: SessionId(1),
             sequence: PacketSequence(0),
             round_trip: Duration::from_millis(round_trip_ms),
+            lateness: Duration::from_millis(round_trip_ms.saturating_sub(50)),
             client_start_delay: Duration::from_millis(1),
             outside_server: Duration::from_millis(round_trip_ms - 13),
             server: PacketTimings {
@@ -122,7 +130,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_echo_retains_stages_without_entering_successful_latency_statistics() {
+    async fn late_echo_is_counted_in_latency_and_lateness_statistics() {
         let (events, mailbox) = mpsc::channel(2);
         events
             .send(ClientPacketTrace::Echo(echo(20)))
@@ -134,10 +142,11 @@ mod tests {
             .unwrap();
         drop(events);
         let measurements = PacketMeasurements::default().collect(mailbox).await;
-        assert_eq!(measurements.round_trip.summary().samples, 1);
+        assert_eq!(measurements.round_trip.summary().samples, 2);
+        assert_eq!(measurements.deadline_lateness.summary().samples, 1);
         assert_eq!(measurements.failed_round_trip.summary().samples, 1);
         assert_eq!(measurements.client_start_delay.summary().samples, 2);
-        assert_eq!(measurements.outside_server.summary().samples, 1);
+        assert_eq!(measurements.outside_server.summary().samples, 2);
         let ClientPacketTrace::LateEcho(trace) = &measurements.slowest_packets[0] else {
             panic!("late echo must remain the slowest trace");
         };

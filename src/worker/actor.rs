@@ -244,7 +244,7 @@ impl Worker {
             + self.projected_device_time()
             + replay
             + self.configuration.scheduling_margin
-            <= deadline
+            <= deadline + self.configuration.packet_lateness_grace
     }
     fn admission_limit(&self) -> usize {
         let now = Instant::now();
@@ -438,7 +438,7 @@ impl Worker {
             self.reject(session_id, reply, FrameRejection::Overloaded);
             return;
         }
-        if input.deadline <= Instant::now() {
+        if input.deadline + self.configuration.packet_lateness_grace <= Instant::now() {
             self.reject(session_id, reply, FrameRejection::DeadlineExceeded);
             return;
         }
@@ -672,12 +672,14 @@ impl Worker {
                 + replay
                 + pending.replay_duration
                 + self.configuration.scheduling_margin;
+            let completion_deadline =
+                pending.input.deadline + self.configuration.packet_lateness_grace;
             let batch_deadline = earliest_deadline
-                .unwrap_or(pending.input.deadline)
-                .min(pending.input.deadline);
+                .unwrap_or(completion_deadline)
+                .min(completion_deadline);
             let own_cost =
                 device_time + pending.replay_duration + self.configuration.scheduling_margin;
-            if predicted_start + own_cost > pending.input.deadline {
+            if predicted_start + own_cost > completion_deadline {
                 let pending = session.work.take_ready();
                 self.measurements
                     .profile
@@ -837,6 +839,10 @@ impl Worker {
                         self.measurements
                             .deadline_lateness
                             .record(Instant::now().duration_since(item.input.deadline));
+                    }
+                    if Instant::now()
+                        > item.input.deadline + self.configuration.packet_lateness_grace
+                    {
                         self.reject(
                             item.session_id,
                             item.reply,

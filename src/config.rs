@@ -24,6 +24,7 @@ pub struct RuntimeConfig {
     pub workers: usize,
     pub minimum_packet_interval: Duration,
     pub packet_deadline: Duration,
+    pub packet_lateness_grace: Duration,
     pub batch_size: usize,
     pub inference_latency: Duration,
     pub device_wait: DeviceWait,
@@ -58,6 +59,7 @@ impl Default for RuntimeConfig {
             workers: 8,
             minimum_packet_interval: Duration::from_millis(48),
             packet_deadline: Duration::from_millis(50),
+            packet_lateness_grace: Duration::from_millis(10),
             batch_size: 16,
             inference_latency: Duration::from_millis(12),
             device_wait: DeviceWait::Tokio,
@@ -145,7 +147,16 @@ impl FromStr for DeviceWait {
     }
 }
 impl RuntimeConfig {
+    pub fn packet_completion_budget(&self) -> Duration {
+        self.packet_deadline + self.packet_lateness_grace
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.packet_lateness_grace > self.minimum_packet_interval {
+            return Err(ConfigError(
+                "packet_lateness_grace must not exceed minimum_packet_interval".into(),
+            ));
+        }
         match self.device_wait {
             DeviceWait::Tokio | DeviceWait::Thread(ThreadWait::Sleep) => {}
             DeviceWait::Thread(

@@ -89,8 +89,9 @@ impl AudioSession {
             return Err(ClientError::PrefixCapacity);
         }
         let deadline = captured_at + self.admission.packet_deadline;
+        let completion_deadline = deadline + self.admission.packet_lateness_grace;
         let operation = self.exchange_audio(payload, deadline);
-        tokio::time::timeout_at(deadline, operation)
+        tokio::time::timeout_at(completion_deadline, operation)
             .await
             .map_err(|_| ClientError::DeadlineExceeded)?
     }
@@ -101,6 +102,7 @@ impl AudioSession {
         deadline: Instant,
     ) -> Result<AudioResult, ClientError> {
         let sequence = self.next_sequence();
+        let completion_deadline = deadline + self.admission.packet_lateness_grace;
         let packet = AudioPacket {
             sequence,
             payload: payload.clone(),
@@ -109,7 +111,7 @@ impl AudioSession {
         self.peer
             .send(ClientRequest::Audio {
                 packet,
-                remaining_budget: deadline.saturating_duration_since(Instant::now()),
+                remaining_budget: completion_deadline.saturating_duration_since(Instant::now()),
             })
             .await?;
         let mut reply = self.peer.receive().await?.ok_or(WireError::Closed)?;
@@ -122,7 +124,7 @@ impl AudioSession {
             self.peer
                 .send(ClientRequest::Audio {
                     packet,
-                    remaining_budget: deadline.saturating_duration_since(Instant::now()),
+                    remaining_budget: completion_deadline.saturating_duration_since(Instant::now()),
                 })
                 .await?;
             reply = self.peer.receive().await?.ok_or(WireError::Closed)?;
@@ -137,11 +139,11 @@ impl AudioSession {
                 {
                     return Err(ClientError::EchoMismatch);
                 }
+                self.history.0.push(payload);
+                self.prefix = expected;
                 if Instant::now() > deadline {
                     return Err(ClientError::LateEcho(Box::new(audio)));
                 }
-                self.history.0.push(payload);
-                self.prefix = expected;
                 Ok(audio)
             }
             ServerReply::Rejected(reason) => Err(ClientError::Rejected(reason)),
@@ -183,7 +185,7 @@ mod tests {
     use tokio::{net::TcpListener, time::Instant};
 
     #[tokio::test]
-    async fn received_late_echo_preserves_profile_without_advancing_audio_history() {
+    async fn received_late_echo_preserves_profile_and_advances_audio_history() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let assignment = Assignment {
@@ -202,6 +204,7 @@ mod tests {
                     assignment,
                     audio_limits: AudioLimits::default(),
                     packet_deadline: Duration::from_millis(50),
+                    packet_lateness_grace: Duration::from_millis(10),
                 },
             )))
             .await
@@ -244,8 +247,8 @@ mod tests {
         };
         assert_eq!(audio.payload, Bytes::from_static(b"audio"));
         assert_eq!(audio.timings.device_execution, Duration::from_millis(12));
-        assert_eq!(session.prefix, PrefixState::default());
-        assert!(session.history.0.is_empty());
+        assert_eq!(session.prefix, PrefixState::default().append(b"audio"));
+        assert_eq!(session.history.0, vec![Bytes::from_static(b"audio")]);
         server.await.unwrap();
     }
 }

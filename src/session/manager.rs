@@ -229,6 +229,7 @@ impl SessionManager {
                     assignment,
                     audio_limits: self.configuration.audio_limits,
                     packet_deadline: self.configuration.packet_deadline,
+                    packet_lateness_grace: self.configuration.packet_lateness_grace,
                 }));
             }
             workers[worker_id.0].session_limit = 0;

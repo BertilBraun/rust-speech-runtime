@@ -1,8 +1,11 @@
 use std::{cmp::Reverse, collections::BinaryHeap, net::SocketAddr, time::Duration};
 
 mod measurements;
+mod quality;
 use measurements::PacketMeasurements;
 pub use measurements::{ClientEchoTrace, ClientPacketTrace};
+use quality::PacketQuality;
+pub use quality::PacketQualityPolicy;
 
 use bytes::Bytes;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
@@ -37,6 +40,7 @@ pub struct SimulationConfig {
     pub churn_after: Option<Duration>,
     pub io_timeout: Duration,
     pub metric_channel_capacity: usize,
+    pub quality: PacketQualityPolicy,
 }
 impl Default for SimulationConfig {
     fn default() -> Self {
@@ -52,6 +56,7 @@ impl Default for SimulationConfig {
             churn_after: None,
             io_timeout: Duration::from_secs(5),
             metric_channel_capacity: 4096,
+            quality: PacketQualityPolicy::default(),
         }
     }
 }
@@ -71,6 +76,10 @@ impl SimulationConfig {
             || self.evict_every == Some(0)
             || self.metric_channel_capacity == 0
             || self.metric_channel_capacity > 1_000_000
+            || self.quality.window_packets == 0
+            || self.quality.window_packets > 10_000
+            || self.quality.miss_limit == 0
+            || self.quality.miss_limit > self.quality.window_packets
             || self
                 .churn_after
                 .is_some_and(|duration| duration.is_zero() || duration > Duration::from_secs(86400))
@@ -102,6 +111,7 @@ pub enum FailureReason {
     InvalidEcho,
     Protocol,
     GeneratorOverrun,
+    DeadlineMissBurst,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FailureCount {
@@ -117,6 +127,11 @@ pub struct ClientCounters {
     pub failed_sessions: u64,
     pub attempted_frames: u64,
     pub echoed_frames: u64,
+    pub late_frames: u64,
+    pub unrecovered_deadline_frames: u64,
+    pub quality_failed_sessions: u64,
+    pub maximum_consecutive_misses: u64,
+    pub maximum_window_misses: u64,
     pub cache_hits: u64,
     pub replayed_frames: u64,
     pub replayed_packets: u64,
@@ -127,6 +142,13 @@ pub struct ClientCounters {
 impl ClientCounters {
     fn failure(&mut self, reason: FailureReason) {
         self.failed_sessions += 1;
+        if matches!(
+            reason,
+            FailureReason::DeadlineExceeded
+                | FailureReason::ServerRejected(FrameRejection::DeadlineExceeded)
+        ) {
+            self.unrecovered_deadline_frames += 1;
+        }
         if let Some(entry) = self
             .failures
             .iter_mut()
@@ -145,6 +167,13 @@ impl ClientCounters {
         self.failed_sessions += other.failed_sessions;
         self.attempted_frames += other.attempted_frames;
         self.echoed_frames += other.echoed_frames;
+        self.late_frames += other.late_frames;
+        self.unrecovered_deadline_frames += other.unrecovered_deadline_frames;
+        self.quality_failed_sessions += other.quality_failed_sessions;
+        self.maximum_consecutive_misses = self
+            .maximum_consecutive_misses
+            .max(other.maximum_consecutive_misses);
+        self.maximum_window_misses = self.maximum_window_misses.max(other.maximum_window_misses);
         self.cache_hits += other.cache_hits;
         self.replayed_frames += other.replayed_frames;
         self.replayed_packets += other.replayed_packets;
@@ -180,6 +209,7 @@ pub struct SimulationReport {
     pub throughput_frames_per_sec: f64,
     pub round_trip_latency: LatencyDistribution,
     pub failed_round_trip_latency: LatencyDistribution,
+    pub deadline_lateness: LatencyDistribution,
     pub generator_delay: LatencyDistribution,
     pub generated_intervals: LatencyDistribution,
     pub generator_overruns: u64,
@@ -314,6 +344,7 @@ async fn run_session(
         .churn_after
         .map(|duration| duration.mul_f64(random.random_range(0.5..=1.0)));
     let _ = ready.send(());
+    let mut quality = PacketQuality::new(configuration.quality);
     loop {
         let captured_at = tokio::select! {
             _ = cancellation.cancelled() => {
@@ -333,77 +364,85 @@ async fn run_session(
             }
             outcome => outcome,
         };
-        match outcome {
-            Ok(audio) => {
+        let (audio, late) = match outcome {
+            Ok(audio) => (audio, false),
+            Err(ClientError::LateEcho(audio)) => (*audio, true),
+            Err(error) => {
+                let reason = classify(error);
                 if metrics
-                    .try_send(ClientPacketTrace::Echo(ClientEchoTrace::new(
+                    .try_send(ClientPacketTrace::Failure {
                         session_id,
-                        &audio,
+                        sequence,
                         round_trip,
                         client_start_delay,
-                    )))
+                        reason,
+                    })
                     .is_err()
                 {
                     counters.metric_samples_dropped += 1;
                 }
-                counters.echoed_frames += 1;
-                match audio.cache {
-                    CacheOutcome::Hit => counters.cache_hits += 1,
-                    CacheOutcome::Replayed { packets, bytes } => {
-                        counters.replayed_frames += 1;
-                        counters.replayed_packets += packets;
-                        counters.replayed_bytes += bytes;
-                    }
-                }
-                if configuration
-                    .evict_every
-                    .is_some_and(|period| (audio.sequence.0 + 1) % period == 0)
-                {
-                    match tokio::time::timeout(configuration.io_timeout, session.evict_cache())
-                        .await
-                    {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(error)) => {
-                            counters.failure(classify(error));
-                            return counters;
-                        }
-                        Err(_) => {
-                            counters.failure(FailureReason::Connection);
-                            return counters;
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                let (reason, trace) = match error {
-                    ClientError::LateEcho(audio) => (
-                        FailureReason::DeadlineExceeded,
-                        ClientPacketTrace::LateEcho(ClientEchoTrace::new(
-                            session_id,
-                            &audio,
-                            round_trip,
-                            client_start_delay,
-                        )),
-                    ),
-                    error => {
-                        let reason = classify(error);
-                        (
-                            reason,
-                            ClientPacketTrace::Failure {
-                                session_id,
-                                sequence,
-                                round_trip,
-                                client_start_delay,
-                                reason,
-                            },
-                        )
-                    }
-                };
-                if metrics.try_send(trace).is_err() {
-                    counters.metric_samples_dropped += 1;
-                }
                 counters.failure(reason);
                 return counters;
+            }
+        };
+        {
+            let trace = ClientEchoTrace::new(
+                session_id,
+                &audio,
+                round_trip,
+                client_start_delay,
+                session.packet_deadline(),
+            );
+            let trace = if late {
+                ClientPacketTrace::LateEcho(trace)
+            } else {
+                ClientPacketTrace::Echo(trace)
+            };
+            if metrics.try_send(trace).is_err() {
+                counters.metric_samples_dropped += 1;
+            }
+            counters.echoed_frames += 1;
+            counters.late_frames += u64::from(late);
+            let burst = quality.observe(late);
+            counters.maximum_consecutive_misses = counters
+                .maximum_consecutive_misses
+                .max(quality.consecutive_misses);
+            counters.maximum_window_misses =
+                counters.maximum_window_misses.max(quality.window_misses);
+            match audio.cache {
+                CacheOutcome::Hit => counters.cache_hits += 1,
+                CacheOutcome::Replayed { packets, bytes } => {
+                    counters.replayed_frames += 1;
+                    counters.replayed_packets += packets;
+                    counters.replayed_bytes += bytes;
+                }
+            }
+            if burst {
+                counters.quality_failed_sessions += 1;
+                counters.failure(FailureReason::DeadlineMissBurst);
+                if matches!(
+                    tokio::time::timeout(configuration.io_timeout, session.close()).await,
+                    Ok(Ok(_))
+                ) {
+                    counters.closed_sessions += 1;
+                }
+                return counters;
+            }
+            if configuration
+                .evict_every
+                .is_some_and(|period| (audio.sequence.0 + 1) % period == 0)
+            {
+                match tokio::time::timeout(configuration.io_timeout, session.evict_cache()).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        counters.failure(classify(error));
+                        return counters;
+                    }
+                    Err(_) => {
+                        counters.failure(FailureReason::Connection);
+                        return counters;
+                    }
+                }
             }
         }
         if lifetime.is_some_and(|duration| created.elapsed() >= duration) {
@@ -418,6 +457,7 @@ async fn run_session(
                 Ok(ConnectOutcome::Admitted(new_session)) => {
                     session = new_session;
                     counters.admitted_sessions += 1;
+                    quality = PacketQuality::new(configuration.quality);
                 }
                 Ok(ConnectOutcome::Rejected(reason)) => {
                     counters.admission(reason);
@@ -527,6 +567,7 @@ pub async fn run(
         counters,
         round_trip_latency: totals.round_trip.summary(),
         failed_round_trip_latency: totals.failed_round_trip.summary(),
+        deadline_lateness: totals.deadline_lateness.summary(),
         generator_delay: pacing.delay.summary(),
         generated_intervals: pacing.intervals.summary(),
         generator_overruns: pacing.overruns,

@@ -328,7 +328,9 @@ async fn serve_connection(
                 let Some(lease) = *session else {
                     return Err(WireError::InvalidMessage("open a session before audio").into());
                 };
-                if remaining_budget.is_zero() || remaining_budget > runtime.packet_deadline {
+                if remaining_budget.is_zero()
+                    || remaining_budget > runtime.packet_completion_budget()
+                {
                     send_reply(
                         peer,
                         ServerReply::Rejected(FrameRejection::DeadlineExceeded),
@@ -343,7 +345,7 @@ async fn serve_connection(
                     lease,
                     InputFrame {
                         timestamp,
-                        deadline: timestamp + remaining_budget,
+                        deadline: timestamp + remaining_budget - runtime.packet_lateness_grace,
                         packet,
                     },
                 );
