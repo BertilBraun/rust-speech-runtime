@@ -97,44 +97,26 @@ impl SimulatedSession {
                     None => break,
                 },
             };
-            let sequence = match self.infer_packet(captured_at).await {
-                Ok(sequence) => sequence,
-                Err(reason) => {
-                    self.counters.failure(reason);
-                    if reason == FailureReason::DeadlineMissBurst
-                        && matches!(
-                            tokio::time::timeout(
-                                self.configuration.io_timeout,
-                                self.session.close()
-                            )
-                            .await,
-                            Ok(Ok(_))
-                        )
-                    {
-                        self.counters.closed_sessions += 1;
-                    }
-                    return self.counters;
-                }
-            };
-            if let Err(reason) = self.evict_if_due(sequence).await {
+            if let Err(reason) = self.process_capture(captured_at).await {
                 self.counters.failure(reason);
+                if reason == FailureReason::DeadlineMissBurst {
+                    let _ =
+                        close_session(*self.session, &self.configuration, &mut self.counters).await;
+                }
                 return self.counters;
             }
             if self
                 .lifetime
                 .is_some_and(|duration| self.created_at.elapsed() >= duration)
             {
-                match tokio::time::timeout(self.configuration.io_timeout, self.session.close())
-                    .await
-                {
-                    Ok(Ok(_)) => self.counters.closed_sessions += 1,
-                    _ => {
-                        self.counters.failure(FailureReason::Connection);
-                        return self.counters;
-                    }
-                }
-                match connect_session(self.address, self.session_id, self.configuration.io_timeout)
-                    .await
+                match reopen_session(
+                    *self.session,
+                    self.address,
+                    self.session_id,
+                    &self.configuration,
+                    &mut self.counters,
+                )
+                .await
                 {
                     Ok(ConnectOutcome::Admitted(session)) => {
                         self.session = session;
@@ -145,8 +127,8 @@ impl SimulatedSession {
                         self.counters.admission(reason);
                         return self.counters;
                     }
-                    Err(error) => {
-                        self.counters.failure(classify(error));
+                    Err(reason) => {
+                        self.counters.failure(reason);
                         return self.counters;
                     }
                 }
@@ -157,11 +139,17 @@ impl SimulatedSession {
                     .map(|duration| duration.mul_f64(self.random.random_range(0.5..=1.0)));
             }
         }
-        match tokio::time::timeout(self.configuration.io_timeout, self.session.close()).await {
-            Ok(Ok(_)) => self.counters.closed_sessions += 1,
-            _ => self.counters.failure(FailureReason::Connection),
+        if let Err(reason) =
+            close_session(*self.session, &self.configuration, &mut self.counters).await
+        {
+            self.counters.failure(reason);
         }
         self.counters
+    }
+
+    async fn process_capture(&mut self, captured_at: Instant) -> Result<(), FailureReason> {
+        let sequence = self.infer_packet(captured_at).await?;
+        self.evict_if_due(sequence).await
     }
 
     async fn infer_packet(
@@ -288,4 +276,31 @@ impl SimulatedSession {
             self.counters.metric_samples_dropped += 1;
         }
     }
+}
+
+async fn close_session(
+    session: AudioSession,
+    configuration: &SimulationConfig,
+    counters: &mut ClientCounters,
+) -> Result<(), FailureReason> {
+    match tokio::time::timeout(configuration.io_timeout, session.close()).await {
+        Ok(Ok(_)) => {
+            counters.closed_sessions += 1;
+            Ok(())
+        }
+        _ => Err(FailureReason::Connection),
+    }
+}
+
+async fn reopen_session(
+    session: AudioSession,
+    address: SocketAddr,
+    session_id: SessionId,
+    configuration: &SimulationConfig,
+    counters: &mut ClientCounters,
+) -> Result<ConnectOutcome, FailureReason> {
+    close_session(session, configuration, counters).await?;
+    connect_session(address, session_id, configuration.io_timeout)
+        .await
+        .map_err(classify)
 }
