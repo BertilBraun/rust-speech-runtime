@@ -234,18 +234,31 @@ impl Worker {
         self.estimator.device_time().max(self.base_latency())
     }
     fn admission_limit(&self) -> usize {
-        let queued = self
+        let now = Instant::now();
+        let mut queued = Duration::ZERO;
+        let mut ready_count: usize = 0;
+        let mut replay = Duration::ZERO;
+        for pending in self
             .sessions
             .values()
             .filter_map(|session| session.work.ready())
-            .map(|pending| Instant::now().duration_since(pending.queued_at))
-            .max()
-            .unwrap_or(Duration::ZERO);
+        {
+            queued = queued.max(now.duration_since(pending.queued_at));
+            ready_count += 1;
+            replay += pending.replay_duration;
+        }
+        let device_queue = self.submitted.back().map_or(Duration::ZERO, |batch| {
+            batch.expected_completion.saturating_duration_since(now)
+        });
+        let ready_compute = self
+            .projected_device_time()
+            .mul_f64(ready_count.div_ceil(self.configuration.batch_size) as f64)
+            + replay;
         self.estimator.available_limit(
             &self.configuration,
             self.session_limit,
             self.sessions.len(),
-            queued,
+            queued.max(device_queue + ready_compute),
         )
     }
     fn refresh_capacity(&mut self) {
@@ -694,6 +707,7 @@ impl Worker {
         });
         self.track_submission(submitted_at, latency);
         self.refresh_prepared();
+        self.publish();
     }
     fn complete(&mut self, result: DeviceResult) {
         self.submitted

@@ -81,6 +81,63 @@ async fn calibration_rejects_sessions_that_cannot_fit_realtime_budget() {
     assert_eq!(report.workers[0].initial_session_limit, 0);
     assert!(report.workers[0].calibration_latency.samples > 0);
 }
+#[tokio::test(start_paused = true)]
+async fn long_queued_device_work_pauses_new_admission_until_it_completes() {
+    let node = Node::start(RuntimeConfig {
+        packet_deadline: Duration::from_millis(500),
+        replay_latency_per_packet: Duration::from_millis(2),
+        ..configuration()
+    })
+    .await
+    .unwrap();
+    admit(&node, 1).await;
+    let mut prefix = PrefixState::default();
+    let mut history = Vec::new();
+    for sequence in 0..120 {
+        let payload = Bytes::from(vec![sequence as u8]);
+        let InputOutcome::Processed(output) = node
+            .ingress
+            .input_frame(
+                SessionId(1),
+                frame(
+                    sequence,
+                    prefix,
+                    payload.clone(),
+                    Duration::from_millis(450),
+                ),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected prefix warmup");
+        };
+        prefix = output.audio.prefix;
+        history.push(payload);
+    }
+    assert!(node.ingress.evict_cache(SessionId(1)).await.unwrap());
+    let ingress = node.ingress.clone();
+    let replay = tokio::spawn(async move {
+        let mut input = frame(
+            120,
+            prefix,
+            Bytes::from_static(b"next"),
+            Duration::from_millis(450),
+        );
+        input.packet.context = AudioContext::Replay(AudioPrefix(history));
+        ingress.input_frame(SessionId(1), input).await.unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        node.ingress.create_session(SessionId(2)).await.unwrap(),
+        CreateOutcome::Rejected(CreateRejection::Capacity)
+    );
+    assert!(matches!(replay.await.unwrap(), InputOutcome::Processed(_)));
+    admit(&node, 2).await;
+    let report = node.shutdown().await.unwrap();
+    assert_eq!(report.rejected_sessions, 1);
+    assert_eq!(report.inference.capacity_terminations, 0);
+}
+
 #[tokio::test]
 async fn capacity_and_cache_slots_are_reclaimed() {
     let node = Node::start(RuntimeConfig {
