@@ -1,6 +1,7 @@
 use super::{
     cache::{CacheHandle, CachePool},
     mock_gpu::{self, DeviceJob, DeviceResult, DeviceWork, SessionCancellation, WorkItem},
+    session::{PendingFrame, SessionWork, WorkerSession},
 };
 use crate::{
     config::RuntimeConfig,
@@ -55,18 +56,6 @@ pub(crate) struct WorkerHandle {
     pub commands: mpsc::Sender<WorkerCommand>,
     pub status: watch::Receiver<WorkerStatus>,
     pub task: JoinHandle<WorkerMeasurements>,
-}
-struct PendingFrame {
-    item: WorkItem,
-    queued_at: Instant,
-}
-struct WorkerSession {
-    assignment: Assignment,
-    cache: CacheHandle,
-    prefix: PrefixState,
-    pending: Option<PendingFrame>,
-    in_flight: bool,
-    cancellation: SessionCancellation,
 }
 struct SubmittedBatch {
     submitted_at: Instant,
@@ -239,7 +228,7 @@ impl Worker {
         let queued = self
             .sessions
             .values()
-            .filter_map(|session| session.pending.as_ref())
+            .filter_map(|session| session.work.ready())
             .map(|pending| Instant::now().duration_since(pending.queued_at))
             .max()
             .unwrap_or(Duration::ZERO);
@@ -266,11 +255,12 @@ impl Worker {
     fn terminate(&mut self, session_id: SessionId, reason: FrameRejection) {
         if let Some(session) = self.sessions.remove(&session_id) {
             session.cancellation.cancel();
-            if let Some(pending) = session.pending {
+            let submitted = matches!(session.work, SessionWork::Submitted);
+            if let SessionWork::Ready(pending) = session.work {
                 self.measurements.counters.rejected_frames += 1;
                 let _ = pending.item.reply.send(InputOutcome::Rejected(reason));
             }
-            if session.in_flight {
+            if submitted {
                 let prior = self.retired_cache.insert(
                     SessionLease {
                         session_id,
@@ -312,8 +302,7 @@ impl Worker {
                         assignment,
                         cache,
                         prefix: PrefixState::default(),
-                        pending: None,
-                        in_flight: false,
+                        work: SessionWork::Idle,
                         cancellation: SessionCancellation::default(),
                     },
                 );
@@ -355,8 +344,7 @@ impl Worker {
                 let removed = match self.sessions.get(&session_id) {
                     Some(session)
                         if session.assignment.generation == generation
-                            && !session.in_flight
-                            && session.pending.is_none() =>
+                            && matches!(session.work, SessionWork::Idle) =>
                     {
                         self.cache.evict(session.cache);
                         self.measurements.counters.cache_evictions += 1;
@@ -410,7 +398,7 @@ impl Worker {
             let _ = reply.send(InputOutcome::Rejected(FrameRejection::Cancelled));
             return;
         }
-        if session.in_flight || session.pending.is_some() {
+        if !matches!(session.work, SessionWork::Idle) {
             self.reject(session_id, reply, FrameRejection::Overloaded);
             return;
         }
@@ -502,7 +490,7 @@ impl Worker {
             .sessions
             .get_mut(&session_id)
             .expect("session remains owned during validation");
-        session.pending = Some(PendingFrame {
+        session.work = SessionWork::Ready(PendingFrame {
             item: WorkItem {
                 session_id,
                 assignment: session.assignment,
@@ -527,7 +515,7 @@ impl Worker {
             self.sessions
                 .iter()
                 .filter_map(|(session_id, session)| {
-                    session.pending.as_ref().map(|pending| ReadySession {
+                    session.work.ready().map(|pending| ReadySession {
                         session_id: *session_id,
                         deadline: pending.item.input.deadline,
                     })
@@ -573,7 +561,7 @@ impl Worker {
         for pending in self
             .sessions
             .values()
-            .filter_map(|session| session.pending.as_ref())
+            .filter_map(|session| session.work.ready())
         {
             count += 1;
             let latest = pending.item.input.deadline
@@ -603,7 +591,7 @@ impl Worker {
                 .sessions
                 .get_mut(&selected.session_id)
                 .expect("selected session exists");
-            let pending = session.pending.as_ref().expect("pending frame exists");
+            let pending = session.work.ready().expect("pending frame exists");
             let projected = self.estimator.device_time()
                 + replay
                 + pending.item.replay_duration
@@ -615,7 +603,7 @@ impl Worker {
                 + pending.item.replay_duration
                 + self.configuration.scheduling_margin;
             if predicted_start + own_cost > pending.item.input.deadline {
-                let pending = session.pending.take().expect("pending frame exists");
+                let pending = session.work.take_ready();
                 self.measurements
                     .profile
                     .rejected_queue_delay
@@ -634,13 +622,13 @@ impl Worker {
             if predicted_start + projected > batch_deadline {
                 continue;
             }
-            let pending = session.pending.take().expect("pending frame exists");
+            let pending = session.work.take_ready();
             replay += pending.item.replay_duration;
             earliest_deadline = Some(batch_deadline);
             self.sessions
                 .get_mut(&selected.session_id)
                 .expect("session exists")
-                .in_flight = true;
+                .work = SessionWork::Submitted;
             items.push(pending.item);
         }
         if items.is_empty() {
@@ -760,7 +748,7 @@ impl Worker {
                             .send(InputOutcome::Rejected(FrameRejection::Cancelled));
                         continue;
                     };
-                    session.in_flight = false;
+                    session.work = SessionWork::Idle;
                     self.measurements
                         .queue_delay
                         .record(result.started_at.duration_since(item.input.timestamp));
