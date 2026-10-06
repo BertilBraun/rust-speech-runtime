@@ -2,6 +2,8 @@
 
 ## Rust code quality pass, 2026-10-06
 
+The follow-up architecture review (`6f01f47`, `8fad05e` and `00b1c8e`) separates the TCP accept loop from an owned connection lifecycle, shortens simulator packet/lifecycle orchestration, and extracts worker packet and replay validation. All 67 tests pass again on Windows and WSL. Strict Windows Clippy, formatting, rustdoc and the release build also pass. These changes retain the serving policies; the performance results below remain measurements of their stated revisions, rather than new measurements of this follow-up.
+
 Revisions `15100c8` through `a4c95a9` refactor the implementation without changing the default workload, admission settings or fixed 12 ms batch cost. Worker admission, input validation, scheduling and completion are focused methods on one private worker owner. The simulator separates capture pacing, owned session state and reporting. Recoverable deliveries are explicit `AudioDelivery` variants; terminal transport and CLI failures use typed errors. Cache replay consumes its uploaded history during validation, and submitted device jobs retain only the current packet and verified prefix.
 
 Scoped cancellation guards cover startup, serving and simulation failures. Calibration stops submitting probes after cancellation and lets its running probe finish. New regression tests cover cancellation during calibration and dropping a node during inference. Configuration defaults and validation stay with their canonical types; scheduler internals are private, and Tokio's paused-clock support is restricted to development builds. [The README code guide](README.md#rust-code-guide) maps these responsibilities to their modules.

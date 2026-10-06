@@ -140,23 +140,34 @@ impl Gateway {
                 connection = self.listener.accept() => {
                     match connection {
                         Ok((stream, _)) => {
-                            let Ok(permit) = permits.clone().try_acquire_owned() else { metrics.rejected_connection_capacity += 1; continue; };
+                            let Ok(permit) = permits.clone().try_acquire_owned() else {
+                                metrics.rejected_connection_capacity += 1;
+                                continue;
+                            };
                             let ingress = self.node.ingress.clone();
                             let configuration = self.configuration.clone();
                             let runtime = self.runtime_configuration.clone();
                             let signal = cancellation.clone();
                             tasks.spawn(async move {
                                 let _permit = permit;
-                                Connection::new(stream, ingress, runtime, configuration, signal)?.run().await
+                                let connection = Connection::new(
+                                    stream, ingress, runtime, configuration, signal,
+                                )?;
+                                connection.run().await
                             });
                             metrics.accepted += 1;
                             metrics.peak_active = metrics.peak_active.max(tasks.len());
                         }
-                        Err(error) => { failure = Some(error); break; }
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
                     }
                 }
                 Some(result) = tasks.join_next() => {
-                    if !matches!(result, Ok(Ok(()))) { metrics.failed_connections += 1; }
+                    if !matches!(result, Ok(Ok(()))) {
+                        metrics.failed_connections += 1;
+                    }
                 }
             }
         }

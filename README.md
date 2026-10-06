@@ -89,11 +89,17 @@ The current profiling results and their limits are documented in [PERFORMANCE.md
 | Input validation and cache replay | [actor/input.rs](src/worker/actor/input.rs) |
 | EDF preparation, device submission and completion | [actor/scheduling.rs](src/worker/actor/scheduling.rs) |
 | Bounded worker messages and mock device execution | [mailbox.rs](src/worker/mailbox.rs), [mock_gpu.rs](src/worker/mock_gpu.rs) |
-| TCP lifecycle and cancellation-safe framing | [gateway.rs](src/transport/gateway.rs), [wire.rs](src/transport/wire.rs) |
+| TCP accept loop and bounded connection tasks | [gateway.rs](src/transport/gateway.rs) |
+| Owned connection lifecycle and audio exchanges | [connection.rs](src/transport/connection.rs) |
+| Cancellation-safe framing | [wire.rs](src/transport/wire.rs) |
 | Simulated capture, session behavior and reporting | [pacing.rs](src/simulation/pacing.rs), [session.rs](src/simulation/session.rs), [report.rs](src/simulation/report.rs) |
 | CLI argument overrides and process orchestration | [cli.rs](src/cli.rs), [main.rs](src/main.rs) |
 
 The private `Worker` owns scheduling and cache state. Its child modules implement focused methods on that same owner. Messages transfer work by ownership, and `Bytes` shares audio buffers cheaply. Cache replay consumes the uploaded history during validation; device jobs retain the current packet and verified prefix. A cancelled session's cache slot remains pinned until its submitted work physically completes.
+
+Dependencies follow the serving flow: TCP connections use the public ingress API, the session manager routes to workers, and workers use deadline/admission policies, cache state and the mock device. Worker code has no dependency on TCP or the simulator. Each connection owns its peer and generation-scoped lease; its request loop delegates opening, audio exchange, interruption and closing to focused methods. Packet invariants and replay validation are separate from worker queue mutation. Simulator lifecycle helpers consume closed audio connections explicitly.
+
+Functions should perform one operation at one level of abstraction. Modules group a cohesive responsibility, configuration has one typed owner per component, and protocol alternatives use enums. Pure scheduling policies are tested without a transport; integration tests exercise the runtime and TCP contracts, including cancellation and bounded overload. Keep ownership and dependency direction explicit when extending the prototype.
 
 Explicit shutdown cancels sessions and awaits submitted device work. Dropping the node requests cancellation, and scoped cancellation guards cover startup failures and early returns in serving, benchmarking and simulation. Calibration stops submitting probes after cancellation; its running probe finishes. The serving task handles Ctrl+C directly. The client models recoverable audio delivery with enum variants, while terminal failures use typed errors.
 
