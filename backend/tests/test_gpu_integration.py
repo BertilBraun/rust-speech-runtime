@@ -1,5 +1,5 @@
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 
@@ -61,8 +61,23 @@ def native_continuation_logits(model: SpeechModel, prefix: Tensor, continuation:
     return output.logits[:, -1].float().cpu()
 
 
+def native_replay_logits(model: SpeechModel, prefix: Tensor, continuation: Tensor) -> Tensor:
+    prompt = torch.cat((prefix, continuation))
+    output: CausalLMOutputWithPast = model.language_model(
+        inputs_embeds=prompt.unsqueeze(0),
+        past_key_values=DynamicCache(config=model.text_config),
+        attention_mask=continuation_mask([0], prompt.shape[0], model.device),
+        position_ids=continuation_positions([0], prompt.shape[0], model.device),
+        use_cache=True,
+        logits_to_keep=1,
+    )
+    return output.logits[:, -1].float().cpu()
+
+
 @pytest.mark.integration
-def test_real_speech_multiturn_cache_matches_full_replay(configured_model: SpeechModel) -> None:
+def test_real_speech_multiturn_cache_matches_full_replay(
+    configured_model: SpeechModel, record_property: Callable[[str, float], None]
+) -> None:
     model = configured_model
     with torch.inference_mode():
         speech, _ = model.encode_audio((bytes(32000), bytes(64000)))
@@ -79,9 +94,12 @@ def test_real_speech_multiturn_cache_matches_full_replay(configured_model: Speec
             (DynamicCache(config=model.text_config),),
         )
         native_logits = native_continuation_logits(model, prompts[0], next_prompt)
+        native_replay = native_replay_logits(model, prompts[0], next_prompt)
+        native_drift = (native_logits - native_replay).abs().max().item()
+        record_property("native_bf16_cached_replay_max_abs", native_drift)
+        # BF16 cached/replayed kernels differ; each execution shape must match its native reference.
         torch.testing.assert_close(cached, native_logits, atol=0, rtol=0)
-        # Native BF16 cached/replayed kernels differed by 0.198 on the shared 3090.
-        torch.testing.assert_close(cached, replay, atol=0.25, rtol=0.03)
+        torch.testing.assert_close(replay, native_replay, atol=0, rtol=0)
         torch.testing.assert_close(cached.argmax(-1), replay.argmax(-1), atol=0, rtol=0)
 
 
