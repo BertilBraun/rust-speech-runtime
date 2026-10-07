@@ -84,6 +84,16 @@ def resources(child_pid: int) -> Resources:
     )
 
 
+def observe_child(child: subprocess.Popen[bytes]) -> Resources | None:
+    try:
+        return resources(child.pid)
+    except (FileNotFoundError, ValueError):
+        # Exited Linux children can retain /proc/status without VmRSS until reaped.
+        if child.poll() is None:
+            raise
+        return None
+
+
 def run(command: list[str], limits: GuardLimits, report: Path) -> int:
     stopped = threading.Event()
 
@@ -97,9 +107,8 @@ def run(command: list[str], limits: GuardLimits, report: Path) -> int:
         child = subprocess.Popen(command)
         try:
             while child.poll() is None and not stopped.is_set():
-                try:
-                    observation = resources(child.pid)
-                except FileNotFoundError:
+                observation = observe_child(child)
+                if observation is None:
                     break
                 output.write(json.dumps(asdict(observation)) + "\n")
                 output.flush()

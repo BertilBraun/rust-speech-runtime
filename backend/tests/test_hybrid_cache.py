@@ -55,6 +55,7 @@ def tiny_model() -> Qwen3_5ForCausalLM:
         patch.setattr(modeling_qwen3_5, "causal_conv1d_update", None)
         patch.setattr(modeling_qwen3_5, "chunk_gated_delta_rule", None)
         patch.setattr(modeling_qwen3_5, "fused_recurrent_gated_delta_rule", None)
+        patch.setattr(modeling_qwen3_5, "FusedRMSNormGated", None)
         model = Qwen3_5ForCausalLM(configuration).eval()
     model.config._attn_implementation = "sdpa"
     return model
