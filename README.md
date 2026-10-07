@@ -18,22 +18,22 @@ This is a working runtime showcase with real-model RTX 3090 measurements. It str
 
 ## Measured on real hardware
 
-The [final immediate-commit benchmark](docs/GPU_IMMEDIATE_COMMIT_3090.md) uses one RTX 3090, BF16 serving weights and a real 5.94-second speech recording. Clients send 100 ms audio packets over loopback WebSocket and commit immediately after the final packet. **No speculative preparation or added endpointing delay is used.** The configured resident-session and active-turn limits are raised to 128 for the offered-concurrency sweep.
+The [staggered conversation benchmark](docs/GPU_STEADY_STATE_3090.md) uses one RTX 3090, BF16 serving weights and a real 5.94-second speech recording. Sessions start randomly across **10 seconds**, then cycle through user and assistant turns during a separate **20-second measurement interval**. Clients send 100 ms packets over loopback WebSocket and commit immediately after the final packet. **No speculative preparation or added endpointing delay is used.**
 
-| Offered conversations | Completed / refused turns, run 1; run 2 | First-token p95, run 1; run 2 |
-| --- | --- | --- |
-| 8 | 16 / 0; 16 / 0 | 106 ms; 109 ms |
-| 16 | 32 / 0; 30 / 1 | 173 ms; 257 ms |
-| 32 | 64 / 0; 30 / 17 | 673 ms; 239 ms |
-| 96 | 30 / 81; 16 / 88 | 372 ms; 197 ms |
+| Persistent conversations | Measured tokens/s | First-token p95 | Refused turn-start attempts during measurement |
+| --- | ---: | ---: | ---: |
+| 8 | 98.95 | 109 ms | 0 |
+| 32 | 249.20 | 203 ms | 212 |
 
-The first 32-conversation run reached **215 aggregate model tokens/s** including capture and think time. Every evaluated generation met the rolling four-token/second objective, but individual token gaps reached **896 ms**. All 96 offered conversations could open; many could not start a turn. Latencies describe accepted responses only. Later runs admitted less work because the conservative cost model retained slower observations; this is not an independently established concurrency ceiling.
+Every session produced text and had complete two-second generation-rate windows above the four-token/second target. At 32 sessions, ten individual token gaps exceeded 250 ms, with a **403 ms maximum**. Clients retained their connection and retried refused turn starts, so the 212 refusals include repeated attempts. First-token latency excludes waiting for admission: this is **not a refusal-free capacity claim** for 32 users.
 
-The report includes all latency percentiles, admission counts, token-rate violations, resource usage and reproducible commands. Latencies exclude client VAD decision time and an external network; the benchmark client knows where its recording ends. Model quality is evaluated in the training project, separately from serving behavior. Short trials on repeated audio do not establish sustainable capacity.
+Rust batch building and completion processing took **13 µs and 17 µs p95** at 32 sessions. Paired backend communication overhead was **0.70 ms p95**, including both Rust and Python framing/transport; Python decode was **28.2 ms p95**. These are measured boundary durations, not a complete Rust CPU profile. The report includes p50/p95/p99/max, admission counts, rate coverage, resource observations and commands. Short trials on repeated audio do not establish sustainable capacity or external-network latency. Model quality is evaluated in the training project.
+
+The earlier [immediate-commit concurrency sweep](docs/GPU_IMMEDIATE_COMMIT_3090.md) used arrivals spread across only 500 ms and preceded the cache optimization below. It remains available as historical burst-like evidence, including the offered-96-session overload cases.
 
 The older [endpoint-preparation experiment](docs/GPU_ENDPOINTING_3090.md) obtained **35.9–42.3 ms post-commit p95** at eight offered sessions by doing inference during an artificial 200 ms confirmation interval. Its **237–242 ms last-audio-to-first-token p95** is the relevant full interval. Those numbers are not the ordinary path's response latency. Historical experiments remain available with their limitations and raw-evidence identities.
 
-A subsequent [CPU/CUDA decoder profile](docs/GPU_DECODE_OPTIMIZATION_3090.md) found redundant cache copies and initialization in our PyTorch adapter. Removing them reduced batch-16 direct decode median latency from **39.6 to 26.1 ms** on the same 3090. This measures backend row-steps without audio capture or the gateway; the earlier conversation results above predate this optimization and are not its capacity claim.
+A [CPU/CUDA decoder profile](docs/GPU_DECODE_OPTIMIZATION_3090.md) found redundant cache copies and initialization in our PyTorch adapter. Removing them reduced batch-16 direct decode median latency from **39.6 to 26.1 ms** on the same 3090. This measures backend row-steps without audio capture or the gateway; the staggered conversation benchmark includes this optimization.
 
 ## How the system fits together
 
@@ -98,7 +98,7 @@ sequenceDiagram
 
 **Current audio cannot be incrementally prefetched into a final cache.** Whisper is bidirectional: extending the utterance changes earlier audio representations. Packet arrival therefore buffers audio; the ordinary path encodes and prefills the complete utterance after commit. Prior turns remain cached, so they are not replayed on every response.
 
-An optional `prepare` control computes a complete candidate on a private cache branch and holds its first token until commit. More speech invalidates it. Repeating that on every packet would repeatedly encode and prefill the growing utterance; it is not streaming inference. The final benchmark leaves preparation disabled. A genuinely incremental audio path needs a compatible streaming encoder/model. See [the preparation lifecycle](docs/ENDPOINTING_PREPARATION.md).
+An optional `prepare` control computes a complete candidate on a private cache branch and holds its first token until commit. More speech invalidates it. Repeating that on every packet would repeatedly encode and prefill the growing utterance; it is not streaming inference. The current benchmark leaves preparation disabled. A genuinely incremental audio path needs a compatible streaming encoder/model. See [the preparation lifecycle](docs/ENDPOINTING_PREPARATION.md).
 
 ## Scheduling and the four-token target
 
