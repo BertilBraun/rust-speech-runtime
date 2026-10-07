@@ -18,6 +18,32 @@ def recurrent_layer(cache: DynamicCache, index: int) -> LinearAttentionLayer:
     return cast(LinearAttentionLayer, cache.layers[index])
 
 
+def _install_attention(layer: DynamicLayer, keys: Tensor, values: Tensor) -> None:
+    """Adopt owned tensors into the pinned SDK layer without its empty-cache concatenation."""
+    layer.keys = keys
+    layer.values = values
+    layer.dtype = keys.dtype
+    layer.device = keys.device
+    layer.is_initialized = True
+
+
+def _install_recurrent(layer: LinearAttentionLayer, convolution: Tensor, recurrent: Tensor) -> None:
+    """Adopt owned state; normal SDK updates still mutate this storage during inference."""
+    layer.conv_states = convolution
+    layer.recurrent_states = recurrent
+    layer.dtype = convolution.dtype
+    layer.device = convolution.device
+    layer.batch_size = convolution.shape[0]
+    layer.conv_kernel_size = convolution.shape[-1]
+    layer.is_conv_states_initialized = True
+    layer.is_recurrent_states_initialized = True
+    layer.has_previous_state = True
+
+
+def _pad_attention(tensor: Tensor, padding: int) -> Tensor:
+    return functional.pad(tensor, (0, 0, padding, 0)) if padding else tensor
+
+
 def join_caches(caches: Sequence[DynamicCache], config: Qwen3_5TextConfig) -> DynamicCache:
     """Left-pad only attention KV; recurrent/convolution state has no padding positions."""
     if not caches:
@@ -37,9 +63,12 @@ def join_caches(caches: Sequence[DynamicCache], config: Qwen3_5TextConfig) -> Dy
                 for cache, length in zip(caches, lengths, strict=True):
                     layer = attention_layer(cache, index)
                     assert layer.keys is not None and layer.values is not None
-                    keys.append(functional.pad(layer.keys, (0, 0, maximum - length, 0)))
-                    values.append(functional.pad(layer.values, (0, 0, maximum - length, 0)))
-                joined.update(torch.cat(keys), torch.cat(values), index)
+                    padding = maximum - length
+                    keys.append(_pad_attention(layer.keys, padding))
+                    values.append(_pad_attention(layer.values, padding))
+                _install_attention(
+                    attention_layer(joined, index), torch.cat(keys), torch.cat(values)
+                )
             case "linear_attention":
                 convolution = []
                 recurrent = []
@@ -48,8 +77,9 @@ def join_caches(caches: Sequence[DynamicCache], config: Qwen3_5TextConfig) -> Dy
                     assert layer.conv_states is not None and layer.recurrent_states is not None
                     convolution.append(layer.conv_states)
                     recurrent.append(layer.recurrent_states)
-                joined.update_conv_state(torch.cat(convolution), index)
-                joined.update_recurrent_state(torch.cat(recurrent), index)
+                _install_recurrent(
+                    recurrent_layer(joined, index), torch.cat(convolution), torch.cat(recurrent)
+                )
             case _:
                 raise ValueError(f"Unsupported Qwen cache layer: {layer_type}")
     return joined
@@ -71,18 +101,19 @@ def split_cache(
                 for row, (cache, length) in enumerate(zip(separated, lengths, strict=True)):
                     start = maximum - length
                     stop = maximum + appended_tokens
-                    cache.update(
+                    _install_attention(
+                        attention_layer(cache, index),
                         layer.keys[row : row + 1, :, start:stop].clone(),
                         layer.values[row : row + 1, :, start:stop].clone(),
-                        index,
                     )
             case "linear_attention":
                 layer = recurrent_layer(batched, index)
                 assert layer.conv_states is not None and layer.recurrent_states is not None
                 for row, cache in enumerate(separated):
-                    cache.update_conv_state(layer.conv_states[row : row + 1].clone(), index)
-                    cache.update_recurrent_state(
-                        layer.recurrent_states[row : row + 1].clone(), index
+                    _install_recurrent(
+                        recurrent_layer(cache, index),
+                        layer.conv_states[row : row + 1].clone(),
+                        layer.recurrent_states[row : row + 1].clone(),
                     )
             case _:
                 raise ValueError(f"Unsupported Qwen cache layer: {layer_type}")

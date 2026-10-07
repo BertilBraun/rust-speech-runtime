@@ -33,6 +33,8 @@ The report includes all latency percentiles, admission counts, token-rate violat
 
 The older [endpoint-preparation experiment](docs/GPU_ENDPOINTING_3090.md) obtained **35.9–42.3 ms post-commit p95** at eight offered sessions by doing inference during an artificial 200 ms confirmation interval. Its **237–242 ms last-audio-to-first-token p95** is the relevant full interval. Those numbers are not the ordinary path's response latency. Historical experiments remain available with their limitations and raw-evidence identities.
 
+A subsequent [CPU/CUDA decoder profile](docs/GPU_DECODE_OPTIMIZATION_3090.md) found redundant cache copies and initialization in our PyTorch adapter. Removing them reduced batch-16 direct decode median latency from **39.6 to 26.1 ms** on the same 3090. This measures backend row-steps without audio capture or the gateway; the earlier conversation results above predate this optimization and are not its capacity claim.
+
 ## How the system fits together
 
 ```mermaid
