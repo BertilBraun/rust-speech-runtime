@@ -1,7 +1,10 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::{Args, Parser, Subcommand};
-use voice_scheduler::{simulation::SimulationConfig, transport::GatewayConfig};
+use voice_scheduler::{
+    simulation::{DEFAULT_AUDIO_PACKET_MS, SimulationConfig},
+    transport::GatewayConfig,
+};
 
 #[derive(Parser)]
 #[command(
@@ -56,9 +59,9 @@ pub struct BenchmarkArguments {
     pub turns: usize,
     #[arg(long, default_value_t = 1000)]
     pub utterance_ms: u64,
-    #[arg(long, default_value_t = 48)]
+    #[arg(long, default_value_t = DEFAULT_AUDIO_PACKET_MS)]
     pub minimum_packet_ms: u64,
-    #[arg(long, default_value_t = 55)]
+    #[arg(long, default_value_t = DEFAULT_AUDIO_PACKET_MS)]
     pub maximum_packet_ms: u64,
     #[arg(long, default_value_t = 500)]
     pub start_spread_ms: u64,

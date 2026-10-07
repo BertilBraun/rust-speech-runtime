@@ -360,7 +360,7 @@ async fn network_benchmark_exercises_multi_turn_churn_and_latency_distributions(
     let configuration = SimulationConfig {
         sessions: 4,
         turns_per_session: 2,
-        utterance_ms: 50,
+        utterance_ms: 250,
         start_spread_ms: 10,
         think_ms: 0,
         churn_rounds: 2,

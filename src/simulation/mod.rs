@@ -10,7 +10,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::{task::JoinSet, time::Instant};
 
-pub use config::SimulationConfig;
+pub use config::{DEFAULT_AUDIO_PACKET_MS, SimulationConfig};
 pub use report::{SessionSummary, SimulationReport};
 
 #[derive(Debug, thiserror::Error)]

@@ -65,7 +65,7 @@ flowchart TB
 
 Audio packets travel over WebSocket while the user speaks. They accumulate in the assigned Rust actor's bounded session record. **No Whisper or language-model forward runs for each incoming packet.** The client sends `commit` when the utterance ends. End-of-turn detection is currently the client's responsibility.
 
-The initial audio format is mono, little-endian PCM16 at 16 kHz, with a maximum 30-second utterance. The benchmark uses randomly started sessions and 48-55 ms packet intervals.
+The audio format is mono, little-endian PCM16 at 16 kHz, with a maximum 30-second utterance. The benchmark uses randomly started sessions and 100 ms packets: 1,600 samples / 3,200 PCM bytes each, plus a shorter final packet when needed. The model target is 10 Hz speech embeddings. Transport packet boundaries do not determine embedding boundaries; the complete utterance is encoded at commit. The optional jitter scenario uses 100–110 ms capture intervals.
 
 ```mermaid
 sequenceDiagram
@@ -81,7 +81,7 @@ sequenceDiagram
     G->>W: Begin: reserve active-turn capacity
     W-->>G: Accepted, or capacity rejection
     G-->>C: accepted / failed
-    loop While user speaks: benchmark packets every 48-55 ms
+    loop While user speaks: default packets every 100 ms
         C->>G: Binary PCM16 audio chunk
         G->>W: Audio: turn ID, chunk index, bytes
         W->>W: Validate chunk<br/>Append to RAM record

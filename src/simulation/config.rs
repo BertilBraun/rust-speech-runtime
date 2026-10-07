@@ -2,6 +2,8 @@ use std::{path::PathBuf, time::Duration};
 
 use super::SimulationError;
 
+pub const DEFAULT_AUDIO_PACKET_MS: u64 = 100;
+
 #[derive(Clone, Debug)]
 pub struct SimulationConfig {
     pub sessions: usize,
@@ -26,8 +28,8 @@ impl Default for SimulationConfig {
             sessions: 8,
             turns_per_session: 2,
             utterance_ms: 1000,
-            minimum_packet_ms: 48,
-            maximum_packet_ms: 55,
+            minimum_packet_ms: DEFAULT_AUDIO_PACKET_MS,
+            maximum_packet_ms: DEFAULT_AUDIO_PACKET_MS,
             start_spread_ms: 500,
             think_ms: 250,
             target_tokens_per_second: 4.0,

@@ -23,7 +23,7 @@ The model's quality with persistent speech history is owned by training, but cac
 
 ## Measure the complete service
 
-Use ordinary network WebSocket clients with independent random session starts and 48–55 ms packet intervals during capture. Include different utterance lengths, think times, output lengths, simultaneous end-of-turn bursts, session churn and interruptions. Do not force sessions into a periodic audio-decode workload.
+Use ordinary network WebSocket clients with independent random session starts and 100 ms packets during capture, matching the final 10 Hz model target. Include the 100–110 ms jitter scenario, different utterance lengths, think times, output lengths, simultaneous end-of-turn bursts, session churn and interruptions. Preserve short final packets and exact sample counts. Do not force sessions into a periodic audio-decode workload.
 
 Measure end-of-turn to first token separately from subsequent client-observed model token throughput. Report per-session rolling rates and inter-token p50/p95/p99/max; aggregate tokens/second alone can conceal starvation. For actively generating sessions, the initial service objective is at least four model tokens/second after the first token. Report violations and the measurement window explicitly.
 

@@ -2,7 +2,7 @@
 
 A Tokio gateway schedules persistent audio conversations across a configurable list of GPU workers. Ordinary WebSocket clients send user audio, commit the turn and receive streamed text tokens. Rust owns admission, sticky placement, turn state, dynamic batching, interruption and output acceptance. A persistent Python process per GPU owns the PyTorch model and complete hybrid conversation cache. There is no authentication, database, frontend or text-to-speech stage.
 
-The model is Whisper Small, a speech projection layer and Qwen3.5-2B. Complete utterances are encoded at commit because Whisper is bidirectional. Prior audio embeddings and accepted assistant tokens stay in the worker's cache across turns. The initial deployment may have two GPUs; the endpoint list controls GPU count.
+The model is Whisper Small, a speech projection layer and Qwen3.5-2B. The serving target is **10 Hz audio embeddings**, with **100 ms audio packets** from clients. Complete utterances are encoded at commit because Whisper is bidirectional. Prior audio embeddings and accepted assistant tokens stay in the worker's cache across turns. The initial deployment may have two GPUs; the endpoint list controls GPU count.
 
 Start with the **[visual architecture guide](docs/ARCHITECTURE.md)** for seven Mermaid diagrams covering the system, one turn, computation, cache/storage ownership, batching, interruption and shutdown. Each diagram links to the code that implements it.
 
@@ -14,7 +14,7 @@ flowchart LR
     gateway -->|"Final record on close"| archive[("Session archive files")]
 ```
 
-The agreed design is in [PLAN.md](PLAN.md), implementation decisions in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md), measured local results in [docs/LOCAL_VALIDATION.md](docs/LOCAL_VALIDATION.md), and tomorrow's checks in [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md). [PERFORMANCE.md](PERFORMANCE.md) preserves measurements of the superseded periodic audio-echo workload; those results do not establish this model's capacity. The old TCP echo transport and simulator have been replaced.
+The agreed design is in [PLAN.md](PLAN.md), implementation decisions in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md), measured local results in [docs/LOCAL_VALIDATION.md](docs/LOCAL_VALIDATION.md), and GPU checks in [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md). The [model integration status](docs/MODEL_INTEGRATION.md) records the checked training architecture and remaining checkpoint/hardware work. [PERFORMANCE.md](PERFORMANCE.md) preserves measurements of the superseded periodic audio-echo workload; those results do not establish this model's capacity. The old TCP echo transport and simulator have been replaced.
 
 ## Run the pipeline
 
@@ -27,7 +27,7 @@ uv run python tests/fixture_worker.py --port 9100 --response-tokens 12 --prefill
 # Terminal 2, from the repository root.
 cargo run --release -- serve --runtime-config examples/runtime.json
 
-# Terminal 3: ordinary clients, random starts and 48–55 ms packets.
+# Terminal 3: ordinary clients, random starts and 100 ms packets.
 cargo run --release -- benchmark --sessions 1 --turns 3
 cargo run --release -- benchmark --sessions 16 --turns 3 --report benchmark-results/turns.json
 cargo run --release -- benchmark --sessions 16 --turns 4 --interrupt-after-tokens 3 --churn-rounds 3 --report benchmark-results/interruption.json
@@ -35,11 +35,11 @@ cargo run --release -- suite --session-budget 16 --sessions 8 --turns 2 --report
 cargo run --example session
 ```
 
-The fixture charges its full configured duration for every nonempty batch. Its response has 12 ordinary tokens followed by an accepted EOS token. This exercises transport, cache and scheduling; it does not measure GPU performance. `benchmark` connects to an independently running gateway and never bypasses the network. `suite` offers low/50%/80%/95%/120% of the explicit session budget, then aligned starts, jitter, churn and interruption. The budget is an offered-load reference rather than measured hardware capacity.
+The fixture charges its full configured duration for every nonempty batch. Its response has 12 ordinary tokens followed by an accepted EOS token. This exercises transport, cache and scheduling; it does not measure GPU performance. `benchmark` connects to an independently running gateway and never bypasses the network. `suite` offers low/50%/80%/95%/120% of the explicit session budget, then aligned starts at 100 ms cadence, jitter with 100–110 ms capture intervals, churn and interruption. The budget is an offered-load reference rather than measured hardware capacity.
 
 Run the one-session warmup first so reactive estimates have observations. The example starts with a conservative 100 ms unknown-forward estimate; it can reject turns until it learns the active batch/context shapes. Warmup does not establish every future shape's cost or guarantee that all offered sessions will be accepted. Inspect reported rejections and measured hardware results before raising capacity.
 
-Use `--audio-file path/to/audio.pcm` for real speech. It must contain raw little-endian signed PCM16, mono, 16 kHz, up to 30 seconds. The benchmark sends silence when omitted. Use `--url ws://host:8080/v1` for another machine. Packet length follows the sampled 48–55 ms interval, keeping sample accounting consistent with capture time.
+Use `--audio-file path/to/audio.pcm` for real speech. It must contain raw little-endian signed PCM16, mono, 16 kHz, up to 30 seconds. The benchmark sends silence when omitted. Use `--url ws://host:8080/v1` for another machine. Default packets contain 100 ms of audio: 1,600 samples / 3,200 PCM bytes. A final shorter packet retains the utterance tail. `--minimum-packet-ms` and `--maximum-packet-ms` remain configurable for timing experiments; packet length follows the sampled capture interval. The gateway validates order and sample counts rather than imposing a wall-clock arrival rate. Model embedding frequency is determined by the projector, independently of transport packet boundaries.
 
 `examples/runtime.json` is the canonical runtime configuration. Add or remove worker endpoints to change GPU count. Each endpoint refers to a ready, warmed worker exclusively owned by this gateway. Runtime JSON is strict: important fields are explicit and unknown fields fail. Tune session/cache limits, active-turn reservations, batch limits and reactive timing headroom on actual hardware. CLI `--listen`, `--max-connections`, `--archive-directory` and `--no-archive` concern only the gateway.
 
@@ -50,7 +50,7 @@ Connect to `/v1`; other paths receive an HTTP rejection. One connection owns one
 ```json
 {"type":"open","session_id":"conversation-123"}
 {"type":"start_turn","turn_id":1}
-{"type":"commit","turn_id":1,"chunk_count":20,"sample_count":16000}
+{"type":"commit","turn_id":1,"chunk_count":10,"sample_count":16000}
 {"type":"cancel","turn_id":1}
 {"type":"close"}
 ```

@@ -5,7 +5,7 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 use voice_scheduler::{
     config::RuntimeConfig,
-    simulation::{self, SimulationError, SimulationReport},
+    simulation::{self, DEFAULT_AUDIO_PACKET_MS, SimulationError, SimulationReport},
     transport::{Gateway, GatewayError},
 };
 
@@ -113,12 +113,12 @@ async fn suite(arguments: SuiteArguments) -> Result<(), ApplicationError> {
         match name {
             "aligned" => {
                 workload.start_spread_ms = 0;
-                workload.minimum_packet_ms = 50;
-                workload.maximum_packet_ms = 50;
+                workload.minimum_packet_ms = DEFAULT_AUDIO_PACKET_MS;
+                workload.maximum_packet_ms = DEFAULT_AUDIO_PACKET_MS;
             }
             "jitter" => {
-                workload.minimum_packet_ms = 48;
-                workload.maximum_packet_ms = 55;
+                workload.minimum_packet_ms = DEFAULT_AUDIO_PACKET_MS;
+                workload.maximum_packet_ms = DEFAULT_AUDIO_PACKET_MS + 10;
             }
             "churn" => workload.churn_rounds = 3,
             "interruption" => workload.interrupt_after_tokens = Some(2),

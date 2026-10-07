@@ -2,6 +2,8 @@
 
 The Rust gateway, scheduler, Python worker protocol and ordinary WebSocket clients have been exercised together on Windows, with additional Rust tests on Ubuntu/WSL. These are synthetic serving measurements. No trained checkpoint, CUDA inference, GPU cache parity or rented GPU node was tested; see [hardware validation](HARDWARE_VALIDATION.md).
 
+The runs below retain their original 48–55 ms packet cadence. On 7 October the default workload changed to 100 ms packets for the final 10 Hz model target. These historical reports have not been rerun or relabeled; current integration checks are recorded in [MODEL_INTEGRATION.md](MODEL_INTEGRATION.md).
+
 ## Revisions and evidence
 
 The broad release scenarios used Rust `9cc4da3` and the Python idle-frame fix `8f63afb`. The later Python `54ecefa` changes real-model timing attribution, without changing the fixture protocol. The final archive and transport audit used Rust `e010a42`; `055aa05` subsequently extracted session cleanup without changing behavior, and passed the final Rust gates. Test-only process cleanup followed in Rust `74a5553` and Python `0507388`, with the cross-language test explicitly repeated afterward. Raw JSON reports, configurations, logs and conversation archives remain locally under ignored `benchmark-results/local-turn-pipeline-20261006/`. They are deliberately excluded from Git because session archives contain actual input and output data.

@@ -3,6 +3,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use voice_scheduler::{
     protocol::{SessionEvent, SessionId, TurnId},
+    simulation::DEFAULT_AUDIO_PACKET_MS,
     transport::VoiceClient,
 };
 
@@ -15,13 +16,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for index in 1..=2 {
         let turn_id = TurnId(index);
         client.begin_turn(turn_id).await?;
-        for chunk in 0..20 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        for chunk in 0..10 {
+            tokio::time::sleep(Duration::from_millis(DEFAULT_AUDIO_PACKET_MS)).await;
             client
-                .audio(turn_id, chunk, Bytes::from(vec![0; 1600]))
+                .audio(turn_id, chunk, Bytes::from(vec![0; 3200]))
                 .await?;
         }
-        client.commit(turn_id, 20, 16_000).await?;
+        client.commit(turn_id, 10, 16_000).await?;
         loop {
             match client.next_event().await? {
                 SessionEvent::TextDelta { text, .. } => print!("{text}"),
