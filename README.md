@@ -27,13 +27,36 @@ The [staggered conversation benchmark](docs/GPU_STEADY_STATE_3090.md) uses one R
 
 Every session produced text and had complete two-second generation-rate windows above the four-token/second target. At 32 sessions, ten individual token gaps exceeded 250 ms, with a **403 ms maximum**. Clients retained their connection and retried refused turn starts, so the 212 refusals include repeated attempts. First-token latency excludes waiting for admission: this is **not a refusal-free capacity claim** for 32 users.
 
-Rust batch building and completion processing took **13 µs and 17 µs p95** at 32 sessions. Paired backend communication overhead was **0.70 ms p95**, including both Rust and Python framing/transport; Python decode was **28.2 ms p95**. These are measured boundary durations, not a complete Rust CPU profile. The report includes p50/p95/p99/max, admission counts, rate coverage, resource observations and commands. Short trials on repeated audio do not establish sustainable capacity or external-network latency. Model quality is evaluated in the training project.
+The report includes p50/p95/p99/max, admission counts, rate coverage, resource observations and commands. Short trials on repeated audio do not establish sustainable capacity or external-network latency. Model quality is evaluated in the training project.
 
 The earlier [immediate-commit concurrency sweep](docs/GPU_IMMEDIATE_COMMIT_3090.md) used arrivals spread across only 500 ms and preceded the cache optimization below. It remains available as historical burst-like evidence, including the offered-96-session overload cases.
 
 The older [endpoint-preparation experiment](docs/GPU_ENDPOINTING_3090.md) obtained **35.9–42.3 ms post-commit p95** at eight offered sessions by doing inference during an artificial 200 ms confirmation interval. Its **237–242 ms last-audio-to-first-token p95** is the relevant full interval. Those numbers are not the ordinary path's response latency. Historical experiments remain available with their limitations and raw-evidence identities.
 
 A [CPU/CUDA decoder profile](docs/GPU_DECODE_OPTIMIZATION_3090.md) found redundant cache copies and initialization in our PyTorch adapter. Removing them reduced batch-16 direct decode median latency from **39.6 to 26.1 ms** on the same 3090. This measures backend row-steps without audio capture or the gateway; the staggered conversation benchmark includes this optimization.
+
+### Scheduling and orchestration timings
+
+The measured Rust scheduling work takes **microseconds**, while model execution takes **tens of milliseconds**. At 32 conversations, batch building took **13 µs p95** and completion handling **17 µs p95**, compared with **28.2 ms p95** for Python decode. The inference engine, cache operations and batching are the main opportunities for further throughput improvements in this workload.
+
+| Timing boundary | What it measures | p95 at 32 sessions |
+| --- | --- | ---: |
+| Worker command handling | Apply one mailbox command; excludes queue wait and reply delivery | 0.014 ms |
+| Batch building | Select eligible sessions, construct metadata and pack audio | 0.013 ms |
+| Completion processing | Accept token proposals, update session state and enqueue output | 0.017 ms |
+| Execution handoff | Prepared batch to execution task starting its backend request | 0.002 ms |
+| Completion handoff | Backend response ready to scheduling actor handling it | 0.002 ms |
+| WebSocket serialization | Encode an outbound event as JSON | 0.001 ms |
+| WebSocket write | Send/flush an event, including OS waits and client backpressure | 0.016 ms |
+| Backend RPC overhead | Each round trip minus its matching Python engine duration; includes both sides' framing, loopback transport and executor handoff | 0.698 ms |
+| Python audio encode | Whisper and speech projection, including CPU orchestration and GPU work | 28.847 ms |
+| Python prefill | Process the turn's input into the language-model cache | 35.231 ms |
+| Python decode | Execute an autoregressive decoding step for a batch | 28.223 ms |
+| Scheduling queue delay | Committed turn waiting to begin model execution | 113.087 ms |
+
+These elapsed boundary timings cover the gateway's whole lifetime, including ramp-up and draining. Backend RPC overhead includes Rust and Python work; it is not a Rust-only measurement. The histogram's minimum bucket is 0.001 ms. Individual p95 values cannot be added to reconstruct response latency.
+
+This demonstrates small measured scheduling and orchestration overhead at the tested load. Queueing remains significant: batching and admission policy affect when model work runs, even when constructing a batch is cheap. First-token latency also includes audio encoding and prefill. Ingress parsing, mailbox queue wait, metrics recording and archive work were not independently profiled here; the table is not a complete Rust CPU profile. See the [full timing distributions and measurement definitions](docs/GPU_STEADY_STATE_3090.md#where-the-time-goes).
 
 ## How the system fits together
 
