@@ -366,7 +366,7 @@ async fn network_benchmark_exercises_multi_turn_churn_and_latency_distributions(
     let gateway = TestGateway::start(backend.config(), gateway_config()).await;
     let configuration = SimulationConfig {
         sessions: 4,
-        turns_per_session: 2,
+        length: voice_scheduler::simulation::WorkloadLength::Turns(2),
         utterance_ms: 250,
         start_spread_ms: 10,
         think_ms: 0,
@@ -413,6 +413,74 @@ async fn bounded_handshakes_and_connection_limit_do_not_block_healthy_clients() 
     client.close().await.expect("healthy closed");
     drop(half_open);
     assert_eq!(gateway.shutdown().await.rejected_connections, 1);
+}
+
+#[tokio::test]
+async fn steady_benchmark_excludes_ramp_up_and_retains_every_session() {
+    let backend = Fixture::start(20).await;
+    let gateway = TestGateway::start(backend.config(), gateway_config()).await;
+    let report = simulation::run(
+        &gateway.url,
+        SimulationConfig {
+            sessions: 4,
+            length: voice_scheduler::simulation::WorkloadLength::SteadyState {
+                measurement: Duration::from_millis(600),
+            },
+            utterance_ms: 10,
+            start_spread_ms: 100,
+            think_ms: 10,
+            throughput_window_ms: 30,
+            ..SimulationConfig::default()
+        },
+    )
+    .await
+    .expect("timed workload");
+    assert_eq!(report.admitted_sessions, 4);
+    assert_eq!(report.failed_sessions, 0, "{:?}", report.sessions);
+    let measured = report.steady_state.expect("measurement report");
+    assert_eq!(measured.measurement_seconds, 0.6);
+    assert_eq!(measured.sessions_with_tokens, 4);
+    assert!(report.elapsed_seconds > measured.ramp_up_seconds + measured.measurement_seconds);
+    assert!(measured.traffic.received_tokens <= report.received_tokens);
+    assert_eq!(
+        measured.traffic.received_tokens,
+        report
+            .sessions
+            .iter()
+            .map(|session| session.measured.as_ref().unwrap().received_tokens)
+            .sum::<usize>()
+    );
+    let stopped = gateway.shutdown().await;
+    assert_eq!(stopped.runtime.active_sessions, 0);
+    assert!(stopped.runtime.runtime_timing.batch_build.count > 0);
+    assert!(stopped.runtime.runtime_timing.websocket_write.count > 0);
+}
+
+#[tokio::test]
+async fn steady_benchmark_retries_refused_turns_without_retiring_sessions() {
+    let backend = Fixture::start(20).await;
+    let mut runtime = backend.config();
+    runtime.max_active_turns_per_worker = 1;
+    let gateway = TestGateway::start(runtime, gateway_config()).await;
+    let report = simulation::run(
+        &gateway.url,
+        SimulationConfig {
+            sessions: 4,
+            length: voice_scheduler::simulation::WorkloadLength::SteadyState {
+                measurement: Duration::from_millis(600),
+            },
+            utterance_ms: 10,
+            start_spread_ms: 50,
+            think_ms: 0,
+            ..SimulationConfig::default()
+        },
+    )
+    .await
+    .expect("timed admission trial");
+    assert_eq!(report.admitted_sessions, 4);
+    assert_eq!(report.failed_sessions, 0, "{:?}", report.sessions);
+    assert!(report.steady_state.unwrap().traffic.rejected_turns > 0);
+    assert_eq!(gateway.shutdown().await.runtime.active_sessions, 0);
 }
 
 #[tokio::test]
@@ -478,7 +546,7 @@ async fn python_worker_process_to_websocket_client_full_pipeline() {
         &gateway.url,
         SimulationConfig {
             sessions: 4,
-            turns_per_session: 2,
+            length: voice_scheduler::simulation::WorkloadLength::Turns(2),
             utterance_ms: 50,
             start_spread_ms: 10,
             think_ms: 0,
@@ -551,7 +619,7 @@ async fn benchmark_cancellation_drains_accepted_tokens_and_finish_before_next_tu
         &gateway.url,
         SimulationConfig {
             sessions: 2,
-            turns_per_session: 2,
+            length: voice_scheduler::simulation::WorkloadLength::Turns(2),
             utterance_ms: 50,
             start_spread_ms: 0,
             think_ms: 0,
@@ -615,7 +683,7 @@ async fn benchmark_reports_terminal_backend_failure_instead_of_completed_turn() 
         &gateway.url,
         SimulationConfig {
             sessions: 1,
-            turns_per_session: 1,
+            length: voice_scheduler::simulation::WorkloadLength::Turns(1),
             utterance_ms: 50,
             start_spread_ms: 0,
             ..SimulationConfig::default()
@@ -670,7 +738,7 @@ async fn benchmark_distinguishes_session_admission_from_active_turn_rejection() 
         &gateway.url,
         SimulationConfig {
             sessions: 8,
-            turns_per_session: 1,
+            length: voice_scheduler::simulation::WorkloadLength::Turns(1),
             utterance_ms: 100,
             start_spread_ms: 0,
             ..SimulationConfig::default()

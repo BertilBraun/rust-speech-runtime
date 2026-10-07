@@ -4,14 +4,21 @@ mod config;
 mod measurements;
 mod report;
 mod session;
+mod steady;
 
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio::{task::JoinSet, time::Instant};
+use tokio::{
+    sync::{oneshot, watch},
+    task::JoinSet,
+    time::Instant,
+};
 
-pub use config::{DEFAULT_AUDIO_PACKET_MS, SimulationConfig};
+pub use config::{DEFAULT_AUDIO_PACKET_MS, SimulationConfig, WorkloadLength};
 pub use report::{SessionSummary, SimulationReport};
+pub use steady::{MeasuredTraffic, SteadyStateReport};
+use steady::{MeasurementWindow, SteadyMeasurements};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SimulationError {
@@ -37,19 +44,37 @@ pub async fn run(
     let mut endpoint_confirmation = measurements::histogram();
     let mut gaps = measurements::histogram();
     let mut sessions = Vec::with_capacity(configuration.sessions * configuration.churn_rounds);
+    let (window_sender, window_receiver) = watch::channel(None);
+    let mut measured = SteadyMeasurements::default();
     for round in 0..configuration.churn_rounds {
         let mut clients = JoinSet::new();
+        let mut openings = Vec::with_capacity(configuration.sessions);
         for index in 0..configuration.sessions {
+            let (opened, opening) = oneshot::channel();
+            openings.push(opening);
             clients.spawn(session::run(
                 url.clone(),
                 configuration.clone(),
                 audio.clone(),
                 index,
                 round,
+                opened,
+                window_receiver.clone(),
             ));
         }
+        if let WorkloadLength::SteadyState { measurement } = configuration.length {
+            for opening in openings {
+                // A dropped sender records a failed attempt without trapping the cohort.
+                let _ = opening.await;
+            }
+            let starts_at = Instant::now();
+            window_sender.send_replace(Some(MeasurementWindow {
+                starts_at,
+                ends_at: starts_at + measurement,
+            }));
+        }
         while let Some(result) = clients.join_next().await {
-            let measurement = result?;
+            let mut measurement = result?;
             ttft.add(&measurement.ttft)
                 .expect("matching histogram precision");
             end_of_audio_to_first_token
@@ -60,12 +85,19 @@ pub async fn run(
                 .expect("matching histogram precision");
             gaps.add(&measurement.token_gaps)
                 .expect("matching histogram precision");
+            if matches!(configuration.length, WorkloadLength::SteadyState { .. }) {
+                measured.merge(&measurement.steady);
+                measurement.summary.measured = Some(measurement.steady.report());
+            }
             sessions.push(measurement.summary);
         }
     }
     sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
     let elapsed_seconds = started.elapsed().as_secs_f64();
     let received_tokens = sessions.iter().map(|session| session.received_tokens).sum();
+    let steady_state = window_receiver
+        .borrow()
+        .map(|window| measured.cohort_report(window, started, &sessions));
     Ok(SimulationReport {
         prepare_before_commit: configuration.prepare_before_commit,
         endpointing_ms: configuration.endpointing_ms,
@@ -100,6 +132,7 @@ pub async fn run(
         endpoint_confirmation_ms: measurements::distribution(&endpoint_confirmation),
         token_gap_ms: measurements::distribution(&gaps),
         sessions,
+        steady_state,
     })
 }
 

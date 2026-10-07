@@ -1,10 +1,13 @@
 use std::{collections::VecDeque, time::Duration};
 
 use hdrhistogram::Histogram;
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::report::SessionSummary;
+use super::steady::{MeasurementWindow, SteadyMeasurements};
 use crate::metrics::LatencyDistribution;
+use crate::protocol::FinishReason;
 
 pub(crate) struct Measurements {
     pub summary: SessionSummary,
@@ -12,6 +15,8 @@ pub(crate) struct Measurements {
     pub end_of_audio_to_first_token: Histogram<u64>,
     pub endpoint_confirmation: Histogram<u64>,
     pub token_gaps: Histogram<u64>,
+    pub steady: SteadyMeasurements,
+    pub measurement_window: Option<watch::Receiver<Option<MeasurementWindow>>>,
 }
 
 impl Measurements {
@@ -22,6 +27,21 @@ impl Measurements {
             end_of_audio_to_first_token: histogram(),
             endpoint_confirmation: histogram(),
             token_gaps: histogram(),
+            steady: SteadyMeasurements::default(),
+            measurement_window: None,
+        }
+    }
+
+    pub fn window(&self) -> Option<MeasurementWindow> {
+        self.measurement_window
+            .as_ref()
+            .and_then(|receiver| *receiver.borrow())
+    }
+
+    pub fn reject_turn(&mut self, now: Instant) {
+        self.summary.rejected_turns += 1;
+        if self.window().is_some_and(|window| window.contains(now)) {
+            self.steady.reject_turn();
         }
     }
 }
@@ -47,10 +67,10 @@ pub(crate) fn distribution(histogram: &Histogram<u64>) -> LatencyDistribution {
 }
 
 pub(crate) struct TurnTiming {
-    audio_finished: Instant,
-    committed: Instant,
+    pub(super) audio_finished: Instant,
+    pub(super) committed: Instant,
     first_token: Option<Instant>,
-    previous_token: Option<Instant>,
+    pub(super) previous_token: Option<Instant>,
     arrivals: VecDeque<Instant>,
     tokens: usize,
 }
@@ -72,6 +92,9 @@ impl TurnTiming {
     }
 
     pub fn token(&mut self, now: Instant, measurements: &mut Measurements, target: f64) {
+        if let Some(window) = measurements.window() {
+            measurements.steady.token(now, self, window, target);
+        }
         if let Some(previous) = self.previous_token {
             let gap = now - previous;
             record(&mut measurements.token_gaps, gap);
@@ -112,6 +135,12 @@ impl TurnTiming {
         }
         if self.first_token.is_some_and(|first| now - first >= window) {
             let rate = self.arrivals.len() as f64 / window.as_secs_f64();
+            if measurements
+                .window()
+                .is_some_and(|period| period.contains(now) && now - window >= period.starts_at)
+            {
+                measurements.steady.observe_rate(rate, target);
+            }
             if rate < target {
                 measurements.summary.rolling_rate_violations += 1;
             }
@@ -124,7 +153,14 @@ impl TurnTiming {
         }
     }
 
-    pub fn finish(&self, measurements: &mut Measurements) {
+    pub fn finish(&self, measurements: &mut Measurements, reason: FinishReason) {
+        if matches!(reason, FinishReason::Eos | FinishReason::TokenLimit)
+            && measurements
+                .window()
+                .is_some_and(|window| window.contains(self.committed))
+        {
+            measurements.steady.finish_turn();
+        }
         if self.tokens > 1 {
             let duration = self.previous_token.expect("tokens observed")
                 - self.first_token.expect("tokens observed");

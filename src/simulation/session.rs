@@ -2,7 +2,10 @@ use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
-use tokio::time::Instant;
+use tokio::{
+    sync::{oneshot, watch},
+    time::Instant,
+};
 
 use crate::{
     protocol::{ErrorCode, FinishReason, SessionEvent, SessionId, TurnId},
@@ -10,8 +13,9 @@ use crate::{
 };
 
 use super::{
-    SimulationConfig,
+    SimulationConfig, WorkloadLength,
     measurements::{Measurements, TurnTiming},
+    steady::MeasurementWindow,
 };
 
 pub(crate) async fn run(
@@ -20,9 +24,12 @@ pub(crate) async fn run(
     audio: Bytes,
     index: usize,
     round: usize,
+    opened: oneshot::Sender<()>,
+    measurement_window: watch::Receiver<Option<MeasurementWindow>>,
 ) -> Measurements {
     let session_id = format!("benchmark-{round}-{index}");
     let mut measurements = Measurements::new(session_id.clone());
+    measurements.measurement_window = Some(measurement_window);
     let mut random = SmallRng::seed_from_u64(
         configuration
             .seed
@@ -37,6 +44,7 @@ pub(crate) async fn run(
         session_id,
         &mut random,
         &mut measurements,
+        opened,
     )
     .await
     {
@@ -62,11 +70,13 @@ async fn conversation(
     session_id: String,
     random: &mut SmallRng,
     measurements: &mut Measurements,
+    opened: oneshot::Sender<()>,
 ) -> Result<(), GatewayError> {
     let mut client = VoiceClient::connect(url, configuration.response_timeout).await?;
     let worker_id = client.open(SessionId(session_id)).await?;
     measurements.summary.worker_id = Some(worker_id);
     measurements.summary.admitted = true;
+    let _ = opened.send(());
     let result = turns(&mut client, configuration, audio, random, measurements).await;
     let cleanup = client.close().await;
     result?;
@@ -80,33 +90,82 @@ async fn turns(
     random: &mut SmallRng,
     measurements: &mut Measurements,
 ) -> Result<(), GatewayError> {
-    for index in 0..configuration.turns_per_session {
+    let mut index = 0;
+    while should_start_turn(configuration, index, measurements.window()) {
         let turn_id = TurnId(index as u64 + 1);
-        client.begin_turn(turn_id).await?;
-        measurements.summary.admitted_turns += 1;
-        let chunks = send_audio(client, turn_id, audio.clone(), configuration, random).await?;
-        let audio_finished = Instant::now();
-        if configuration.prepare_before_commit {
-            client.prepare(turn_id, chunks, audio.len() / 2).await?;
-        }
-        tokio::time::sleep_until(
-            audio_finished + Duration::from_millis(configuration.endpointing_ms),
-        )
-        .await;
-        let committed = Instant::now();
-        client.commit(turn_id, chunks, audio.len() / 2).await?;
-        generate(
-            client,
-            turn_id,
-            TurnTiming::new(audio_finished, committed),
-            configuration,
-            measurements,
-        )
-        .await?;
-        if index + 1 < configuration.turns_per_session {
-            tokio::time::sleep(Duration::from_millis(configuration.think_ms)).await;
+        let rejected = match client.begin_turn(turn_id).await {
+            Ok(()) => {
+                measurements.summary.admitted_turns += 1;
+                run_turn(
+                    client,
+                    turn_id,
+                    configuration,
+                    audio.clone(),
+                    random,
+                    measurements,
+                )
+                .await?;
+                false
+            }
+            Err(GatewayError::Rejected(ErrorCode::CapacityExceeded, _))
+                if matches!(configuration.length, WorkloadLength::SteadyState { .. }) =>
+            {
+                measurements.reject_turn(Instant::now());
+                true
+            }
+            Err(error) => return Err(error),
+        };
+        index += 1;
+        if should_start_turn(configuration, index, measurements.window()) {
+            let think_ms = if rejected {
+                configuration.think_ms.max(100)
+            } else {
+                configuration.think_ms
+            };
+            tokio::time::sleep(Duration::from_millis(think_ms)).await;
         }
     }
+    Ok(())
+}
+
+fn should_start_turn(
+    configuration: &SimulationConfig,
+    index: usize,
+    window: Option<MeasurementWindow>,
+) -> bool {
+    match configuration.length {
+        WorkloadLength::Turns(count) => index < count,
+        WorkloadLength::SteadyState { .. } => {
+            window.is_none_or(|window| Instant::now() < window.ends_at)
+        }
+    }
+}
+
+async fn run_turn(
+    client: &mut VoiceClient,
+    turn_id: TurnId,
+    configuration: &SimulationConfig,
+    audio: Bytes,
+    random: &mut SmallRng,
+    measurements: &mut Measurements,
+) -> Result<(), GatewayError> {
+    let chunks = send_audio(client, turn_id, audio.clone(), configuration, random).await?;
+    let audio_finished = Instant::now();
+    if configuration.prepare_before_commit {
+        client.prepare(turn_id, chunks, audio.len() / 2).await?;
+    }
+    tokio::time::sleep_until(audio_finished + Duration::from_millis(configuration.endpointing_ms))
+        .await;
+    let committed = Instant::now();
+    client.commit(turn_id, chunks, audio.len() / 2).await?;
+    generate(
+        client,
+        turn_id,
+        TurnTiming::new(audio_finished, committed),
+        configuration,
+        measurements,
+    )
+    .await?;
     Ok(())
 }
 
@@ -186,7 +245,7 @@ async fn generate(
                 reason,
                 ..
             } if observed == turn_id => {
-                timing.finish(measurements);
+                timing.finish(measurements, reason);
                 match reason {
                     FinishReason::Eos => measurements.summary.completed_turns += 1,
                     FinishReason::TokenLimit => {

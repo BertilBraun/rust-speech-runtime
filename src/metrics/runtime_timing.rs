@@ -4,9 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use super::{Distribution, LatencyDistribution};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 /// Elapsed boundary timings; socket waits and IPC are not CPU execution time.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RuntimeTimingSnapshot {
+    /// Applying a worker mailbox command; excludes queue wait and reply delivery.
+    pub command_processing: LatencyDistribution,
     /// Selecting eligible sessions, building metadata and packing audio; no backend await.
     pub batch_build: LatencyDistribution,
     /// Applying returned proposals, updating state and enqueuing output; no socket await.
@@ -24,6 +26,7 @@ pub struct RuntimeTimingSnapshot {
 
 #[derive(Default)]
 pub(crate) struct RuntimeTiming {
+    pub command_processing: Distribution,
     pub batch_build: Distribution,
     pub completion_processing: Distribution,
     pub completion_handoff: Distribution,
@@ -36,6 +39,7 @@ pub(crate) struct RuntimeTiming {
 impl RuntimeTiming {
     pub fn snapshot(&self) -> RuntimeTimingSnapshot {
         RuntimeTimingSnapshot {
+            command_processing: self.command_processing.snapshot(),
             batch_build: self.batch_build.snapshot(),
             completion_processing: self.completion_processing.snapshot(),
             completion_handoff: self.completion_handoff.snapshot(),

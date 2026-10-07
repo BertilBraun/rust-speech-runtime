@@ -58,6 +58,18 @@ The objective is at least four accepted model tokens per second per generating s
 
 Client reports include TTFT and token-gap p50/p95/p99/max, aggregate throughput, per-session rates, rejections, failures and interruptions. Rolling throughput defaults to a two-second window sampled every 100 ms, including stalls without new output. Gaps above target are reported separately. Short responses have no rolling sample if they never span the window; token gaps and complete-turn rates remain visible. The response timeout bounds a whole generation. Aggregate wall throughput includes capture/thinking time; per-turn token rates exclude those phases. Churn closes conversations between rounds and creates fresh sessions.
 
+Session starts default to independent random offsets across **10 seconds**. Use `--start-spread-ms 0` for a deliberate synchronized burst. For a persistent cohort, replace `--turns` with `--measurement-secs`:
+
+```powershell
+cargo run --release -- benchmark --sessions 32 --start-spread-ms 10000 --measurement-secs 20 --audio-file speech.pcm --report benchmark-results/steady.json
+```
+
+Each session cycles through speech and generation during ramp-up. Measurement begins only after every session-open attempt finishes and lasts exactly the configured interval. Clients retain their connection and retry refused turns after at least 100 ms instead of retiring and reducing offered load. At the interval's end they stop starting turns and drain the current turn. Open failures, turn refusals and later failures remain visible; a cohort with missing sessions is not a successful full-load measurement.
+
+Read the nested **`steady_state`** report for fixed-window throughput and latency; the outer report retains lifetime totals including ramp-up and draining. Measured tokens arrive inside the interval. Token gaps require both arrivals inside it. Rolling-rate samples require a complete window inside it and an active generation long enough to evaluate. TTFT and completed-turn counts include turns committed inside the interval, retaining late first tokens during draining to avoid censoring latency tails. Per-session `measured` reports expose coverage and rates. Fixed-turn tests and churn remain available without `--measurement-secs`.
+
+Gateway reports include `runtime.runtime_timing`: synchronous batch selection/building, completion processing, execution/completion task handoffs, WebSocket serialization and socket writes. These are elapsed boundary timings, not CPU samples. `backend_rpc_overhead` subtracts the matching Python engine duration from each RPC, then records the difference; it includes Rust and Python framing, transport and executor handoff. It is not a Rust-only cost, and differences between independently aggregated percentiles cannot identify that cost. Socket-write timing includes OS waits and backpressure. Runtime timing histograms cover the gateway lifetime, while client steady-state histograms cover the fixed measurement interval.
+
 Ordinary benchmarks default to `--endpointing-ms 0` with preparation disabled. The [current GPU report](GPU_IMMEDIATE_COMMIT_3090.md) uses that path. The client commits as soon as the last packet is sent; a real application supplies its own VAD/end-of-turn decision.
 
 For an optional preparation experiment, use the same simulated endpoint confirmation delay for both runs:

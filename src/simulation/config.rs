@@ -4,10 +4,17 @@ use super::SimulationError;
 
 pub const DEFAULT_AUDIO_PACKET_MS: u64 = 100;
 
+/// Fixed-turn tests or a timed measurement after every session-open attempt has finished.
+#[derive(Clone, Copy, Debug)]
+pub enum WorkloadLength {
+    Turns(usize),
+    SteadyState { measurement: Duration },
+}
+
 #[derive(Clone, Debug)]
 pub struct SimulationConfig {
     pub sessions: usize,
-    pub turns_per_session: usize,
+    pub length: WorkloadLength,
     pub utterance_ms: u64,
     pub minimum_packet_ms: u64,
     pub maximum_packet_ms: u64,
@@ -28,11 +35,11 @@ impl Default for SimulationConfig {
     fn default() -> Self {
         Self {
             sessions: 8,
-            turns_per_session: 2,
+            length: WorkloadLength::Turns(2),
             utterance_ms: 1000,
             minimum_packet_ms: DEFAULT_AUDIO_PACKET_MS,
             maximum_packet_ms: DEFAULT_AUDIO_PACKET_MS,
-            start_spread_ms: 500,
+            start_spread_ms: 10_000,
             think_ms: 250,
             endpointing_ms: 0,
             prepare_before_commit: false,
@@ -51,12 +58,24 @@ impl SimulationConfig {
     pub fn validate(&self) -> Result<(), SimulationError> {
         if self.sessions == 0
             || self.sessions > 10_000
-            || self.turns_per_session == 0
+            || matches!(self.length, WorkloadLength::Turns(0))
             || self.churn_rounds == 0
         {
             return Err(SimulationError::Configuration(
                 "sessions (1..10000), turns and rounds must be positive",
             ));
+        }
+        match self.length {
+            WorkloadLength::SteadyState { measurement }
+                if measurement.is_zero()
+                    || measurement > Duration::from_secs(3600)
+                    || self.churn_rounds != 1 =>
+            {
+                return Err(SimulationError::Configuration(
+                    "steady measurement must be positive, at most 3600 seconds, and use one cohort",
+                ));
+            }
+            _ => {}
         }
         if self
             .sessions

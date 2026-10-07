@@ -169,7 +169,7 @@ async fn benchmark_endpoint_confirmation_preserves_commit_based_latency() {
             &gateway.url,
             SimulationConfig {
                 sessions: 1,
-                turns_per_session: 2,
+                length: voice_scheduler::simulation::WorkloadLength::Turns(2),
                 utterance_ms: 50,
                 start_spread_ms: 0,
                 think_ms: 0,

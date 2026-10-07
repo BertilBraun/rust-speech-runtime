@@ -1,5 +1,6 @@
 use serde::Serialize;
 
+use super::steady::{MeasuredTraffic, SteadyStateReport};
 use crate::metrics::LatencyDistribution;
 
 #[derive(Debug, Serialize)]
@@ -20,6 +21,7 @@ pub struct SessionSummary {
     pub rolling_rate_violations: usize,
     pub minimum_rolling_tokens_per_second: Option<f64>,
     pub minimum_turn_tokens_per_second: Option<f64>,
+    pub measured: Option<MeasuredTraffic>,
 }
 
 impl SessionSummary {
@@ -41,6 +43,7 @@ impl SessionSummary {
             rolling_rate_violations: 0,
             minimum_rolling_tokens_per_second: None,
             minimum_turn_tokens_per_second: None,
+            measured: None,
         }
     }
 }
@@ -68,4 +71,5 @@ pub struct SimulationReport {
     pub endpoint_confirmation_ms: LatencyDistribution,
     pub token_gap_ms: LatencyDistribution,
     pub sessions: Vec<SessionSummary>,
+    pub steady_state: Option<SteadyStateReport>,
 }

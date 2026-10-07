@@ -90,6 +90,11 @@ struct ScenarioReport {
 }
 
 async fn suite(arguments: SuiteArguments) -> Result<(), ApplicationError> {
+    if arguments.benchmark.measurement_secs.is_some() {
+        return Err(
+            SimulationError::Configuration("timed cohorts use benchmark, not suite").into(),
+        );
+    }
     let mut reports = Vec::new();
     for (name, fraction) in [
         ("low_load", 0.10),
@@ -139,6 +144,21 @@ async fn suite(arguments: SuiteArguments) -> Result<(), ApplicationError> {
 }
 
 fn print_summary(report: &SimulationReport) {
+    if let Some(measured) = &report.steady_state {
+        println!(
+            "steady measurement: {:.1} s ramp-up, {:.1} s measured; {}/{} sessions produced tokens; {:.1} tokens/s; TTFT p50/p95/p99/max {:.1}/{:.1}/{:.1}/{:.1} ms",
+            measured.ramp_up_seconds,
+            measured.measurement_seconds,
+            measured.sessions_with_tokens,
+            report.offered_sessions,
+            measured.aggregate_tokens_per_second,
+            measured.traffic.time_to_first_token_ms.p50_ms,
+            measured.traffic.time_to_first_token_ms.p95_ms,
+            measured.traffic.time_to_first_token_ms.p99_ms,
+            measured.traffic.time_to_first_token_ms.max_ms
+        );
+        println!("lifetime totals below include ramp-up and draining:");
+    }
     println!(
         "sessions: {} admitted, {} rejected, {} failed; {} tokens ({:.1} aggregate tokens/s)",
         report.admitted_sessions,

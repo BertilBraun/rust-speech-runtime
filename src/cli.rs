@@ -2,7 +2,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::{Args, Parser, Subcommand};
 use voice_scheduler::{
-    simulation::{DEFAULT_AUDIO_PACKET_MS, SimulationConfig},
+    simulation::{DEFAULT_AUDIO_PACKET_MS, SimulationConfig, WorkloadLength},
     transport::GatewayConfig,
 };
 
@@ -55,15 +55,18 @@ pub struct BenchmarkArguments {
     pub url: String,
     #[arg(long, default_value_t = 8)]
     pub sessions: usize,
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 2, conflicts_with = "measurement_secs")]
     pub turns: usize,
+    /// Keep sessions cycling; measure this interval after the last session-open attempt.
+    #[arg(long)]
+    pub measurement_secs: Option<u64>,
     #[arg(long, default_value_t = 1000)]
     pub utterance_ms: u64,
     #[arg(long, default_value_t = DEFAULT_AUDIO_PACKET_MS)]
     pub minimum_packet_ms: u64,
     #[arg(long, default_value_t = DEFAULT_AUDIO_PACKET_MS)]
     pub maximum_packet_ms: u64,
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = 10_000)]
     pub start_spread_ms: u64,
     #[arg(long, default_value_t = 250)]
     pub think_ms: u64,
@@ -96,7 +99,13 @@ impl BenchmarkArguments {
     pub fn workload(&self) -> SimulationConfig {
         SimulationConfig {
             sessions: self.sessions,
-            turns_per_session: self.turns,
+            length: self
+                .measurement_secs
+                .map_or(WorkloadLength::Turns(self.turns), |seconds| {
+                    WorkloadLength::SteadyState {
+                        measurement: Duration::from_secs(seconds),
+                    }
+                }),
             utterance_ms: self.utterance_ms,
             minimum_packet_ms: self.minimum_packet_ms,
             maximum_packet_ms: self.maximum_packet_ms,
@@ -122,4 +131,34 @@ pub struct SuiteArguments {
     /// Offered concurrency used as the reference capacity for the load sweep.
     #[arg(long)]
     pub session_budget: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn measurement_interval_replaces_the_default_turn_count() {
+        let arguments =
+            Cli::try_parse_from(["voice-scheduler", "benchmark", "--measurement-secs", "20"])
+                .expect("timed benchmark arguments");
+        let Command::Benchmark(benchmark) = arguments.command else {
+            panic!("benchmark command");
+        };
+        assert!(matches!(
+            benchmark.workload().length,
+            WorkloadLength::SteadyState { .. }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "voice-scheduler",
+                "benchmark",
+                "--measurement-secs",
+                "20",
+                "--turns",
+                "2"
+            ])
+            .is_err()
+        );
+    }
 }

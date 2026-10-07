@@ -108,6 +108,8 @@ Decode selection prioritizes the earliest next-token targets. Prefill uses avail
 
 Three different limits matter: open conversations reserve cache and record space; active turns reserve compute capacity; transport limits bound connections and queues. An idle resident session is not a generator. An open session can still have a new turn refused. Offered concurrency, admitted work and hardware capacity are reported separately.
 
+The workload runner now defaults to random session starts spread over ten seconds. `--measurement-secs 20` keeps a cohort cycling and measures a fixed interval after every session-open attempt completes. The report separates measured traffic from ramp-up and draining. Use `--start-spread-ms 0` explicitly for burst tests; the older 500 ms hardware campaigns above are burst-like workloads, not the new arrival pattern. See [the measurement contract](docs/CLIENT_GUIDE.md#measurements-and-admission).
+
 ## Try the pipeline locally
 
 The test fixture exercises the real IPC and WebSocket boundaries without a GPU. It returns deterministic text and charges the full configured duration for each nonempty batch; it supplies no model-quality or GPU-speed evidence.

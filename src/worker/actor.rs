@@ -120,7 +120,7 @@ impl WorkerActor {
                     let Some(command) = command else {
                         break;
                     };
-                    self.handle_command(command);
+                    self.process_command(command);
                 }
                 completion = completion_receiver.recv(), if self.in_flight_batch.is_some() => {
                     self.handle_completion(completion);
@@ -129,6 +129,15 @@ impl WorkerActor {
             }
             self.schedule_next_batch(job_sender);
         }
+    }
+
+    fn process_command(&mut self, command: Command) {
+        let started = tokio::time::Instant::now();
+        self.handle_command(command);
+        self.metrics
+            .runtime_timing
+            .command_processing
+            .record(started.elapsed().as_secs_f64() * 1000.0);
     }
 
     fn handle_completion(&mut self, completion: Option<BatchCompletion>) {
