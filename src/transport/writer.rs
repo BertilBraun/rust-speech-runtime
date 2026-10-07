@@ -1,6 +1,6 @@
 //! Owns socket writes so a slow client cannot block the connection's input loop.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use futures_util::{SinkExt, stream::SplitSink};
 use tokio::{
@@ -12,7 +12,7 @@ use tokio::{
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 
-use crate::protocol::SessionEvent;
+use crate::{metrics::Metrics, protocol::SessionEvent};
 
 use super::GatewayError;
 
@@ -21,6 +21,7 @@ pub(crate) fn start_writer<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut mailbox: mpsc::Receiver<SessionEvent>,
     write_timeout: Duration,
     cancellation: CancellationToken,
+    metrics: Arc<Metrics>,
 ) -> JoinHandle<Result<(), GatewayError>> {
     tokio::spawn(async move {
         let _writer_cleanup = cancellation.clone().drop_guard();
@@ -34,13 +35,24 @@ pub(crate) fn start_writer<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     event
                 }
             };
+            let started = tokio::time::Instant::now();
             let message = Message::Text(serde_json::to_string(&event)?.into());
-            tokio::select! {
+            metrics
+                .runtime_timing
+                .websocket_serialization
+                .record(started.elapsed().as_secs_f64() * 1000.0);
+            let started = tokio::time::Instant::now();
+            let result = tokio::select! {
                 _ = cancellation.cancelled() => return Ok(()),
                 result = timeout(write_timeout, writer.send(message)) => {
-                    result.map_err(|_| GatewayError::Timeout)??;
+                    result
                 }
-            }
+            };
+            metrics
+                .runtime_timing
+                .websocket_write
+                .record(started.elapsed().as_secs_f64() * 1000.0);
+            result.map_err(|_| GatewayError::Timeout)??;
         }
         timeout(write_timeout, writer.close())
             .await
@@ -69,6 +81,7 @@ mod tests {
             mailbox,
             Duration::from_millis(20),
             connection.clone(),
+            Arc::new(Metrics::default()),
         );
         sender
             .send(SessionEvent::Opened {

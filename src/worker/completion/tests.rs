@@ -75,6 +75,8 @@ async fn interrupted_prefill_cost_uses_original_audio_and_cache_prefix() {
     worker
         .apply_completion(BatchCompletion {
             elapsed_ms: 300.0,
+            completed_at: tokio::time::Instant::now(),
+            execution_handoff_ms: 0.0,
             response: Ok(BatchResponse {
                 request_id: job.request.request_id,
                 body_bytes: 0,

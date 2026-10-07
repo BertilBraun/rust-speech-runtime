@@ -16,12 +16,15 @@ use tokio_util::sync::CancellationToken;
 pub(super) struct BatchJob {
     pub request: BatchRequest,
     pub audio: Vec<u8>,
+    pub prepared_at: Instant,
 }
 
 /// Backend proposals and complete round-trip time, awaiting actor acceptance.
 pub(super) struct BatchCompletion {
     pub response: Result<BatchResponse, RuntimeError>,
     pub elapsed_ms: f64,
+    pub completed_at: Instant,
+    pub execution_handoff_ms: f64,
 }
 
 pub(super) async fn execute_batches(
@@ -57,6 +60,7 @@ async fn execute_batch(
     timeout: Duration,
 ) -> BatchCompletion {
     let started = Instant::now();
+    let execution_handoff_ms = (started - job.prepared_at).as_secs_f64() * 1000.0;
     let response =
         match tokio::time::timeout(timeout, connection.execute(&job.request, &job.audio)).await {
             Ok(response) => response,
@@ -68,5 +72,7 @@ async fn execute_batch(
     BatchCompletion {
         response,
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+        completed_at: Instant::now(),
+        execution_handoff_ms,
     }
 }

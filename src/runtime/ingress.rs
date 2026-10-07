@@ -76,4 +76,8 @@ impl Ingress {
     pub fn metrics(&self) -> MetricsSnapshot {
         self.metrics.snapshot()
     }
+
+    pub(crate) fn observations(&self) -> Arc<Metrics> {
+        self.metrics.clone()
+    }
 }

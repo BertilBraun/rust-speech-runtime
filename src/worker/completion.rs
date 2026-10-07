@@ -101,6 +101,10 @@ impl WorkerActor {
             }
         }
         self.metrics.inference.record(elapsed_ms);
+        self.metrics
+            .runtime_timing
+            .backend_rpc_overhead
+            .record((elapsed_ms - response.timing.elapsed_ms).max(0.0));
         let input_context_tokens = operations
             .iter()
             .filter_map(|operation| self.operation_input_context(operation))

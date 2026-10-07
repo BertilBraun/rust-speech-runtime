@@ -139,9 +139,22 @@ impl WorkerActor {
             ));
             return;
         };
+        self.metrics
+            .runtime_timing
+            .completion_handoff
+            .record(completion.completed_at.elapsed().as_secs_f64() * 1000.0);
+        self.metrics
+            .runtime_timing
+            .execution_handoff
+            .record(completion.execution_handoff_ms);
+        let started = tokio::time::Instant::now();
         if let Err(error) = self.apply_completion(completion) {
             self.handle_backend_failure(error);
         }
+        self.metrics
+            .runtime_timing
+            .completion_processing
+            .record(started.elapsed().as_secs_f64() * 1000.0);
     }
 
     fn schedule_next_batch(&mut self, job_sender: &mpsc::Sender<BatchJob>) {
@@ -149,6 +162,7 @@ impl WorkerActor {
             return;
         }
 
+        let started = tokio::time::Instant::now();
         let Some((kind, session_keys)) = select_batch(
             &self.sessions,
             self.batch_size_limit(),
@@ -161,6 +175,10 @@ impl WorkerActor {
         };
 
         let job = self.build_batch(kind, session_keys);
+        self.metrics
+            .runtime_timing
+            .batch_build
+            .record(started.elapsed().as_secs_f64() * 1000.0);
         if job_sender.try_send(job).is_err() {
             self.handle_backend_failure(RuntimeError::new(
                 ErrorCode::BackendUnavailable,

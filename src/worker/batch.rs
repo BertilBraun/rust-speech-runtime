@@ -37,6 +37,7 @@ impl WorkerActor {
         BatchJob {
             request: job_request,
             audio,
+            prepared_at: tokio::time::Instant::now(),
         }
     }
 

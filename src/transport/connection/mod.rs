@@ -65,6 +65,7 @@ pub(crate) async fn run(
         mailbox,
         configuration.write_timeout,
         cancellation.clone(),
+        ingress.observations(),
     );
     let connection = Connection {
         reader,

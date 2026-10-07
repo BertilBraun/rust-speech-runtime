@@ -1,6 +1,11 @@
 //! Cumulative counters and latency observations, separate from mutable scheduling state.
 //! Histogram locks cover only synchronous record/snapshot operations and never span an await.
 
+mod runtime_timing;
+
+use runtime_timing::RuntimeTiming;
+pub use runtime_timing::RuntimeTimingSnapshot;
+
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use std::sync::{
@@ -48,6 +53,7 @@ pub struct MetricsSnapshot {
     pub encode: LatencyDistribution,
     pub prefill: LatencyDistribution,
     pub decode: LatencyDistribution,
+    pub runtime_timing: RuntimeTimingSnapshot,
     pub decode_batches: u64,
     pub mean_decode_batch_size: f64,
     pub decode_batch_fill_ratio: f64,
@@ -96,6 +102,7 @@ pub(crate) struct Metrics {
     pub encode: Distribution,
     pub prefill: Distribution,
     pub decode: Distribution,
+    pub runtime_timing: RuntimeTiming,
     pub decode_batches: AtomicU64,
     pub decode_items: AtomicU64,
     pub decode_slots: AtomicU64,
@@ -135,6 +142,7 @@ impl Metrics {
             encode: Distribution::default(),
             prefill: Distribution::default(),
             decode: Distribution::default(),
+            runtime_timing: RuntimeTiming::default(),
             decode_batches: AtomicU64::new(0),
             decode_items: AtomicU64::new(0),
             decode_slots: AtomicU64::new(0),
@@ -198,6 +206,7 @@ impl Metrics {
             encode: self.encode.snapshot(),
             prefill: self.prefill.snapshot(),
             decode: self.decode.snapshot(),
+            runtime_timing: self.runtime_timing.snapshot(),
             decode_batches: batches,
             mean_decode_batch_size: if batches > 0 {
                 items as f64 / batches as f64
