@@ -193,3 +193,17 @@ fn slow_prefill_does_not_permanently_reject_solo_turns() {
     assert!(costs.admits(1, 16, 32, &config, false));
     assert!(!costs.admits(2, 16, 32, &config, true));
 }
+
+#[test]
+fn admission_uses_only_batch_shapes_that_fit_the_active_turn_count() {
+    let mut costs = CostModel::new(100.0);
+    let config = RuntimeConfig::default();
+    costs.observe(BatchKind::Decode, 20.0, 1, 32);
+    costs.observe(BatchKind::Decode, 300.0, 16, 32);
+    costs.observe(BatchKind::Prefill, 10.0, 1, 32);
+    assert!(costs.admits(1, 16, 32, &config, false));
+    assert!(costs.admits(2, 16, 32, &config, true));
+    assert!(!costs.admits(16, 16, 32, &config, false));
+    assert!(!costs.admits(16, 8, 32, &config, false));
+    assert_eq!(costs.estimate(BatchKind::Decode, 16, 32), 330.0);
+}

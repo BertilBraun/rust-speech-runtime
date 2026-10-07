@@ -68,7 +68,11 @@ impl CostModel {
         let measured = self
             .samples
             .keys()
-            .filter(|shape| shape.kind == BatchKind::Decode && shape.items <= maximum_batch)
+            .filter(|shape| {
+                shape.kind == BatchKind::Decode
+                    && shape.items <= maximum_batch
+                    && shape.items <= active
+            })
             .map(|shape| shape.items)
             .max()
             .unwrap_or(1);
