@@ -52,15 +52,17 @@ Two 12 GB RTX 3060s are a possible lower-cost multi-worker experiment, subject t
 
 The provided one-GPU node uses a separate serving directory and environment. Its PyTorch 2.6.0+cu124/Transformers 5.13.0 stack and existing fast kernels passed both CUDA cache tests and the documented load sweep. The backend also supports the pure PyTorch linear-attention fallback. These short experiments do not establish sustainable session capacity or general fast-kernel performance across hardware.
 
-Remaining gates:
+Subsequent profiling and workload validation are complete: the [CPU/CUDA decoder profile](GPU_DECODE_OPTIMIZATION_3090.md) identifies and removes redundant cache copies, and the [staggered conversation benchmark](GPU_STEADY_STATE_3090.md) measures random ten-second arrivals, a separate measurement interval and Rust orchestration boundaries. At 32 sessions, every session produced text and had rolling-rate observations above four tokens/second, but 212 turn-start attempts were refused during measurement. This does not establish refusal-free or sustained capacity.
 
-1. Confirm the quality-selected checkpoint; the completed step-9,550 run is already copied, hashed and integrated.
+Remaining validation and extensions:
+
+1. Validate the training project's quality-selected checkpoint through the serving adapter; the step-9,550 checkpoint used for runtime benchmarks is already copied, hashed and integrated.
 2. Extend the existing one-GPU deployment to multi-worker hardware when that experiment is needed.
 3. Complete audio-reference/projector parity and broader mixed-context checks; native cache continuation, ragged decode and gateway interruption now pass.
-4. Profile encode/prefill/decode, cache join/split, CPU preparation, VRAM and end-of-turn-to-first-token latency.
-5. Ramp realistic concurrent conversations and tune reactive admission against per-session four-token/second throughput. Record the utterance, context and output lengths with capacity results.
+4. Extend the existing profiles and short workload measurements to varied utterances, longer contexts and sustained runs.
+5. Tune reactive admission and batching against per-session four-token/second throughput and turn-start refusals. Record the utterance, context and output lengths with capacity results.
 
-The detailed correctness and performance procedure is in [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md). The [current benchmark report](GPU_BENCHMARK_3090.md) establishes GPU integration and short workload measurements for the completed checkpoint. Training-reference quality parity, mixed long-context workloads, multiple physical GPUs and sustained capacity remain untested.
+The detailed correctness and performance procedure is in [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md). The [initial GPU report](GPU_BENCHMARK_3090.md) establishes model integration; the [current staggered report](GPU_STEADY_STATE_3090.md) records the latest workload and orchestration timings. Training-reference quality parity, mixed long-context workloads, multiple physical GPUs and sustained capacity remain untested.
 
 ## Validation of the cadence update
 

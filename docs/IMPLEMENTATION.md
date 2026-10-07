@@ -35,6 +35,8 @@ The final Windows suite passes 47 Rust tests; the separately enabled Python-proc
 
 The final aligned-overload release audit saved all 48 admitted session archives, with 21 bounded archive backpressure events and no archive, connection or backend failures. All 6,176 accepted tokens matched client, runtime and archive counts. The deliberate 350 ms decode run exposed token-gap and rolling-rate violations and rejected the next turn after profiling. These results validate orchestration with fixed-cost synthetic workers; they do not establish GPU throughput.
 
-## Pending hardware validation
+## Hardware validation deferred at the initial implementation stage
 
 Real checkpoint loading, GPU cache continuation parity, CUDA timing, peak VRAM, speech correctness, batching efficiency and concurrency at four generated tokens/second/session require the trained model and GPU node. No local mock result establishes those properties.
+
+Subsequent real-model GPU validation, profiling and cache optimization are recorded in [GPU_BENCHMARK_3090.md](GPU_BENCHMARK_3090.md) and [GPU_DECODE_OPTIMIZATION_3090.md](GPU_DECODE_OPTIMIZATION_3090.md). The latest [staggered workload report](GPU_STEADY_STATE_3090.md) includes random session starts, fixed-window measurements and Rust timing boundaries. Those checks supersede this stage's deferral, while training-reference parity, varied long-context workloads, physical multi-GPU execution and sustained capacity remain unvalidated. See [the current integration status](MODEL_INTEGRATION.md#hardware-experiment-and-remaining-work).

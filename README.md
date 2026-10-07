@@ -188,12 +188,13 @@ Ordinary tests cover placement, admission, dynamic batching, full hybrid cache s
 | Read next | Purpose |
 | --- | --- |
 | [Visual architecture](docs/ARCHITECTURE.md) | Data movement, computation and cache/storage ownership |
-| [Immediate-commit GPU results](docs/GPU_IMMEDIATE_COMMIT_3090.md) | Current ordinary-path latency and offered-concurrency sweep |
+| [Staggered GPU results](docs/GPU_STEADY_STATE_3090.md) | Current ordinary-path latency, persistent cohort load and Rust timing definitions |
+| [Decoder profile](docs/GPU_DECODE_OPTIMIZATION_3090.md) | CPU/CUDA evidence and cache-copy optimization |
 | [Client and operating guide](docs/CLIENT_GUIDE.md) | Public protocol, benchmark controls, records and limits |
 | [Backend guide](backend/README.md) | Model integration, deployment, cache invariants and GPU tests |
 | [Preparation diagrams](docs/ENDPOINTING_PREPARATION.md) | Optional speculative branch and activation semantics |
 | [Rust style](docs/RUST_STYLE.md) | Code organization and review conventions |
 | [Implementation decisions](docs/IMPLEMENTATION.md), [original plan](PLAN.md) | Design context and documented assumptions |
-| [Earlier GPU benchmark](docs/GPU_BENCHMARK_3090.md), [endpointing experiment](docs/GPU_ENDPOINTING_3090.md) | Historical evidence and its limitations |
+| [Earlier GPU benchmark](docs/GPU_BENCHMARK_3090.md), [concurrency sweep](docs/GPU_IMMEDIATE_COMMIT_3090.md), [endpointing experiment](docs/GPU_ENDPOINTING_3090.md) | Historical evidence and its limitations |
 
 This prototype does not implement crash recovery, automatic history replay, cache migration, paged allocation or silent context truncation. Hybrid cache join/split currently copies tensors; unequal context lengths require padding. Short repeated-recording trials do not establish sustainable production capacity, general speech quality or external-network latency. [PERFORMANCE.md](PERFORMANCE.md) concerns the superseded audio-echo prototype and does not describe this model's capacity.
