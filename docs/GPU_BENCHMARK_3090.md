@@ -136,7 +136,7 @@ Raw reports, both gateway summaries, every archive, resource samples, failure/fi
 
 ## Remaining work
 
-1. Improve representative startup warmup and calibrate cold compilation separately from steady-state admission. Conservative recent maxima and unknown-context estimates currently cause avoidable refusals and up to about 2.5 seconds TTFT. The sweep does not show the GPU's maximum decode throughput.
+1. The subsequent [endpointing-preparation work](GPU_ENDPOINTING_3090.md) adds private candidate prefill before commit, broader startup warmup and an admission correction for impossible historical batch shapes. These original measurements retain their older configuration. Further cold-shape calibration and sustained capacity measurements remain necessary; this sweep does not show the GPU's maximum decode throughput.
 2. Run longer, repeated mixed workloads: distinct speech, longer conversations, variable response lengths, overlapping end-of-turn bursts and realistic think times. The two 32-session runs admitted different numbers of turns; they cannot justify a fixed concurrent-generation capacity promise.
 3. Validate quality and preprocessing/output parity against the selected training reference. The completed checkpoint is integrated; runtime success is independent of whether it is the final quality selection.
 4. Validate actual multi-GPU deployment and sticky locality across devices. Only one physical GPU was available. Local fake-worker tests cover placement, slowdown, bounded-channel saturation and slow consumers; those fault scenarios still need hardware exercises.

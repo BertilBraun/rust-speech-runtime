@@ -81,4 +81,4 @@ The optimization relies on a stable candidate waveform during the confirmation i
 - Exercise duplicate candidate requests, mismatched counts, cache-budget refusal and preparation failure with a healthy fallback.
 - Measure both commit-to-first-token and the visible endpointing interval under identical traffic. Retain per-session generation rates, rejections, archives and memory observations.
 
-Implementation and hardware measurements are added after these checks pass.
+The implementation passes the Rust, Python and real-model cache checks. [RTX 3090 measurements](GPU_ENDPOINTING_3090.md) record latency before and after commit, accepted and rejected turns, interruption, warmup limitations and resource observations. No provisional output is accepted before matching final commit.

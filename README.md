@@ -2,7 +2,7 @@
 
 A Tokio gateway schedules persistent audio conversations across a configurable list of GPU workers. Ordinary WebSocket clients send user audio, commit the turn and receive streamed text tokens. Rust owns admission, sticky placement, turn state, dynamic batching, interruption and output acceptance. A persistent Python process per GPU owns the PyTorch model and complete hybrid conversation cache. There is no authentication, database, frontend or text-to-speech stage.
 
-The model is Whisper Small, a speech projection layer and Qwen3.5-2B. The serving target is **10 Hz audio embeddings**, with **100 ms audio packets** from clients. Complete utterances are encoded at commit because Whisper is bidirectional. Prior audio embeddings and accepted assistant tokens stay in the worker's cache across turns. The initial deployment may have two GPUs; the endpoint list controls GPU count.
+The model is Whisper Small, a speech projection layer and Qwen3.5-2B. The serving target is **10 Hz audio embeddings**, with **100 ms audio packets** from clients. Bidirectional Whisper encodes a complete candidate at optional `prepare`, or the final utterance at `commit`. Preparation holds its first token and isolated cache privately during endpoint detection; matching commit activates them. Prior audio embeddings and accepted assistant tokens stay in the worker's cache across turns. The endpoint list controls GPU count.
 
 Start with the **[visual architecture guide](docs/ARCHITECTURE.md)** for seven Mermaid diagrams covering the system, one turn, computation, cache/storage ownership, batching, interruption and shutdown. Each diagram links to the code that implements it.
 
@@ -17,6 +17,8 @@ flowchart LR
 The agreed design is in [PLAN.md](PLAN.md), implementation decisions in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md), measured local results in [docs/LOCAL_VALIDATION.md](docs/LOCAL_VALIDATION.md), and GPU checks in [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md). The [model integration status](docs/MODEL_INTEGRATION.md) records the checked training architecture and remaining checkpoint/hardware work. [PERFORMANCE.md](PERFORMANCE.md) preserves measurements of the superseded periodic audio-echo workload; those results do not establish this model's capacity. The old TCP echo transport and simulator have been replaced.
 
 The [RTX 3090 benchmark report](docs/GPU_BENCHMARK_3090.md) records the completed step-9,550 checkpoint, 65 passing on-node Python tests and real-speech workloads through 80 offered sessions. The two 32-session runs measured 148–164 aggregate model tokens/s with active-turn rejections. Churn, interruption, bounded archive backpressure and exact audio/token archival passed. The report includes percentile tables, configuration, a data-flow diagram and current startup commands. Model quality and sustained capacity remain unmeasured. The earlier [shared-node smoke deployment](docs/DEPLOYMENT_3090.md) is retained as historical evidence.
+
+The newer [endpointing benchmark](docs/GPU_ENDPOINTING_3090.md) measures preparation before commit, with [cache lifecycle diagrams](docs/ENDPOINTING_PREPARATION.md), identical endpointing delays for both paths, native-cache parity tests and explicit cold-start limitations.
 
 ## Run the pipeline
 
