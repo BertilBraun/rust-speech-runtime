@@ -1,6 +1,6 @@
 # Model integration status — 2026-10-07
 
-The real PyTorch adapter now passes a preliminary [RTX 3090 integration check](DEPLOYMENT_3090.md) using a copied step-3,200 checkpoint from the active 10 Hz run. The training project was checked locally at revision `46ed242`; its mean-pool-five architecture matches the serving adapter. Final-checkpoint selection remains pending. The archived 2.5 Hz research selection is superseded for this deployment.
+The real PyTorch adapter now passes a preliminary [RTX 3090 integration check](DEPLOYMENT_3090.md) using a copied step-3,200 checkpoint from the then-active 10 Hz run. Training subsequently completed normally at step 4,775 and follow-up evaluation started; final-checkpoint selection remains pending. The training project was checked locally at revision `46ed242`; its mean-pool-five architecture matches the serving adapter. The archived 2.5 Hz research selection is superseded for this deployment.
 
 ## Architecture comparison
 

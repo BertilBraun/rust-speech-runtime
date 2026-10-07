@@ -46,7 +46,7 @@ The serving configuration permits one session, one active turn, batch size one, 
 
 Across the serving runs, sampled child RSS reached **2,214 MiB**, free VRAM stayed at least **11,063 MiB**, and estimated available RAM stayed at least **13,885 MiB**. Compared with the training-only snapshot, serving added about **4.4 GiB VRAM**. These are sampled observations, not allocation high-water measurements. Reported container RAM usage included substantial reclaimable file cache; the guard accounted for the cgroup limit and inactive file cache.
 
-The training process retained PID `180526`, stayed running and continued advancing. No training process was stopped or restarted. The container memory-limit failure counter stayed zero. After serving stopped, the GPU returned to approximately 8,734 MiB used / 15,520 MiB free. GPU contention during inference is still possible on a shared device; these short tests do not establish isolated serving performance.
+During the GPU tests, training retained PID `180526`, stayed running and continued advancing. No training process was stopped or restarted. The container memory-limit failure counter stayed zero. After serving stopped, the GPU returned to approximately 8,734 MiB used / 15,520 MiB free. At the final deployment check, training had completed its full pass naturally at step **4,775**, with Supervisor reporting exit status **0** at 09:53:39 UTC (11:53:39 Berlin). Follow-up evaluation was running in its own process. Serving remains pinned to the preliminary step-3,200 snapshot. GPU contention during inference is still possible on a shared device; these short tests do not establish isolated serving performance.
 
 ## Verified behavior
 
