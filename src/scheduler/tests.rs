@@ -172,6 +172,7 @@ fn unknown_shape_does_not_assume_linear_batch_scaling() {
     costs.observe(BatchKind::Decode, 120.0, 8, 32);
     assert!(!costs.admits(16, 16, 32, &config, true));
 }
+
 #[test]
 fn context_costs_and_slow_recent_batches_remain_conservative() {
     let mut costs = CostModel::new(100.0);
@@ -184,6 +185,7 @@ fn context_costs_and_slow_recent_batches_remain_conservative() {
         55.00000000000001
     );
 }
+
 #[test]
 fn slow_prefill_does_not_permanently_reject_solo_turns() {
     let mut costs = CostModel::new(100.0);

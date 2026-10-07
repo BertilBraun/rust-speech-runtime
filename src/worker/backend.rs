@@ -1,3 +1,6 @@
+//! Exclusive framed TCP connection to one model process.
+//! Requests and replies are serial; losing framing makes this worker unavailable.
+
 use crate::{
     protocol::{
         ErrorCode,
@@ -15,6 +18,7 @@ const MAX_METADATA_BYTES: usize = 1024 * 1024;
 pub(crate) struct BackendConnection {
     stream: TcpStream,
 }
+
 impl BackendConnection {
     pub async fn connect(endpoint: SocketAddr) -> Result<(Self, Ready), RuntimeError> {
         let stream = TcpStream::connect(endpoint).await.map_err(network_error)?;
@@ -35,6 +39,7 @@ impl BackendConnection {
         }
         Ok((connection, ready))
     }
+
     pub async fn execute(
         &mut self,
         request: &BatchRequest,
@@ -79,6 +84,7 @@ impl BackendConnection {
         }
         Ok(response)
     }
+
     async fn read_json<T: serde::de::DeserializeOwned>(&mut self) -> Result<T, RuntimeError> {
         let length = self.stream.read_u32().await.map_err(network_error)? as usize;
         if length == 0 || length > MAX_METADATA_BYTES {
@@ -95,9 +101,11 @@ impl BackendConnection {
         serde_json::from_slice(&metadata).map_err(protocol_error)
     }
 }
+
 fn network_error(error: std::io::Error) -> RuntimeError {
     RuntimeError::new(ErrorCode::BackendUnavailable, error.to_string())
 }
+
 fn protocol_error(error: serde_json::Error) -> RuntimeError {
     RuntimeError::new(ErrorCode::BackendFailed, error.to_string())
 }

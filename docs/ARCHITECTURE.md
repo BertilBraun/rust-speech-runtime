@@ -115,7 +115,7 @@ sequenceDiagram
 
 The diagram shows one session; its decode steps can share batches with other sessions. A model token is not necessarily a word or complete character. EOS is accepted and counted even when its text delta is empty.
 
-**Inspect:** [wire format](../src/transport/wire.rs), [connection handling](../src/transport/connection.rs), [audio accumulation and commit](../src/worker/commands.rs), [token acceptance](../src/worker/output.rs), [worker protocol](WORKER_PROTOCOL.md).
+**Inspect:** [wire format](../src/transport/wire.rs), [connection handling](../src/transport/connection/mod.rs), [audio accumulation and commit](../src/worker/turn.rs), [token acceptance](../src/worker/output.rs), [worker protocol](WORKER_PROTOCOL.md).
 
 ## 3. Inside the model worker
 
@@ -271,7 +271,7 @@ Observed costs use conservative recent measurements, with no assumption that a h
 
 Bounded worker job and completion channels each have capacity one. The ingress, worker commands, session events, socket writer and archive queues also have explicit bounds. Ordinary command saturation rejects work; a slow output consumer stops its own session. Archive saturation waits during bounded connection teardown rather than dropping a record or blocking a GPU scheduler.
 
-**Inspect:** [selection and reactive cost model](../src/scheduler/mod.rs), [turn admission](../src/worker/commands.rs), [actor/execution channels](../src/worker/actor.rs), [batch construction](../src/worker/batch.rs), [timing observations](../src/worker/completion.rs), [runtime configuration](../src/config.rs).
+**Inspect:** [selection and reactive cost model](../src/scheduler/mod.rs), [turn admission](../src/worker/admission.rs), [actor/execution channels](../src/worker/actor.rs), [batch construction](../src/worker/batch.rs), [timing observations](../src/worker/completion.rs), [runtime configuration](../src/config.rs).
 
 ## 6. Interruption
 
@@ -303,7 +303,7 @@ This diagram omits transport tasks to emphasize the acceptance order. If T8 was 
 
 Cancelling a queued prefill removes it from future model work. An already-running prefill may still append the old user input to valid cache history; its late output proposal is discarded. Cancellation does not rewind hybrid model state. If a forward fails and its progress is uncertain, the session is terminated and its cache released rather than silently continued.
 
-**Inspect:** [interrupt state transition](../src/session/state.rs), [begin/cancel handling](../src/worker/commands.rs), [stale completion handling](../src/worker/completion.rs), [pending token reconciliation](../backend/src/voice_worker/session.py).
+**Inspect:** [interrupt state transition](../src/session/state.rs), [begin/cancel handling](../src/worker/turn.rs), [stale completion handling](../src/worker/completion.rs), [pending token reconciliation](../backend/src/voice_worker/session.py).
 
 ## 7. Closing a session
 
@@ -334,7 +334,7 @@ sequenceDiagram
 
 On ordinary close, backend state is released before the record is transferred. If the backend connection has already failed, cleanup collects the retained Rust record without requiring a successful backend acknowledgement; Python resets all owned session caches when its gateway disconnects. Archive enqueue is not a per-client durability acknowledgement. The archive writer reports saves and disk failures, and graceful gateway shutdown waits for it to drain. Abrupt process or machine loss can still lose in-memory records.
 
-**Inspect:** [session close API](../src/runtime.rs), [connection cleanup](../src/transport/connection.rs), [gateway drain ordering](../src/transport/gateway.rs), [archive backpressure and file writes](../src/transport/archive.rs), [Python disconnect cleanup](../backend/src/voice_worker/server.py).
+**Inspect:** [session close API](../src/runtime/session.rs), [connection cleanup](../src/transport/connection/cleanup.rs), [gateway drain ordering](../src/transport/gateway.rs), [archive backpressure and file writes](../src/transport/archive.rs), [Python disconnect cleanup](../backend/src/voice_worker/server.py).
 
 ## Review the design without reading every module
 

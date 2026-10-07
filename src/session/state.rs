@@ -21,6 +21,7 @@ pub(crate) enum Stage {
         deadline: Instant,
     },
 }
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CaptureSnapshot {
     pub turn_id: crate::protocol::TurnId,
@@ -28,6 +29,7 @@ pub(crate) struct CaptureSnapshot {
     pub chunk_count: u32,
     pub sample_count: usize,
 }
+
 #[derive(Clone, Copy)]
 pub(crate) struct PreparationRequest {
     pub snapshot: CaptureSnapshot,
@@ -41,6 +43,7 @@ pub(crate) enum Preparation {
     DiscardPending { next: Option<PreparationRequest> },
     Discarding { next: Option<PreparationRequest> },
 }
+
 impl Preparation {
     pub fn invalidate(&mut self) {
         *self = match self {
@@ -51,6 +54,7 @@ impl Preparation {
             }
         };
     }
+
     pub fn snapshot(&self) -> Option<CaptureSnapshot> {
         match self {
             Self::Queued(request) => Some(request.snapshot),
@@ -81,6 +85,7 @@ pub(crate) struct SessionState {
     pub chunk_count: u32,
     pub preparation: Preparation,
 }
+
 impl SessionState {
     pub fn new(
         session_id: SessionId,
@@ -114,18 +119,23 @@ impl SessionState {
             preparation: Preparation::None,
         }
     }
+
     pub fn active(&self) -> bool {
         !self.closing && !matches!(self.stage, Stage::Idle)
     }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }
+
     pub fn turn(&self) -> Option<&TurnRecord> {
         self.record.turns.last()
     }
+
     pub fn turn_mut(&mut self) -> Option<&mut TurnRecord> {
         self.record.turns.last_mut()
     }
+
     pub fn interrupt(&mut self, next_generation: u64) {
         self.preparation.invalidate();
         if self.active() {
@@ -133,6 +143,7 @@ impl SessionState {
         }
         self.generation = next_generation;
     }
+
     pub fn finish(&mut self, reason: FinishReason) {
         let generation = self.generation();
         if let Some(turn) = self.turn_mut() {
@@ -151,6 +162,7 @@ impl SessionState {
         }
         self.stage = Stage::Idle;
     }
+
     pub fn token_interval(target: f64) -> Duration {
         Duration::from_secs_f64(1.0 / target)
     }

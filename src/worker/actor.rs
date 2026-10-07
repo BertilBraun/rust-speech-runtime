@@ -1,10 +1,16 @@
-use super::{Command, backend::BackendConnection};
+//! Coordinates commands and completions; this task alone mutates scheduling state.
+
+use super::{
+    Command,
+    backend::BackendConnection,
+    execution::{Completion, Job, run_backend},
+};
 use crate::{
     config::RuntimeConfig,
     metrics::Metrics,
     protocol::{
         ErrorCode, SessionEvent,
-        backend::{BatchRequest, BatchResponse, Ready},
+        backend::{BatchRequest, Ready},
     },
     runtime::RuntimeError,
     scheduler::{BatchKind, CostModel, select_batch},
@@ -18,17 +24,9 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{sync::mpsc, time::Instant};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-pub(super) struct Job {
-    pub request: BatchRequest,
-    pub audio: Vec<u8>,
-}
-pub(super) struct Completion {
-    pub response: Result<BatchResponse, RuntimeError>,
-    pub elapsed_ms: f64,
-}
 pub(super) struct ActiveBatch {
     pub request: BatchRequest,
     pub kind: BatchKind,
@@ -47,6 +45,7 @@ pub(super) struct WorkerActor {
     pub active: Option<ActiveBatch>,
     pub consecutive_decode_batches: usize,
 }
+
 impl WorkerActor {
     pub fn new(
         id: usize,
@@ -73,9 +72,10 @@ impl WorkerActor {
             consecutive_decode_batches: 0,
         }
     }
+
     pub async fn run(
         mut self,
-        mut commands: mpsc::Receiver<Command>,
+        commands: mpsc::Receiver<Command>,
         connection: BackendConnection,
         cancellation: CancellationToken,
     ) {
@@ -88,47 +88,80 @@ impl WorkerActor {
             Duration::from_millis(self.config.backend_timeout_ms),
             cancellation.child_token(),
         ));
-        let mut results = result_receiver;
-        let mut reap = tokio::time::interval(Duration::from_millis(50));
+        self.run_control_loop(commands, result_receiver, &jobs, &cancellation)
+            .await;
+        self.stop_sessions();
+        cancellation.cancel();
+        let _ = execution.await;
+    }
+
+    async fn run_control_loop(
+        &mut self,
+        mut commands: mpsc::Receiver<Command>,
+        mut completions: mpsc::Receiver<Completion>,
+        jobs: &mpsc::Sender<Job>,
+        cancellation: &CancellationToken,
+    ) {
+        let mut cleanup_timer = tokio::time::interval(Duration::from_millis(50));
+
+        // Backend I/O runs separately, so input and cancellation stay responsive during a forward.
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => break,
                 command = commands.recv() => {
-                    match command {
-                        Some(command) => self.command(command),
-                        None => break,
-                    }
+                    let Some(command) = command else {
+                        break;
+                    };
+                    self.command(command);
                 }
-                result = results.recv(), if self.active.is_some() => {
-                    match result {
-                        Some(completion) => {
-                            if let Err(error) = self.complete(completion) {self.fail(error);}
-                        }
-                        None => self.fail(RuntimeError::new(ErrorCode::BackendUnavailable,"execution task stopped")),
-                    }
+                completion = completions.recv(), if self.active.is_some() => {
+                    self.handle_completion(completion);
                 }
-                _ = reap.tick() => self.reap(),
+                _ = cleanup_timer.tick() => self.reap(),
             }
-            if self.available.load(Ordering::Acquire)
-                && self.active.is_none()
-                && let Some((kind, keys)) = select_batch(
-                    &self.sessions,
-                    self.config.max_batch_size.min(self.ready.max_batch_size),
-                    self.config.max_prefill_batch_size,
-                    self.consecutive_decode_batches,
-                    &self.costs,
-                    Duration::from_millis(self.config.max_prefill_wait_ms),
-                )
-            {
-                let job = self.build_batch(kind, keys);
-                if jobs.try_send(job).is_err() {
-                    self.fail(RuntimeError::new(
-                        ErrorCode::BackendUnavailable,
-                        "execution queue stopped",
-                    ));
-                }
-            }
+            self.schedule_next_batch(jobs);
         }
+    }
+
+    fn handle_completion(&mut self, completion: Option<Completion>) {
+        let Some(completion) = completion else {
+            self.fail(RuntimeError::new(
+                ErrorCode::BackendUnavailable,
+                "execution task stopped",
+            ));
+            return;
+        };
+        if let Err(error) = self.complete(completion) {
+            self.fail(error);
+        }
+    }
+
+    fn schedule_next_batch(&mut self, jobs: &mpsc::Sender<Job>) {
+        if !self.available.load(Ordering::Acquire) || self.active.is_some() {
+            return;
+        }
+
+        let Some((kind, session_keys)) = select_batch(
+            &self.sessions,
+            self.config.max_batch_size.min(self.ready.max_batch_size),
+            self.config.max_prefill_batch_size,
+            self.consecutive_decode_batches,
+            &self.costs,
+            Duration::from_millis(self.config.max_prefill_wait_ms),
+        ) else {
+            return;
+        };
+
+        let job = self.build_batch(kind, session_keys);
+        if jobs.try_send(job).is_err() {
+            self.fail(RuntimeError::new(
+                ErrorCode::BackendUnavailable,
+                "execution queue stopped",
+            ));
+        }
+    }
+
+    fn stop_sessions(&mut self) {
         self.available.store(false, Ordering::Release);
         self.metrics.active_sessions.fetch_sub(
             self.sessions
@@ -138,7 +171,7 @@ impl WorkerActor {
             Ordering::Relaxed,
         );
         self.load.store(0, Ordering::Relaxed);
-        for mut session in self.sessions.into_values() {
+        for mut session in self.sessions.drain().map(|(_, session)| session) {
             session.cancellation.cancel();
             if let Some(reply) = session.close_reply.take() {
                 let _ = reply.send(Err(RuntimeError::new(
@@ -147,12 +180,12 @@ impl WorkerActor {
                 )));
             }
         }
-        cancellation.cancel();
-        let _ = execution.await;
     }
+
     pub fn generation(&self) -> u64 {
         self.clock.fetch_add(1, Ordering::Relaxed)
     }
+
     fn reap(&mut self) {
         let generation = self.generation();
         for session in self.sessions.values_mut() {
@@ -172,6 +205,7 @@ impl WorkerActor {
         });
         self.load.store(self.sessions.len(), Ordering::Relaxed);
     }
+
     fn fail(&mut self, error: RuntimeError) {
         self.available.store(false, Ordering::Release);
         self.active = None;
@@ -202,41 +236,6 @@ impl WorkerActor {
             .collect::<Vec<_>>();
         for key in closing {
             self.remove_closed(&key);
-        }
-    }
-}
-async fn run_backend(
-    mut connection: BackendConnection,
-    mut jobs: mpsc::Receiver<Job>,
-    results: mpsc::Sender<Completion>,
-    timeout: Duration,
-    cancellation: CancellationToken,
-) {
-    loop {
-        let job = tokio::select! {
-            _ = cancellation.cancelled() => break,
-            job = jobs.recv() => {
-                match job {Some(job) => job, None => break}
-            }
-        };
-        let started = Instant::now();
-        let response = tokio::select! {
-            _ = cancellation.cancelled() => break,
-            result = tokio::time::timeout(timeout, connection.execute(&job.request, &job.audio)) => {
-                result.unwrap_or_else(|_| Err(RuntimeError::new(ErrorCode::BackendUnavailable, "worker execution timeout")))
-            }
-        };
-        let failed = response.is_err();
-        if results
-            .send(Completion {
-                response,
-                elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
-            })
-            .await
-            .is_err()
-            || failed
-        {
-            break;
         }
     }
 }

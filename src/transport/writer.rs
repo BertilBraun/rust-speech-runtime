@@ -1,3 +1,5 @@
+//! Owns socket writes so a slow client cannot block the connection's input loop.
+
 use std::time::Duration;
 
 use futures_util::{SinkExt, stream::SplitSink};
@@ -25,7 +27,12 @@ pub(crate) fn start_writer<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         loop {
             let event = tokio::select! {
                 _ = cancellation.cancelled() => return Ok(()),
-                event = mailbox.recv() => match event { Some(event) => event, None => break },
+                event = mailbox.recv() => {
+                    let Some(event) = event else {
+                        break;
+                    };
+                    event
+                }
             };
             let message = Message::Text(serde_json::to_string(&event)?.into());
             tokio::select! {

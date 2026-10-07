@@ -1,29 +1,21 @@
+//! Canonical scheduling limits, validated before any worker is started.
+
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use thiserror::Error;
 
+/// Endpoint of one persistent, warmed model process with an exclusive device cache.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerConfig {
     pub endpoint: SocketAddr,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn invalid_token_intervals_fail_at_configuration_boundary() {
-        for rate in [f64::NAN, f64::INFINITY, 0.0, -1.0, 1e-300, 1e300] {
-            let configuration = RuntimeConfig {
-                target_tokens_per_second: rate,
-                ..RuntimeConfig::default()
-            };
-            assert!(configuration.validate().is_err(), "rate {rate}");
-        }
-        assert!(RuntimeConfig::default().validate().is_ok());
-    }
-}
-
+/// Node-wide scheduling and bounded-memory limits shared by the manager and workers.
+///
+/// Defaults support local experiments. Hardware capacity must be measured; session
+/// slots and active-turn compute reservations are separate limits. Backend readiness
+/// may lower model-facing batch, audio and context limits. JSON requires every field.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
@@ -38,10 +30,13 @@ pub struct RuntimeConfig {
     pub event_capacity: usize,
     pub max_batch_size: usize,
     pub max_prefill_batch_size: usize,
+    /// Minimum desired generation rate after the first token, not an audio packet deadline.
     pub target_tokens_per_second: f64,
     pub backend_timeout_ms: u64,
     pub max_prefill_wait_ms: u64,
+    /// Fraction of the estimated generation budget available to admitted work, in (0, 1].
     pub admission_headroom: f64,
+    /// Conservative duration for unobserved batch/context shapes; never scaled linearly by fill.
     pub initial_forward_estimate_ms: f64,
 }
 
@@ -70,12 +65,21 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// Configuration failure reported before task startup or resource allocation.
 #[derive(Debug, Error)]
 #[error("invalid runtime configuration: {0}")]
 pub struct ConfigError(pub String);
 
 impl RuntimeConfig {
+    /// Checks limits, timer ranges and unique endpoints before allocating node resources.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_positive_limits()?;
+        self.validate_timing()?;
+        self.validate_capacity_bounds()?;
+        self.validate_endpoints()
+    }
+
+    fn validate_positive_limits(&self) -> Result<(), ConfigError> {
         if self.workers.is_empty() {
             return Err(ConfigError(
                 "at least one worker endpoint is required".into(),
@@ -100,6 +104,10 @@ impl RuntimeConfig {
                 return Err(ConfigError(format!("{name} must be positive")));
             }
         }
+        Ok(())
+    }
+
+    fn validate_timing(&self) -> Result<(), ConfigError> {
         if !self.target_tokens_per_second.is_finite()
             || self.target_tokens_per_second <= 0.0
             || !self.initial_forward_estimate_ms.is_finite()
@@ -135,6 +143,10 @@ impl RuntimeConfig {
                 "prefill queue wait exceeds platform timer range".into(),
             ));
         }
+        Ok(())
+    }
+
+    fn validate_capacity_bounds(&self) -> Result<(), ConfigError> {
         if self.max_active_turns_per_worker > self.max_sessions_per_worker {
             return Err(ConfigError(
                 "active turn capacity exceeds session capacity".into(),
@@ -149,6 +161,10 @@ impl RuntimeConfig {
         {
             return Err(ConfigError("configured capacity overflows".into()));
         }
+        Ok(())
+    }
+
+    fn validate_endpoints(&self) -> Result<(), ConfigError> {
         let mut endpoints = self
             .workers
             .iter()
@@ -160,5 +176,21 @@ impl RuntimeConfig {
             return Err(ConfigError("worker endpoints must be unique".into()));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn invalid_token_intervals_fail_at_configuration_boundary() {
+        for rate in [f64::NAN, f64::INFINITY, 0.0, -1.0, 1e-300, 1e300] {
+            let configuration = RuntimeConfig {
+                target_tokens_per_second: rate,
+                ..RuntimeConfig::default()
+            };
+            assert!(configuration.validate().is_err(), "rate {rate}");
+        }
+        assert!(RuntimeConfig::default().validate().is_ok());
     }
 }

@@ -1,4 +1,6 @@
-use super::actor::{Completion, WorkerActor};
+//! Correlates backend results, observes cost and fences stale inference proposals.
+
+use super::{actor::WorkerActor, execution::Completion};
 use crate::{
     protocol::{
         ErrorCode, FinishReason, SessionEvent,
@@ -6,6 +8,7 @@ use crate::{
     },
     runtime::RuntimeError,
     scheduler::BatchKind,
+    session::state::Preparation,
 };
 use std::sync::atomic::Ordering;
 
@@ -63,6 +66,7 @@ impl WorkerActor {
         }
         Ok(())
     }
+
     fn observe_batch(
         &mut self,
         operations: &[Operation],
@@ -107,6 +111,7 @@ impl WorkerActor {
         self.costs
             .observe(kind, elapsed_ms, operations.len(), context);
     }
+
     fn complete_open(&mut self, key: &str, outcome: Outcome) -> Result<(), RuntimeError> {
         let session = self.sessions.get_mut(key).expect("opening session");
         match outcome {
@@ -137,6 +142,7 @@ impl WorkerActor {
         }
         Ok(())
     }
+
     fn complete_close(&mut self, key: &str, outcome: Outcome) -> Result<(), RuntimeError> {
         let session = self.sessions.get_mut(key).expect("closing session");
         session.backend_closed = true;
@@ -150,6 +156,7 @@ impl WorkerActor {
         }
         failure.map_or(Ok(()), Err)
     }
+
     fn complete_inference(
         &mut self,
         key: &str,
@@ -199,6 +206,7 @@ impl WorkerActor {
         }
         Ok(())
     }
+
     fn complete_activation(
         &mut self,
         key: &str,
@@ -211,10 +219,7 @@ impl WorkerActor {
         }
         if matches!(result.outcome, Outcome::Failed { .. }) {
             let session = self.sessions.get_mut(key).expect("activating session");
-            if matches!(
-                session.preparation,
-                crate::session::state::Preparation::Ready(_)
-            ) {
+            if matches!(session.preparation, Preparation::Ready(_)) {
                 session.preparation.invalidate();
             }
             self.metrics
@@ -225,11 +230,10 @@ impl WorkerActor {
         let session = self.sessions.get_mut(key).expect("activating session");
         session.pending_token = None;
         session.preparation = match session.preparation {
-            crate::session::state::Preparation::DiscardPending { next } => next.map_or(
-                crate::session::state::Preparation::None,
-                crate::session::state::Preparation::Queued,
-            ),
-            _ => crate::session::state::Preparation::None,
+            Preparation::DiscardPending { next } => {
+                next.map_or(Preparation::None, Preparation::Queued)
+            }
+            _ => Preparation::None,
         };
         self.metrics
             .preparations_activated
@@ -237,112 +241,10 @@ impl WorkerActor {
         self.complete_inference(key, turn_id, generation, result)
     }
 }
+
 fn protocol_error(message: &str) -> RuntimeError {
     RuntimeError::new(ErrorCode::BackendFailed, message)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        config::RuntimeConfig,
-        metrics::Metrics,
-        protocol::{
-            SessionId, TurnId, TurnRecord,
-            backend::{Memory, Ready, Timing},
-        },
-        session::state::{SessionState, Stage},
-        worker::Command,
-    };
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize},
-    };
-    use tokio::{
-        sync::{mpsc, oneshot},
-        time::Instant,
-    };
-    use tokio_util::sync::CancellationToken;
-
-    #[tokio::test]
-    async fn interrupted_prefill_cost_uses_original_audio_and_cache_prefix() {
-        let configuration = RuntimeConfig::default();
-        let ready = Ready {
-            r#type: "ready".into(),
-            protocol_version: 1,
-            body_bytes: 0,
-            model_id: "test-model".into(),
-            max_context_tokens: configuration.max_context_tokens,
-            max_batch_size: configuration.max_batch_size,
-            max_audio_samples: configuration.max_audio_samples,
-        };
-        let metrics = Arc::new(Metrics::new(1));
-        let mut worker = WorkerActor::new(
-            0,
-            configuration,
-            ready,
-            metrics.clone(),
-            Arc::new(AtomicU64::new(1)),
-            Arc::new(AtomicUsize::new(1)),
-            Arc::new(AtomicBool::new(true)),
-        );
-        let (events, _receiver) = mpsc::channel(8);
-        let mut session = SessionState::new(
-            SessionId("interrupted-prefill".into()),
-            0,
-            "test-model".into(),
-            events,
-            CancellationToken::new(),
-        );
-        session.opened = true;
-        session.context_tokens = 100;
-        session.record.turns.push(TurnRecord {
-            turn_id: TurnId(1),
-            audio_pcm16: vec![0; 30 * 16_000 * 2],
-            tokens: Vec::new(),
-            finish_reason: None,
-            committed: true,
-        });
-        session.stage = Stage::Prefill {
-            queued_at: Instant::now(),
-        };
-        worker.sessions.insert("session-key".into(), session);
-        let job = worker.build_batch(BatchKind::Prefill, vec!["session-key".into()]);
-        let (reply, response) = oneshot::channel();
-        worker.command(Command::Begin {
-            key: "session-key".into(),
-            turn_id: TurnId(2),
-            reply,
-        });
-        response.await.unwrap().unwrap();
-        worker
-            .complete(Completion {
-                elapsed_ms: 300.0,
-                response: Ok(BatchResponse {
-                    request_id: job.request.request_id,
-                    body_bytes: 0,
-                    results: vec![OperationResult {
-                        operation_id: job.request.operations[0].operation_id(),
-                        session_id: "session-key".into(),
-                        turn_id: Some(1),
-                        generation: Some(0),
-                        outcome: Outcome::Token {
-                            token_id: 100,
-                            text_delta: "stale".into(),
-                            eos: false,
-                            context_tokens: 412,
-                        },
-                    }],
-                    timing: Timing::default(),
-                    memory: Memory::default(),
-                }),
-            })
-            .unwrap();
-        let session = &worker.sessions["session-key"];
-        assert_eq!(session.context_tokens, 412);
-        assert!(session.turn().unwrap().audio_pcm16.is_empty());
-        assert!(session.turn().unwrap().tokens.is_empty());
-        assert_eq!(metrics.snapshot().stale_results_discarded, 1);
-        assert_eq!(worker.costs.estimate(BatchKind::Prefill, 1, 432), 330.0);
-    }
-}
+mod tests;

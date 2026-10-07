@@ -1,3 +1,6 @@
+//! Cumulative counters and latency observations, separate from mutable scheduling state.
+//! Histogram locks cover only synchronous record/snapshot operations and never span an await.
+
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use std::sync::{
@@ -5,6 +8,8 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+/// Histogram sample count and latency quantiles in milliseconds.
+/// An empty histogram reports count zero and zero-valued quantiles.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LatencyDistribution {
     pub count: u64,
@@ -13,6 +18,9 @@ pub struct LatencyDistribution {
     pub p99_ms: f64,
     pub max_ms: f64,
 }
+
+/// Cumulative observations since node startup, read independently of the worker actors.
+/// Counter and histogram reads are individually synchronized, not one atomic transaction.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
     pub active_sessions: u64,
@@ -31,9 +39,11 @@ pub struct MetricsSnapshot {
     pub backend_failures: u64,
     pub batches: u64,
     pub batch_items: u64,
+    /// Worker-side time from definitive commit to its first accepted token.
     pub ttft: LatencyDistribution,
     pub token_gap: LatencyDistribution,
     pub queue_delay: LatencyDistribution,
+    /// Full backend round-trip durations, including IPC; stage times come from Python.
     pub inference: LatencyDistribution,
     pub encode: LatencyDistribution,
     pub prefill: LatencyDistribution,
@@ -44,11 +54,13 @@ pub struct MetricsSnapshot {
     pub workers: Vec<WorkerMetricsSnapshot>,
 }
 
+/// Per-worker backend occupancy and latest reported device-allocator memory in bytes.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WorkerMetricsSnapshot {
     pub worker_id: usize,
     pub busy_ms: f64,
     pub observed_ms: f64,
+    /// Backend request wall time divided by node lifetime, capped at one; not GPU SM utilization.
     pub utilization: f64,
     pub allocated_bytes: u64,
     pub reserved_bytes: u64,
@@ -89,11 +101,13 @@ pub(crate) struct Metrics {
     workers: Vec<WorkerMetrics>,
     started: std::time::Instant,
 }
+
 impl Default for Metrics {
     fn default() -> Self {
         Self::new(0)
     }
 }
+
 impl Metrics {
     pub fn new(worker_count: usize) -> Self {
         Self {
@@ -133,6 +147,7 @@ impl Metrics {
             started: std::time::Instant::now(),
         }
     }
+
     pub fn worker_observation(
         &self,
         worker_id: usize,
@@ -151,6 +166,7 @@ impl Metrics {
             .reserved_bytes
             .store(reserved_bytes, Ordering::Relaxed);
     }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         let batches = read(&self.decode_batches);
@@ -223,6 +239,7 @@ impl Default for Distribution {
         ))
     }
 }
+
 impl Distribution {
     pub fn record(&self, milliseconds: f64) {
         let microseconds = (milliseconds * 1000.0).clamp(1.0, 86_400_000_000.0) as u64;
@@ -232,6 +249,7 @@ impl Distribution {
             .expect("metrics lock poisoned")
             .record(microseconds);
     }
+
     fn snapshot(&self) -> LatencyDistribution {
         let histogram = self.0.lock().expect("metrics lock poisoned");
         if histogram.is_empty() {

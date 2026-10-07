@@ -1,3 +1,5 @@
+//! Owns session routes and placement; pending opens never block control for other workers.
+
 use crate::{
     config::RuntimeConfig,
     metrics::Metrics,
@@ -71,10 +73,10 @@ pub(crate) async fn run_manager(
                 manager.complete_open(completion);
             }
             command = receiver.recv() => {
-                match command {
-                    Some(command) => manager.command(command),
-                    None => break,
-                }
+                let Some(command) = command else {
+                    break;
+                };
+                manager.command(command);
             }
         }
     }
@@ -88,6 +90,7 @@ impl SessionManager {
         self.routes
             .retain(|_, route| !route.cancellation.is_cancelled());
     }
+
     fn command(&mut self, command: ManagerCommand) {
         match command {
             ManagerCommand::Release { session_id, key } => {
@@ -110,6 +113,7 @@ impl SessionManager {
             },
         }
     }
+
     fn complete_open(&self, completion: OpenCompletion) {
         if completion.result.is_err() {
             self.metrics
@@ -118,6 +122,7 @@ impl SessionManager {
         }
         let _ = completion.reply.send(completion.result);
     }
+
     fn choose_worker(&self) -> Result<WorkerHandle, RuntimeError> {
         let load = |worker: &WorkerHandle| {
             worker.load().max(
@@ -141,6 +146,7 @@ impl SessionManager {
                 )
             })
     }
+
     fn reserve(
         &mut self,
         session_id: SessionId,
@@ -192,8 +198,14 @@ async fn wait_open(
     reply: oneshot::Sender<Result<SessionHandle, RuntimeError>>,
 ) -> OpenCompletion {
     let result = tokio::select! {
-        _ = handle.cancellation.cancelled() => Err(RuntimeError::new(ErrorCode::Shutdown, "session opening cancelled")),
-        result = opened => result.unwrap_or_else(|_| Err(RuntimeError::new(ErrorCode::BackendUnavailable, "worker stopped"))),
+        _ = handle.cancellation.cancelled() => {
+            Err(RuntimeError::new(ErrorCode::Shutdown, "session opening cancelled"))
+        }
+        result = opened => {
+            result.unwrap_or_else(|_| {
+                Err(RuntimeError::new(ErrorCode::BackendUnavailable, "worker stopped"))
+            })
+        }
     };
     OpenCompletion {
         reply,

@@ -95,7 +95,9 @@ Archival has a bounded queue and one blocking file writer outside Tokio async wo
 
 ## Code and validation
 
-`runtime.rs` exposes `Node`, `Ingress` and session handles. `session/` owns placement/lifecycle and records; `worker/` owns scheduling/execution; `scheduler/` owns fairness/cost estimates. `protocol/` defines canonical public models and the typed backend boundary. `transport/` separates connection control, bounded writing, client/codec and archives. `simulation/` contains ordinary network workloads and client measurements. Model-specific code lives under `backend/src/voice_worker/`.
+The [Rust style guide](docs/RUST_STYLE.md) defines formatting, function/module boundaries, async control flow and interface documentation. [rustfmt.toml](rustfmt.toml) supplies the stable formatter configuration. Generate browsable API documentation with `cargo doc --no-deps --open`.
+
+`runtime/` exposes `Node`, `Ingress` and session handles. `session/` owns placement/lifecycle and records; `worker/` owns scheduling/execution; `scheduler/` owns fairness/cost estimates. `protocol/` defines canonical public models and the typed backend boundary. `transport/` separates connection control, bounded writing, client/codec and archives. `simulation/` contains ordinary network workloads and client measurements. Model-specific code lives under `backend/src/voice_worker/`.
 
 ```powershell
 cargo fmt --check

@@ -1,3 +1,5 @@
+//! Public WebSocket codec: strict JSON controls and ordered binary PCM16 packets.
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
@@ -5,8 +7,11 @@ use crate::protocol::{SessionId, TurnId};
 
 use super::GatewayError;
 
+/// Eight bytes of turn ID followed by four bytes of chunk index, both little-endian.
 pub const AUDIO_HEADER_BYTES: usize = 12;
 
+/// Controls for one connection-owned session; prepare is optional before commit.
+/// Chunk/sample totals refer to the complete current utterance, not one packet.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientControl {
@@ -32,6 +37,8 @@ pub enum ClientControl {
     Close,
 }
 
+/// One mono 16 kHz PCM16 packet, identified by turn and contiguous chunk index.
+/// Payload bytes stay shared when decoding; semantic ordering is validated by the actor.
 #[derive(Debug)]
 pub struct AudioChunk {
     pub turn_id: TurnId,
@@ -40,6 +47,7 @@ pub struct AudioChunk {
 }
 
 impl AudioChunk {
+    /// Validates the binary header and nonempty whole-sample payload without copying PCM.
     pub fn decode(bytes: Bytes) -> Result<Self, GatewayError> {
         if bytes.len() <= AUDIO_HEADER_BYTES
             || !(bytes.len() - AUDIO_HEADER_BYTES).is_multiple_of(2)
@@ -60,6 +68,7 @@ impl AudioChunk {
         })
     }
 
+    /// Encodes header and payload; callers supply valid whole-sample PCM16 bytes.
     pub fn encode(&self) -> Bytes {
         let mut encoded = BytesMut::with_capacity(AUDIO_HEADER_BYTES + self.pcm16.len());
         encoded.put_u64_le(self.turn_id.0);

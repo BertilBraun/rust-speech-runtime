@@ -1,3 +1,5 @@
+//! Conservative recent forward costs indexed by workload, batch size and context bucket.
+
 use super::BatchKind;
 use crate::config::RuntimeConfig;
 use std::collections::{HashMap, VecDeque};
@@ -12,6 +14,7 @@ pub(crate) struct CostModel {
     initial_ms: f64,
     samples: HashMap<Shape, VecDeque<f64>>,
 }
+
 impl CostModel {
     pub fn new(initial_ms: f64) -> Self {
         Self {
@@ -19,6 +22,7 @@ impl CostModel {
             samples: HashMap::new(),
         }
     }
+
     pub fn observe(&mut self, kind: BatchKind, elapsed_ms: f64, items: usize, context: usize) {
         let samples = self
             .samples
@@ -33,6 +37,7 @@ impl CostModel {
         }
         samples.push_back(elapsed_ms.max(0.01));
     }
+
     pub fn estimate(&self, kind: BatchKind, items: usize, context: usize) -> f64 {
         let shape = Shape {
             kind,
@@ -49,14 +54,17 @@ impl CostModel {
             .map(|(_, samples)| conservative(samples))
             .reduce(f64::max);
         if let Some(measured) = same_batch {
+            // An unseen context bucket needs headroom even when batch size has been measured.
             return measured * 2.0;
         }
+        // Unknown batch sizes inherit a conservative duration, never a proportional fraction.
         self.samples
             .iter()
             .filter(|(shape, _)| shape.kind == kind)
             .map(|(_, samples)| conservative(samples))
             .fold(self.initial_ms, f64::max)
     }
+
     pub fn admits(
         &self,
         active: usize,
@@ -86,9 +94,11 @@ impl CostModel {
         decode + prefill <= (1000.0 / config.target_tokens_per_second) * config.admission_headroom
     }
 }
+
 fn bucket(context: usize) -> u32 {
     context.max(1).ilog2() / 2
 }
+
 fn conservative(samples: &VecDeque<f64>) -> f64 {
     samples.iter().copied().fold(0.0, f64::max) * 1.1
 }

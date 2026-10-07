@@ -1,3 +1,5 @@
+//! Ordinary WebSocket client used by examples and benchmark workloads.
+
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -18,12 +20,18 @@ use super::{
     wire::{AudioChunk, ClientControl},
 };
 
+/// One conversation connection to the versioned `/v1` speech endpoint.
+///
+/// Sends controls and PCM16 audio over the same ordered WebSocket. Except for open
+/// and begin_turn, command methods acknowledge socket writes; inspect server events
+/// for validation failures or completion. The client owns no model/cache state.
 pub struct VoiceClient {
     websocket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     timeout: Duration,
 }
 
 impl VoiceClient {
+    /// Opens a WebSocket, bounding connection and later reads/writes by operation_timeout.
     pub async fn connect(url: &str, operation_timeout: Duration) -> Result<Self, GatewayError> {
         let configuration = WebSocketConfig::default()
             .max_message_size(Some(1024 * 1024))
@@ -42,6 +50,8 @@ impl VoiceClient {
         })
     }
 
+    /// Requests admission and waits for Opened, returning the sticky worker ID.
+    /// A rejected open completes the close handshake before returning the failure.
     pub async fn open(&mut self, session_id: SessionId) -> Result<usize, GatewayError> {
         self.send_control(ClientControl::Open { session_id })
             .await?;
@@ -55,6 +65,8 @@ impl VoiceClient {
         }
     }
 
+    /// Starts capture and waits for admission; discards older queued events while waiting.
+    /// Read the old turn first if its output is needed before an interruption.
     pub async fn begin_turn(&mut self, turn_id: TurnId) -> Result<(), GatewayError> {
         self.send_control(ClientControl::StartTurn { turn_id })
             .await?;
@@ -71,6 +83,8 @@ impl VoiceClient {
         }
     }
 
+    /// Sends a contiguous, zero-based packet of mono 16 kHz little-endian PCM16.
+    /// Use 100 ms packets (1,600 samples), retaining a shorter final packet.
     pub async fn audio(
         &mut self,
         turn_id: TurnId,
@@ -88,6 +102,8 @@ impl VoiceClient {
         .await
     }
 
+    /// Requests private candidate inference during endpoint confirmation.
+    /// Counts must describe all audio sent so far; text remains hidden until commit.
     pub async fn prepare(
         &mut self,
         turn_id: TurnId,
@@ -102,6 +118,7 @@ impl VoiceClient {
         .await
     }
 
+    /// Confirms end-of-turn with exact packet/sample totals and enables text generation.
     pub async fn commit(
         &mut self,
         turn_id: TurnId,
@@ -116,10 +133,13 @@ impl VoiceClient {
         .await
     }
 
+    /// Requests logical interruption; read remaining accepted events in their FIFO order.
     pub async fn cancel(&mut self, turn_id: TurnId) -> Result<(), GatewayError> {
         self.send_control(ClientControl::Cancel { turn_id }).await
     }
 
+    /// Reads one JSON event, skipping transport ping/pong frames.
+    /// Each read is bounded; an early peer close is an error.
     pub async fn next_event(&mut self) -> Result<SessionEvent, GatewayError> {
         loop {
             let incoming = timeout(self.timeout, self.websocket.next())
@@ -139,6 +159,8 @@ impl VoiceClient {
         }
     }
 
+    /// Closes the session, consumes events through Closed, then finishes socket shutdown.
+    /// Drain output beforehand if the caller needs to retain those events.
     pub async fn close(mut self) -> Result<(), GatewayError> {
         self.send_control(ClientControl::Close).await?;
         loop {
@@ -168,6 +190,8 @@ impl VoiceClient {
         }
     }
 
+    /// Sends a typed control without consuming its server-side acknowledgement.
+    /// Use this when the caller needs to manage every event, including interruptions.
     pub async fn send_control(&mut self, control: ClientControl) -> Result<(), GatewayError> {
         self.send(Message::Text(serde_json::to_string(&control)?.into()))
             .await

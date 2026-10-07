@@ -150,7 +150,12 @@ async fn generate(
         let event = tokio::select! {
             _ = tokio::time::sleep_until(deadline) => return Err(GatewayError::Timeout),
             _ = observations.tick() => {
-                timing.observe_rate(Instant::now(), measurements, configuration.target_tokens_per_second, Duration::from_millis(configuration.throughput_window_ms));
+                timing.observe_rate(
+                    Instant::now(),
+                    measurements,
+                    configuration.target_tokens_per_second,
+                    Duration::from_millis(configuration.throughput_window_ms),
+                );
                 continue;
             }
             event = client.next_event() => event?,

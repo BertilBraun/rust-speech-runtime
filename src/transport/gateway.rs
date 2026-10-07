@@ -2,8 +2,8 @@ use std::{net::SocketAddr, sync::Arc};
 
 use serde::Serialize;
 use tokio::{
-    net::TcpListener,
-    sync::{Semaphore, mpsc},
+    net::{TcpListener, TcpStream},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
@@ -16,6 +16,7 @@ use super::{
     connection,
 };
 
+/// Typed failures at configuration, network, runtime and task boundaries.
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
     #[error("invalid gateway configuration: {0}")]
@@ -40,6 +41,7 @@ pub enum GatewayError {
     Task(#[from] tokio::task::JoinError),
 }
 
+/// Final connection, archive and runtime observations returned after orderly shutdown.
 #[derive(Debug, Default, Serialize)]
 pub struct GatewayReport {
     pub connections: u64,
@@ -51,6 +53,8 @@ pub struct GatewayReport {
     pub runtime: MetricsSnapshot,
 }
 
+/// Public WebSocket ingress backed by one Node and bounded connection/archive tasks.
+/// Bind once, then serve until cancellation; each connection owns one sticky session.
 pub struct Gateway {
     listener: TcpListener,
     node: Node,
@@ -58,6 +62,8 @@ pub struct Gateway {
 }
 
 impl Gateway {
+    /// Validates transport limits, binds the listener and connects configured model workers.
+    /// Serving starts only after every worker reports readiness.
     pub async fn bind(
         runtime: RuntimeConfig,
         configuration: GatewayConfig,
@@ -72,10 +78,13 @@ impl Gateway {
         })
     }
 
+    /// Returns the bound address, including an OS-selected port when configured as zero.
     pub fn local_address(&self) -> Result<SocketAddr, GatewayError> {
         Ok(self.listener.local_addr()?)
     }
 
+    /// Accepts connections until cancelled, then closes sessions and drains archive work.
+    /// Runtime shutdown follows connection cleanup so accepted records can be retained.
     pub async fn serve(
         self,
         cancellation: CancellationToken,
@@ -137,18 +146,37 @@ impl Gateway {
                     };
                     stream.set_nodelay(true)?;
                     report.connections += 1;
-                    let ingress = self.node.ingress();
-                    let configuration = self.configuration.clone();
-                    let archives = archives.cloned();
-                    let connection_cancellation = cancellation.child_token();
-                    connections.spawn(async move {
-                        let _permit = permit;
-                        connection::run(stream, ingress, configuration, archives, connection_cancellation).await
-                    });
+                    self.spawn_connection(stream, permit, connections, archives, cancellation);
                 }
             }
         }
         Ok(())
+    }
+
+    fn spawn_connection(
+        &self,
+        stream: TcpStream,
+        permit: OwnedSemaphorePermit,
+        connections: &mut JoinSet<connection::ConnectionReport>,
+        archives: Option<&ArchiveSender>,
+        cancellation: &CancellationToken,
+    ) {
+        let ingress = self.node.ingress();
+        let configuration = self.configuration.clone();
+        let archives = archives.cloned();
+        let connection_cancellation = cancellation.child_token();
+        connections.spawn(async move {
+            // Retain the permit through archive backpressure to bound records awaiting disk.
+            let _permit = permit;
+            connection::run(
+                stream,
+                ingress,
+                configuration,
+                archives,
+                connection_cancellation,
+            )
+            .await
+        });
     }
 }
 

@@ -2,6 +2,8 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use super::GatewayError;
 
+/// Network and archive limits; model/scheduling limits belong to RuntimeConfig.
+/// Each connection has a bounded output queue and bounded handshake/write/idle waits.
 #[derive(Clone, Debug)]
 pub struct GatewayConfig {
     pub listen_address: SocketAddr,
@@ -11,6 +13,7 @@ pub struct GatewayConfig {
     pub handshake_timeout: Duration,
     pub write_timeout: Duration,
     pub idle_timeout: Duration,
+    /// Destination for completed records; None disables file archival.
     pub archive_directory: Option<PathBuf>,
     pub archive_capacity: usize,
 }
@@ -32,6 +35,7 @@ impl Default for GatewayConfig {
 }
 
 impl GatewayConfig {
+    /// Rejects invalid limits before binding a socket or starting model workers.
     pub fn validate(&self) -> Result<(), GatewayError> {
         if self.max_connections == 0
             || self.outbound_capacity == 0

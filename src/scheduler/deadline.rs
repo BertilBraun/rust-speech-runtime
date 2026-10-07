@@ -1,3 +1,5 @@
+//! Selects cache control work first, then balances ordered decode and bounded-wait prefill.
+
 use super::{BatchKind, CostModel};
 use crate::session::state::{Preparation, SessionState, Stage};
 use std::collections::HashMap;
@@ -28,6 +30,7 @@ pub(crate) fn select_batch(
         }
     });
     if let Some((_, oldest)) = prefill.first() {
+        // A forward batches either provisional candidates or committed utterances, never both.
         let preparing = matches!(sessions[oldest].preparation, Preparation::Queued(_));
         prefill.retain(|(_, key)| {
             matches!(sessions[key].preparation, Preparation::Queued(_)) == preparing
@@ -64,6 +67,7 @@ pub(crate) fn select_batch(
                     .max()
                     .unwrap_or(0);
                 let predicted_prefill = costs.estimate(BatchKind::Prefill, *size, context);
+                // Bound prefill starvation even when its forward exceeds the decode gap budget.
                 decode.is_empty()
                     || queued_at.elapsed() >= maximum_prefill_wait
                     || predicted_prefill + predicted_decode < available

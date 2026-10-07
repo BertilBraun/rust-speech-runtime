@@ -42,13 +42,16 @@ struct PreparedCache {
     generation: u64,
     context: usize,
 }
+
 impl Fixture {
     async fn start(delay_ms: u64) -> Self {
         Self::limited(delay_ms, usize::MAX).await
     }
+
     async fn limited(delay_ms: u64, maximum_sessions: usize) -> Self {
         Self::configured(delay_ms, maximum_sessions, false).await
     }
+
     async fn configured(delay_ms: u64, maximum_sessions: usize, fail_decode: bool) -> Self {
         Self::with_configuration(FixtureConfiguration {
             open_delay_ms: delay_ms,
@@ -63,6 +66,7 @@ impl Fixture {
         })
         .await
     }
+
     async fn with_configuration(configuration: FixtureConfiguration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = listener.local_addr().unwrap();
@@ -308,6 +312,7 @@ impl Fixture {
             task,
         }
     }
+
     fn config(&self) -> RuntimeConfig {
         RuntimeConfig {
             workers: vec![WorkerConfig {
@@ -318,11 +323,13 @@ impl Fixture {
         }
     }
 }
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
+
 async fn write_json<T: serde::Serialize>(stream: &mut TcpStream, value: &T) {
     let metadata = serde_json::to_vec(value).unwrap();
     if stream.write_u32(metadata.len() as u32).await.is_err() {
@@ -330,6 +337,7 @@ async fn write_json<T: serde::Serialize>(stream: &mut TcpStream, value: &T) {
     }
     let _ = stream.write_all(&metadata).await;
 }
+
 async fn start_turn(session: &SessionHandle, turn_id: u64) {
     session.begin_turn(TurnId(turn_id)).await.unwrap();
     session
@@ -338,6 +346,7 @@ async fn start_turn(session: &SessionHandle, turn_id: u64) {
         .unwrap();
     session.commit(TurnId(turn_id), 1, 800).await.unwrap();
 }
+
 async fn finish_turn(session: &mut SessionHandle) -> usize {
     let mut tokens = 0;
     loop {

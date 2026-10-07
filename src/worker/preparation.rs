@@ -1,4 +1,6 @@
-use super::{actor::WorkerActor, commands::check_turn};
+//! Owns private endpoint candidates, their invalidation and safe fallback to ordinary prefill.
+
+use super::{actor::WorkerActor, turn::check_turn};
 use crate::{
     protocol::{
         ErrorCode, SessionEvent, TurnId,
