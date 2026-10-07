@@ -31,6 +31,7 @@ class WarmupConfig(Record):
         64,
         256,
     )
+    max_prefill_batch_size: Annotated[int, Field(gt=0)] = 4
     max_decode_batch_size: Annotated[int, Field(gt=0)] = 4
 
 

@@ -194,29 +194,44 @@ class SpeechModel:
         return ForwardBatch(separated, tokens, timer)
 
     def warmup(self) -> None:
+        maximum = min(
+            self.configuration.max_batch_size,
+            self.configuration.warmup.max_prefill_batch_size,
+        )
         with torch.inference_mode():
-            self._warm_audio_prefill()
-            for length in self.configuration.warmup.prefill_tokens:
-                length = min(length, (self.configuration.max_context_tokens - 2) // 3)
-                prompt = self.embed((NEWLINE,) * length)
-                self._warm_prompt(prompt)
+            for size in range(1, maximum + 1):
+                self._warm_audio_prefill(size)
+                for length in self.configuration.warmup.prefill_tokens:
+                    length = min(length, (self.configuration.max_context_tokens - 2) // 3)
+                    prompt = self.embed((NEWLINE,) * length)
+                    self._warm_prompt((prompt,) * size)
         torch.cuda.empty_cache()
 
-    def _warm_audio_prefill(self) -> None:
+    def _warm_audio_prefill(self, batch_size: int) -> None:
         samples = min(
             self.configuration.warmup.audio_samples,
             max(1600, (self.configuration.max_context_tokens // 3 - 15) * 1600),
         )
-        projected, _ = self.encode_audio((bytes(samples * 2),))
-        prompt = torch.cat((self.embed(USER_PREFIX), projected[0], self.embed(ASSISTANT_SUFFIX)))
-        self._warm_prompt(prompt)
+        projected, _ = self.encode_audio((bytes(samples * 2),) * batch_size)
+        prompts = tuple(
+            torch.cat((self.embed(USER_PREFIX), speech, self.embed(ASSISTANT_SUFFIX)))
+            for speech in projected
+        )
+        self._warm_prompt(prompts)
 
-    def _warm_prompt(self, prompt: Tensor) -> None:
-        first = self.forward_batch((prompt,), (DynamicCache(config=self.text_config),))
+    def _warm_prompt(self, prompts: tuple[Tensor, ...]) -> None:
+        first = self.forward_batch(
+            prompts, tuple(DynamicCache(config=self.text_config) for _ in prompts)
+        )
         self._warm_decode_batches(first)
-        continuation = torch.cat((self.embed((first.token_ids[0], EOS, NEWLINE)), prompt))
-        second = self.forward_batch((continuation,), first.caches)
-        self._warm_decode_batches(second)
+        completed_endings = tuple(self.embed((EOS, NEWLINE)) for _ in prompts)
+        interrupted_endings = tuple(self.embed((token, EOS, NEWLINE)) for token in first.token_ids)
+        for endings in (completed_endings, interrupted_endings):
+            continuations = tuple(
+                torch.cat((ending, prompt)) for ending, prompt in zip(endings, prompts, strict=True)
+            )
+            second = self.forward_batch(continuations, first.caches)
+            self._warm_decode_batches(second)
 
     def _warm_decode_batches(self, batch: ForwardBatch) -> None:
         maximum = min(
@@ -230,4 +245,4 @@ class SpeechModel:
             size *= 2
         token = self.embed((batch.token_ids[0],))
         for size in sorted(sizes):
-            self.forward_batch((token,) * size, batch.caches * size)
+            self.forward_batch((token,) * size, (batch.caches[0],) * size)

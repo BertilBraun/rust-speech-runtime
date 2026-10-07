@@ -11,7 +11,7 @@ from transformers.cache_utils import DynamicCache
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from voice_worker.cache import attention_layer, cache_bytes, join_caches, recurrent_layer
-from voice_worker.config import WorkerConfig
+from voice_worker.config import WarmupConfig, WorkerConfig
 from voice_worker.model import ForwardBatch, StageTimer
 from voice_worker.protocol import (
     AcceptedToken,
@@ -250,27 +250,51 @@ def test_decode_invalidates_preparation_before_mutating_canonical_history(
     assert isinstance(execute(engine, (activate(2),)).results[0].outcome, Failed)
 
 
+@pytest.mark.parametrize("worker_batch_size,prefill_batch_size", [(1, 4), (2, 4), (4, 3), (4, 4)])
 def test_warmup_covers_populated_prefill_and_bounded_decode_batches(
-    engine: PyTorchEngine, monkeypatch: pytest.MonkeyPatch
+    engine: PyTorchEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_batch_size: int,
+    prefill_batch_size: int,
 ) -> None:
     model = engine.model
     model.configuration = engine.configuration.model_copy(
-        update={"max_batch_size": 2, "max_context_tokens": 512}
+        update={
+            "max_batch_size": worker_batch_size,
+            "max_context_tokens": 512,
+            "warmup": WarmupConfig(max_prefill_batch_size=prefill_batch_size),
+        }
     )
     original_forward = model.forward_batch
+    original_encode = model.encode_audio
     calls: list[tuple[int, int, int]] = []
+    encoder_sizes: list[int] = []
 
     def tracked_forward(
         embeddings: Sequence[Tensor], caches: Sequence[DynamicCache]
     ) -> ForwardBatch:
+        assert len(embeddings) == len(caches)
         calls.append((len(embeddings), embeddings[0].shape[0], caches[0].get_seq_length()))
         return original_forward(embeddings, caches)
 
+    def tracked_encode(audio: Sequence[bytes]) -> tuple[tuple[Tensor, ...], StageTimer]:
+        encoder_sizes.append(len(audio))
+        return original_encode(audio)
+
     monkeypatch.setattr(model, "forward_batch", tracked_forward)
+    monkeypatch.setattr(model, "encode_audio", tracked_encode)
     model.warmup()
-    assert max(batch for batch, _, _ in calls) == 2
+    maximum_prefill = min(worker_batch_size, prefill_batch_size)
+    assert encoder_sizes == list(range(1, maximum_prefill + 1))
+    assert max(batch for batch, _, _ in calls) == worker_batch_size
+    assert max(batch for batch, length, _ in calls if length > 1) == maximum_prefill
     assert all(length + previous < 512 for _, length, previous in calls)
-    assert any(length == 64 and previous == 0 for _, length, previous in calls)
-    assert any(length > 1 and previous > 0 for _, length, previous in calls)
-    assert any(batch == 2 and length == 1 and previous > 0 for batch, length, previous in calls)
+    for batch in range(1, maximum_prefill + 1):
+        assert (batch, 64, 0) in calls
+        assert (batch, 66, 64) in calls
+        assert (batch, 67, 64) in calls
+    assert any(
+        batch == worker_batch_size and length == 1 and previous > 0
+        for batch, length, previous in calls
+    )
     assert not engine.sessions
