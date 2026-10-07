@@ -61,24 +61,26 @@ async fn interrupted_prefill_cost_uses_original_audio_and_cache_prefix() {
     session.stage = Stage::Prefill {
         queued_at: Instant::now(),
     };
-    worker.sessions.insert("session-key".into(), session);
-    let job = worker.build_batch(BatchKind::Prefill, vec!["session-key".into()]);
+    worker
+        .sessions
+        .insert("session-session_key".into(), session);
+    let job = worker.build_batch(BatchKind::Prefill, vec!["session-session_key".into()]);
     let (reply, response) = oneshot::channel();
-    worker.command(Command::Begin {
-        key: "session-key".into(),
+    worker.handle_command(Command::Begin {
+        session_key: "session-session_key".into(),
         turn_id: TurnId(2),
         reply,
     });
     response.await.unwrap().unwrap();
     worker
-        .complete(Completion {
+        .apply_completion(BatchCompletion {
             elapsed_ms: 300.0,
             response: Ok(BatchResponse {
                 request_id: job.request.request_id,
                 body_bytes: 0,
                 results: vec![OperationResult {
                     operation_id: job.request.operations[0].operation_id(),
-                    session_id: "session-key".into(),
+                    session_id: "session-session_key".into(),
                     turn_id: Some(1),
                     generation: Some(0),
                     outcome: Outcome::Token {
@@ -93,10 +95,13 @@ async fn interrupted_prefill_cost_uses_original_audio_and_cache_prefix() {
             }),
         })
         .unwrap();
-    let session = &worker.sessions["session-key"];
+    let session = &worker.sessions["session-session_key"];
     assert_eq!(session.context_tokens, 412);
-    assert!(session.turn().unwrap().audio_pcm16.is_empty());
-    assert!(session.turn().unwrap().tokens.is_empty());
+    assert!(session.current_turn().unwrap().audio_pcm16.is_empty());
+    assert!(session.current_turn().unwrap().tokens.is_empty());
     assert_eq!(metrics.snapshot().stale_results_discarded, 1);
-    assert_eq!(worker.costs.estimate(BatchKind::Prefill, 1, 432), 330.0);
+    assert_eq!(
+        worker.forward_costs.estimate(BatchKind::Prefill, 1, 432),
+        330.0
+    );
 }

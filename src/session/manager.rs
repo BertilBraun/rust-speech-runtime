@@ -23,60 +23,63 @@ pub(crate) enum ManagerCommand {
     },
     Release {
         session_id: SessionId,
-        key: String,
+        session_key: String,
     },
 }
+
 struct Route {
-    key: String,
+    session_key: String,
     worker_id: usize,
     cancellation: CancellationToken,
 }
+
 struct OpenCompletion {
     reply: oneshot::Sender<Result<SessionHandle, RuntimeError>>,
     result: Result<SessionHandle, RuntimeError>,
 }
+
 struct SessionManager {
     sender: mpsc::Sender<ManagerCommand>,
     workers: Vec<WorkerHandle>,
-    config: RuntimeConfig,
+    configuration: RuntimeConfig,
     metrics: Arc<Metrics>,
     cancellation: CancellationToken,
     routes: HashMap<SessionId, Route>,
-    pending: FuturesUnordered<BoxFuture<'static, OpenCompletion>>,
-    sequence: u64,
+    pending_opens: FuturesUnordered<BoxFuture<'static, OpenCompletion>>,
+    next_session_number: u64,
 }
 
 pub(crate) async fn run_manager(
     mut receiver: mpsc::Receiver<ManagerCommand>,
     sender: mpsc::Sender<ManagerCommand>,
     workers: Vec<WorkerHandle>,
-    config: RuntimeConfig,
+    configuration: RuntimeConfig,
     metrics: Arc<Metrics>,
     cancellation: CancellationToken,
 ) {
     let mut manager = SessionManager {
         sender,
         workers,
-        config,
+        configuration,
         metrics,
         cancellation,
         routes: HashMap::new(),
-        pending: FuturesUnordered::new(),
-        sequence: 0,
+        pending_opens: FuturesUnordered::new(),
+        next_session_number: 0,
     };
-    let mut reap = tokio::time::interval(Duration::from_millis(100));
+    let mut cleanup_timer = tokio::time::interval(Duration::from_millis(100));
     loop {
         tokio::select! {
             _ = manager.cancellation.cancelled() => break,
-            _ = reap.tick() => manager.reap(),
-            Some(completion) = manager.pending.next(), if !manager.pending.is_empty() => {
+            _ = cleanup_timer.tick() => manager.remove_cancelled_routes(),
+            Some(completion) = manager.pending_opens.next(), if !manager.pending_opens.is_empty() => {
                 manager.complete_open(completion);
             }
             command = receiver.recv() => {
                 let Some(command) = command else {
                     break;
                 };
-                manager.command(command);
+                manager.handle_command(command);
             }
         }
     }
@@ -86,31 +89,43 @@ pub(crate) async fn run_manager(
 }
 
 impl SessionManager {
-    fn reap(&mut self) {
+    fn remove_cancelled_routes(&mut self) {
         self.routes
             .retain(|_, route| !route.cancellation.is_cancelled());
     }
 
-    fn command(&mut self, command: ManagerCommand) {
+    fn handle_command(&mut self, command: ManagerCommand) {
         match command {
-            ManagerCommand::Release { session_id, key } => {
+            ManagerCommand::Release {
+                session_id,
+                session_key,
+            } => {
                 if self
                     .routes
                     .get(&session_id)
-                    .is_some_and(|route| route.key == key)
+                    .is_some_and(|route| route.session_key == session_key)
                 {
                     self.routes.remove(&session_id);
                 }
             }
-            ManagerCommand::Open { session_id, reply } => match self.reserve(session_id) {
-                Ok((handle, opened)) => self
-                    .pending
-                    .push(Box::pin(wait_open(handle, opened, reply))),
-                Err(error) => self.complete_open(OpenCompletion {
-                    reply,
-                    result: Err(error),
-                }),
-            },
+            ManagerCommand::Open { session_id, reply } => self.start_open(session_id, reply),
+        }
+    }
+
+    fn start_open(
+        &mut self,
+        session_id: SessionId,
+        reply: oneshot::Sender<Result<SessionHandle, RuntimeError>>,
+    ) {
+        match self.reserve_session(session_id) {
+            Ok((handle, opened)) => {
+                self.pending_opens
+                    .push(Box::pin(wait_open(handle, opened, reply)));
+            }
+            Err(error) => self.complete_open(OpenCompletion {
+                reply,
+                result: Err(error),
+            }),
         }
     }
 
@@ -124,34 +139,44 @@ impl SessionManager {
     }
 
     fn choose_worker(&self) -> Result<WorkerHandle, RuntimeError> {
-        let load = |worker: &WorkerHandle| {
-            worker.load().max(
-                self.routes
-                    .values()
-                    .filter(|route| route.worker_id == worker.id)
-                    .count(),
+        let mut selected_worker: Option<&WorkerHandle> = None;
+        let mut selected_priority = (usize::MAX, usize::MAX);
+        for worker in &self.workers {
+            let session_count = self.reserved_session_count(worker);
+            if !worker.is_available() || session_count >= self.configuration.max_sessions_per_worker
+            {
+                continue;
+            }
+            // Prefer fewer sessions, then lower worker ID, independent of vector order.
+            let placement_priority = (session_count, worker.worker_id);
+            if placement_priority < selected_priority {
+                selected_worker = Some(worker);
+                selected_priority = placement_priority;
+            }
+        }
+        selected_worker.cloned().ok_or_else(|| {
+            RuntimeError::new(
+                ErrorCode::CapacityExceeded,
+                "no worker has a free session slot",
             )
-        };
-        self.workers
-            .iter()
-            .filter(|worker| {
-                worker.available() && load(worker) < self.config.max_sessions_per_worker
-            })
-            .min_by_key(|worker| (load(worker), worker.id))
-            .cloned()
-            .ok_or_else(|| {
-                RuntimeError::new(
-                    ErrorCode::CapacityExceeded,
-                    "no worker has a free session slot",
-                )
-            })
+        })
     }
 
-    fn reserve(
+    fn reserved_session_count(&self, worker: &WorkerHandle) -> usize {
+        let routed_sessions = self
+            .routes
+            .values()
+            .filter(|route| route.worker_id == worker.worker_id)
+            .count();
+        // Routes include opens not yet visible in the worker's atomic session count.
+        worker.session_count().max(routed_sessions)
+    }
+
+    fn reserve_session(
         &mut self,
         session_id: SessionId,
     ) -> Result<(SessionHandle, oneshot::Receiver<Result<(), RuntimeError>>), RuntimeError> {
-        self.reap();
+        self.remove_cancelled_routes();
         if self.routes.contains_key(&session_id) {
             return Err(RuntimeError::new(
                 ErrorCode::SessionExists,
@@ -159,13 +184,13 @@ impl SessionManager {
             ));
         }
         let worker = self.choose_worker()?;
-        self.sequence += 1;
-        let key = format!("{}:{}", self.sequence, session_id.0);
+        self.next_session_number += 1;
+        let session_key = format!("{}:{}", self.next_session_number, session_id.0);
         let cancellation = self.cancellation.child_token();
-        let (events, receiver) = mpsc::channel(self.config.event_capacity);
+        let (events, receiver) = mpsc::channel(self.configuration.event_capacity);
         let (reply, opened) = oneshot::channel();
         worker.send(Command::Open {
-            key: key.clone(),
+            session_key: session_key.clone(),
             session_id: session_id.clone(),
             events,
             cancellation: cancellation.clone(),
@@ -174,14 +199,14 @@ impl SessionManager {
         self.routes.insert(
             session_id.clone(),
             Route {
-                key: key.clone(),
-                worker_id: worker.id,
+                session_key: session_key.clone(),
+                worker_id: worker.worker_id,
                 cancellation: cancellation.clone(),
             },
         );
         let handle = SessionHandle {
-            key,
-            worker_id: worker.id,
+            session_key,
+            worker_id: worker.worker_id,
             worker,
             events: receiver,
             cancellation,

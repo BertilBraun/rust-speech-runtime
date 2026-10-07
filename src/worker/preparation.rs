@@ -2,85 +2,48 @@
 
 use super::{actor::WorkerActor, turn::check_turn};
 use crate::{
+    metrics::Metrics,
     protocol::{
-        ErrorCode, SessionEvent, TurnId,
+        ErrorCode, FinishReason, SessionEvent, TurnId,
         backend::{OperationResult, Outcome},
     },
     runtime::RuntimeError,
-    session::state::{CaptureSnapshot, Preparation, PreparationRequest, Stage},
+    session::state::{CaptureSnapshot, Preparation, PreparationRequest, SessionState, Stage},
 };
 use std::sync::atomic::Ordering;
 use tokio::time::Instant;
 
 impl WorkerActor {
-    pub(super) fn prepare(
+    pub(super) fn prepare_turn(
         &mut self,
-        key: &str,
+        session_key: &str,
         turn_id: TurnId,
         chunk_count: u32,
         sample_count: usize,
     ) -> Result<(), RuntimeError> {
-        let context_limit = self
-            .config
-            .max_context_tokens
-            .min(self.ready.max_context_tokens);
-        let session = self.session(key)?;
+        let context_limit = self.context_token_limit();
+        let session = self.session_mut(session_key)?;
         check_turn(session, turn_id)?;
-        if !matches!(session.stage, Stage::Capturing { .. }) {
-            return Err(RuntimeError::new(
-                ErrorCode::InvalidState,
-                "preparation requires a capturing turn",
-            ));
-        }
-        if sample_count == 0
-            || session.chunk_count != chunk_count
-            || session.turn().expect("capturing turn").audio_pcm16.len() / 2 != sample_count
-        {
-            return Err(RuntimeError::new(
-                ErrorCode::InvalidInput,
-                "prepare chunk/sample counts mismatch",
-            ));
-        }
-        if session
-            .context_tokens
-            .saturating_add(sample_count.div_ceil(1600) + 32)
-            >= context_limit
-        {
-            return Err(RuntimeError::new(
-                ErrorCode::ContextLimit,
-                "utterance exceeds remaining context",
-            ));
-        }
+        validate_candidate_capture(session, chunk_count, sample_count, context_limit)?;
         let snapshot = CaptureSnapshot {
             turn_id,
-            generation: session.generation(),
+            generation: session.generation,
             chunk_count,
             sample_count,
         };
         if session.preparation.snapshot() == Some(snapshot) {
             return Ok(());
         }
-        let request = PreparationRequest {
+        session.preparation.queue(PreparationRequest {
             snapshot,
             queued_at: Instant::now(),
-        };
-        session.preparation = match session.preparation {
-            Preparation::None | Preparation::Queued(_) => Preparation::Queued(request),
-            Preparation::Discarding { .. } => Preparation::Discarding {
-                next: Some(request),
-            },
-            Preparation::Running(_)
-            | Preparation::Ready(_)
-            | Preparation::DiscardPending { .. } => Preparation::DiscardPending {
-                next: Some(request),
-            },
-        };
+        });
         Ok(())
     }
 
     pub(super) fn complete_preparation(
         &mut self,
-        key: &str,
+        session_key: &str,
         turn_id: u64,
         generation: u64,
         result: OperationResult,
@@ -91,43 +54,13 @@ impl WorkerActor {
                 "prepared turn/generation mismatch",
             ));
         }
-        let session = self.sessions.get_mut(key).expect("preparing session");
-        let snapshot = match session.preparation {
-            Preparation::Running(snapshot)
-                if snapshot.generation == generation
-                    && snapshot.turn_id.0 == turn_id
-                    && session.generation() == generation
-                    && !session.closing
-                    && session.active() =>
-            {
-                Some(snapshot)
-            }
-            _ => None,
-        };
+        let session = self
+            .sessions
+            .get_mut(session_key)
+            .expect("preparing session");
+        let snapshot = current_preparation_snapshot(session, turn_id, generation);
         match result.outcome {
-            Outcome::Token { .. } => {
-                if let Some(snapshot) = snapshot {
-                    session.preparation = Preparation::Ready(snapshot);
-                    if session
-                        .events
-                        .try_send(SessionEvent::Prepared {
-                            turn_id: snapshot.turn_id,
-                            chunk_count: snapshot.chunk_count,
-                            sample_count: snapshot.sample_count,
-                        })
-                        .is_err()
-                    {
-                        session.preparation.invalidate();
-                        session.finish(crate::protocol::FinishReason::SlowConsumer);
-                        session.cancellation.cancel();
-                        session.closing = true;
-                        self.metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
-                        self.metrics.saturation.fetch_add(1, Ordering::Relaxed);
-                    }
-                } else {
-                    self.metrics.stale_results.fetch_add(1, Ordering::Relaxed);
-                }
-            }
+            Outcome::Token { .. } => publish_prepared_candidate(session, snapshot, &self.metrics),
             Outcome::Failed { .. } => {
                 if snapshot.is_some() {
                     session.preparation = Preparation::DiscardPending { next: None };
@@ -148,7 +81,7 @@ impl WorkerActor {
 
     pub(super) fn complete_discard(
         &mut self,
-        key: &str,
+        session_key: &str,
         outcome: Outcome,
     ) -> Result<(), RuntimeError> {
         if !matches!(outcome, Outcome::Discarded) {
@@ -157,7 +90,10 @@ impl WorkerActor {
                 "unexpected discard result",
             ));
         }
-        let session = self.sessions.get_mut(key).expect("discarding session");
+        let session = self
+            .sessions
+            .get_mut(session_key)
+            .expect("discarding session");
         let Preparation::Discarding { next } = session.preparation else {
             return Err(RuntimeError::new(
                 ErrorCode::BackendFailed,
@@ -170,4 +106,83 @@ impl WorkerActor {
             .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+}
+
+fn validate_candidate_capture(
+    session: &SessionState,
+    chunk_count: u32,
+    sample_count: usize,
+    context_limit: usize,
+) -> Result<(), RuntimeError> {
+    if !matches!(session.stage, Stage::Capturing { .. }) {
+        return Err(RuntimeError::new(
+            ErrorCode::InvalidState,
+            "preparation requires a capturing turn",
+        ));
+    }
+    let captured_samples = session
+        .current_turn()
+        .expect("capturing turn")
+        .audio_pcm16
+        .len()
+        / 2;
+    if sample_count == 0 || session.chunk_count != chunk_count || captured_samples != sample_count {
+        return Err(RuntimeError::new(
+            ErrorCode::InvalidInput,
+            "prepare chunk/sample counts mismatch",
+        ));
+    }
+    let estimated_context_tokens = session
+        .context_tokens
+        .saturating_add(sample_count.div_ceil(1600) + 32);
+    if estimated_context_tokens >= context_limit {
+        return Err(RuntimeError::new(
+            ErrorCode::ContextLimit,
+            "utterance exceeds remaining context",
+        ));
+    }
+    Ok(())
+}
+
+fn current_preparation_snapshot(
+    session: &SessionState,
+    turn_id: u64,
+    generation: u64,
+) -> Option<CaptureSnapshot> {
+    let Preparation::Running(snapshot) = session.preparation else {
+        return None;
+    };
+    if session.closing || !session.has_active_turn() || session.generation != generation {
+        return None;
+    }
+    if snapshot.generation != generation || snapshot.turn_id.0 != turn_id {
+        return None;
+    }
+    Some(snapshot)
+}
+
+fn publish_prepared_candidate(
+    session: &mut SessionState,
+    snapshot: Option<CaptureSnapshot>,
+    metrics: &Metrics,
+) {
+    let Some(snapshot) = snapshot else {
+        metrics.stale_results.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    session.preparation = Preparation::Ready(snapshot);
+    let event = SessionEvent::Prepared {
+        turn_id: snapshot.turn_id,
+        chunk_count: snapshot.chunk_count,
+        sample_count: snapshot.sample_count,
+    };
+    if session.events.try_send(event).is_ok() {
+        return;
+    }
+    session.preparation.invalidate();
+    session.finish_turn(FinishReason::SlowConsumer);
+    session.cancellation.cancel();
+    session.closing = true;
+    metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+    metrics.saturation.fetch_add(1, Ordering::Relaxed);
 }

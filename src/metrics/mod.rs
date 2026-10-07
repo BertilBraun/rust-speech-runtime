@@ -65,6 +65,7 @@ pub struct WorkerMetricsSnapshot {
     pub allocated_bytes: u64,
     pub reserved_bytes: u64,
 }
+
 struct WorkerMetrics {
     busy_microseconds: AtomicU64,
     allocated_bytes: AtomicU64,
@@ -231,6 +232,7 @@ impl Metrics {
         }
     }
 }
+
 pub(crate) struct Distribution(Mutex<Histogram<u64>>);
 impl Default for Distribution {
     fn default() -> Self {

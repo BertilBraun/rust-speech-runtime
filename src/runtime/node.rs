@@ -92,7 +92,7 @@ async fn start_workers(
     metrics: &Arc<Metrics>,
     cancellation: &CancellationToken,
 ) -> Result<StartedWorkers, RuntimeError> {
-    let generation_clock = Arc::new(AtomicU64::new(1));
+    let generation_counter = Arc::new(AtomicU64::new(1));
     let mut workers = StartedWorkers {
         handles: Vec::with_capacity(configuration.workers.len()),
         tasks: Vec::with_capacity(configuration.workers.len()),
@@ -104,7 +104,7 @@ async fn start_workers(
             worker_configuration,
             configuration.clone(),
             metrics.clone(),
-            generation_clock.clone(),
+            generation_counter.clone(),
             cancellation.child_token(),
         )
         .await;

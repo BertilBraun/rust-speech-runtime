@@ -20,61 +20,62 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub(crate) struct WorkerHandle {
-    pub id: usize,
+    pub worker_id: usize,
     sender: mpsc::Sender<Command>,
-    load: Arc<AtomicUsize>,
-    available: Arc<AtomicBool>,
+    session_count: Arc<AtomicUsize>,
+    backend_available: Arc<AtomicBool>,
     metrics: Arc<Metrics>,
 }
 
 impl WorkerHandle {
     pub async fn start(
-        id: usize,
-        worker_config: &WorkerConfig,
-        config: RuntimeConfig,
+        worker_id: usize,
+        worker_configuration: &WorkerConfig,
+        configuration: RuntimeConfig,
         metrics: Arc<Metrics>,
-        clock: Arc<AtomicU64>,
+        generation_counter: Arc<AtomicU64>,
         cancellation: CancellationToken,
     ) -> Result<(Self, JoinHandle<()>), RuntimeError> {
-        let (connection, ready) = tokio::time::timeout(
-            std::time::Duration::from_millis(config.backend_timeout_ms),
-            backend::BackendConnection::connect(worker_config.endpoint),
+        let (connection, backend_capabilities) = tokio::time::timeout(
+            std::time::Duration::from_millis(configuration.backend_timeout_ms),
+            backend::BackendConnection::connect(worker_configuration.endpoint),
         )
         .await
         .map_err(|_| {
             RuntimeError::new(ErrorCode::BackendUnavailable, "worker startup timeout")
         })??;
-        let (sender, receiver) = mpsc::channel(config.mailbox_capacity);
-        let load = Arc::new(AtomicUsize::new(0));
-        let available = Arc::new(AtomicBool::new(true));
+        let (sender, receiver) = mpsc::channel(configuration.mailbox_capacity);
+        let session_count = Arc::new(AtomicUsize::new(0));
+        let backend_available = Arc::new(AtomicBool::new(true));
         let actor = actor::WorkerActor::new(
-            id,
-            config,
-            ready,
+            worker_id,
+            configuration,
+            backend_capabilities,
             metrics.clone(),
-            clock,
-            load.clone(),
-            available.clone(),
+            generation_counter,
+            session_count.clone(),
+            backend_available.clone(),
         );
         let task = tokio::spawn(actor.run(receiver, connection, cancellation));
         Ok((
             Self {
-                id,
+                worker_id,
                 sender,
-                load,
-                available,
+                session_count,
+                backend_available,
                 metrics,
             },
             task,
         ))
     }
 
-    pub fn load(&self) -> usize {
-        self.load.load(Ordering::Relaxed)
+    /// Includes pending opens and closing sessions until their state is released.
+    pub fn session_count(&self) -> usize {
+        self.session_count.load(Ordering::Relaxed)
     }
 
-    pub fn available(&self) -> bool {
-        self.available.load(Ordering::Acquire)
+    pub fn is_available(&self) -> bool {
+        self.backend_available.load(Ordering::Acquire)
     }
 
     pub fn send(&self, command: Command) -> Result<(), RuntimeError> {
@@ -92,12 +93,12 @@ impl WorkerHandle {
 
     pub async fn close(
         &self,
-        key: String,
+        session_key: String,
         reply: oneshot::Sender<Result<SessionRecord, RuntimeError>>,
     ) -> Result<(), RuntimeError> {
         self.sender
             .send(Command::Close {
-                key,
+                session_key,
                 reply: Some(reply),
             })
             .await

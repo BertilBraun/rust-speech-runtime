@@ -9,20 +9,28 @@ use crate::{
 use std::sync::atomic::Ordering;
 
 impl WorkerActor {
-    pub(super) fn cancel_turn(&mut self, key: &str, turn_id: TurnId) -> Result<(), RuntimeError> {
-        let generation = self.generation();
-        let session = self.session(key)?;
+    pub(super) fn cancel_turn(
+        &mut self,
+        session_key: &str,
+        turn_id: TurnId,
+    ) -> Result<(), RuntimeError> {
+        let generation = self.allocate_generation_id();
+        let session = self.session_mut(session_key)?;
         check_turn(session, turn_id)?;
-        if session.active() {
+        if session.has_active_turn() {
             session.interrupt(generation);
         }
         Ok(())
     }
 
-    pub(super) fn begin(&mut self, key: &str, turn_id: TurnId) -> Result<(), RuntimeError> {
-        self.validate_turn_start(key, turn_id)?;
-        let generation = self.generation();
-        let session = self.session(key)?;
+    pub(super) fn begin_turn(
+        &mut self,
+        session_key: &str,
+        turn_id: TurnId,
+    ) -> Result<(), RuntimeError> {
+        self.validate_turn_start(session_key, turn_id)?;
+        let generation = self.allocate_generation_id();
+        let session = self.session_mut(session_key)?;
         session.interrupt(generation);
         session.record.turns.push(TurnRecord {
             turn_id,
@@ -40,7 +48,7 @@ impl WorkerActor {
             .try_send(SessionEvent::Accepted { turn_id })
             .is_err()
         {
-            session.finish(crate::protocol::FinishReason::SlowConsumer);
+            session.finish_turn(crate::protocol::FinishReason::SlowConsumer);
             session.cancellation.cancel();
             session.closing = true;
             self.metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
@@ -54,9 +62,9 @@ impl WorkerActor {
         Ok(())
     }
 
-    pub(super) fn audio(
+    pub(super) fn append_audio_chunk(
         &mut self,
-        key: &str,
+        session_key: &str,
         turn_id: TurnId,
         chunk_index: u32,
         audio: &[u8],
@@ -68,13 +76,13 @@ impl WorkerActor {
             ));
         }
         let audio_limit = self
-            .config
+            .configuration
             .max_audio_samples
-            .min(self.ready.max_audio_samples)
+            .min(self.backend_capabilities.max_audio_samples)
             * 2;
-        let history_limit = self.config.max_history_bytes;
-        let generation = self.generation();
-        let session = self.session(key)?;
+        let history_limit = self.configuration.max_history_bytes;
+        let generation = self.allocate_generation_id();
+        let session = self.session_mut(session_key)?;
         check_turn(session, turn_id)?;
         let chunks = validate_audio_append(
             session,
@@ -89,7 +97,7 @@ impl WorkerActor {
             session.generation = generation;
         }
         session
-            .turn_mut()
+            .current_turn_mut()
             .expect("capturing turn")
             .audio_pcm16
             .extend_from_slice(audio);
@@ -99,20 +107,17 @@ impl WorkerActor {
         Ok(())
     }
 
-    pub(super) fn commit(
+    pub(super) fn commit_turn(
         &mut self,
-        key: &str,
+        session_key: &str,
         turn_id: TurnId,
         final_chunk_count: u32,
         sample_count: usize,
     ) -> Result<(), RuntimeError> {
-        let context_limit = self
-            .config
-            .max_context_tokens
-            .min(self.ready.max_context_tokens);
-        let session = self.session(key)?;
+        let context_limit = self.context_token_limit();
+        let session = self.session_mut(session_key)?;
         check_turn(session, turn_id)?;
-        let turn = session.turn().expect("current turn");
+        let turn = session.current_turn().expect("current turn");
         if turn.committed {
             return if turn.audio_pcm16.len() / 2 == sample_count
                 && session.chunk_count == final_chunk_count
@@ -127,7 +132,7 @@ impl WorkerActor {
         }
         validate_new_commit(session, final_chunk_count, sample_count, context_limit)?;
 
-        session.turn_mut().expect("current turn").committed = true;
+        session.current_turn_mut().expect("current turn").committed = true;
         let now = tokio::time::Instant::now();
         session.committed_at = Some(now);
         session.stage = Stage::Prefill { queued_at: now };
@@ -136,7 +141,10 @@ impl WorkerActor {
 }
 
 pub(super) fn check_turn(session: &SessionState, turn_id: TurnId) -> Result<(), RuntimeError> {
-    if session.turn().is_some_and(|turn| turn.turn_id == turn_id) {
+    if session
+        .current_turn()
+        .is_some_and(|turn| turn.turn_id == turn_id)
+    {
         Ok(())
     } else {
         Err(RuntimeError::new(
@@ -168,7 +176,11 @@ fn validate_audio_append(
             "audio chunk index must be contiguous",
         ));
     }
-    let length = session.turn().expect("capturing turn").audio_pcm16.len();
+    let length = session
+        .current_turn()
+        .expect("capturing turn")
+        .audio_pcm16
+        .len();
     if length.saturating_add(audio_bytes) > audio_limit {
         return Err(RuntimeError::new(
             ErrorCode::InvalidInput,
@@ -201,7 +213,13 @@ fn validate_new_commit(
     };
     if chunks != final_chunk_count
         || sample_count == 0
-        || session.turn().expect("capturing turn").audio_pcm16.len() / 2 != sample_count
+        || session
+            .current_turn()
+            .expect("capturing turn")
+            .audio_pcm16
+            .len()
+            / 2
+            != sample_count
     {
         return Err(RuntimeError::new(
             ErrorCode::InvalidInput,

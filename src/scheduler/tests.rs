@@ -8,10 +8,10 @@ use std::collections::HashMap;
 use tokio::{sync::mpsc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
-fn session(key: &str, queued_at: Instant, preparing: bool) -> SessionState {
+fn session(session_key: &str, queued_at: Instant, preparing: bool) -> SessionState {
     let (events, _) = mpsc::channel(4);
     let mut session = SessionState::new(
-        SessionId(key.into()),
+        SessionId(session_key.into()),
         0,
         "test".into(),
         events,

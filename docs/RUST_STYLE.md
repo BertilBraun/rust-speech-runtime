@@ -20,6 +20,8 @@ Leave one blank line between functions, methods, type declarations and implement
 - Keep nested control flow shallow. Prefer early returns, `?` and `let ... else` for rejected inputs and ended streams. Three nested control-flow blocks deserve review; do not bury state changes inside six or more levels.
 - Split modules by ownership or responsibility. Keep closely related operations together. Move substantial test fixtures out of production modules, and put small inline test modules last.
 - Use descriptive domain names. Avoid compressed identifiers and clever expressions when an ordinary match or named operation communicates the intent more directly.
+- Name counts, durations and identities explicitly: `reserved_turn_count`, `decode_round_ms`, `session_key`, `generation_counter` and `in_flight_batch`. A reader should not have to inspect a type or follow a method to discover what `active`, `clock`, `previous` or `load` means.
+- Separate decision inputs from decisions. Calculate named costs and capacity facts first, then write the acceptance condition. Avoid branching inside iterator closures when an ordinary loop or a focused predicate is easier to follow.
 - Share canonical protocol and configuration types. Clone only where independent owners need the same data; explain non-obvious ownership requirements.
 
 ## Async and state ownership
@@ -27,6 +29,8 @@ Leave one blank line between functions, methods, type declarations and implement
 One worker actor owns its sessions, preparation state and scheduling decisions. Its `select!` coordinates commands, completions, cancellation and cleanup; it delegates substantial work to named functions. Backend execution owns the TCP connection and never borrows actor scheduling state across an await.
 
 Keep hot-path channels bounded. Document whether saturation rejects, waits or ends a session. Distinguish enqueueing, worker validation, model completion and network delivery. Preserve cancellation and acceptance ordering during refactors; a shorter expression is not an improvement if it drops accepted events or bypasses generation fencing.
+
+The worker control loop is a coordination boundary: command receiver, completion receiver, cleanup timer and cancellation. Session lifecycle work lives in `worker/lifecycle.rs`, and backend failure transitions in `worker/failure.rs`. Keep computation out of those event branches. `BatchJob` owns the backend request/audio body; `BatchCompletion` returns proposals for the actor to accept. Neither task borrows the other's mutable state.
 
 Explain non-obvious fairness, biased selection, cache acknowledgement and shutdown ordering with a short reason comment. Keep GPU operations and blocking archive writes outside the Tokio control loops.
 

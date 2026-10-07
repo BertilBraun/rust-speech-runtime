@@ -1,6 +1,6 @@
 //! Correlates backend results, observes cost and fences stale inference proposals.
 
-use super::{actor::WorkerActor, execution::Completion};
+use super::{actor::WorkerActor, execution::BatchCompletion};
 use crate::{
     protocol::{
         ErrorCode, FinishReason, SessionEvent,
@@ -13,19 +13,30 @@ use crate::{
 use std::sync::atomic::Ordering;
 
 impl WorkerActor {
-    pub fn complete(&mut self, completion: Completion) -> Result<(), RuntimeError> {
-        let active = self.active.take().expect("active batch");
+    pub(super) fn apply_completion(
+        &mut self,
+        completion: BatchCompletion,
+    ) -> Result<(), RuntimeError> {
+        let in_flight_batch = self
+            .in_flight_batch
+            .take()
+            .expect("batch awaiting completion");
         let response = completion.response?;
         self.observe_batch(
-            &active.request.operations,
-            active.kind,
+            &in_flight_batch.request.operations,
+            in_flight_batch.kind,
             completion.elapsed_ms,
             &response,
         );
-        for (operation, result) in active.request.operations.into_iter().zip(response.results) {
-            let key = operation.session_id();
+        for (operation, result) in in_flight_batch
+            .request
+            .operations
+            .into_iter()
+            .zip(response.results)
+        {
+            let session_key = operation.session_id();
             self.sessions
-                .get_mut(key)
+                .get_mut(session_key)
                 .ok_or_else(|| protocol_error("completion for unknown session"))?
                 .in_flight = false;
             match operation {
@@ -75,7 +86,7 @@ impl WorkerActor {
         response: &BatchResponse,
     ) {
         self.metrics.worker_observation(
-            self.id,
+            self.worker_id,
             elapsed_ms,
             response.memory.allocated_bytes,
             response.memory.reserved_bytes,
@@ -90,30 +101,29 @@ impl WorkerActor {
             }
         }
         self.metrics.inference.record(elapsed_ms);
-        let context = operations
+        let input_context_tokens = operations
             .iter()
-            .filter_map(|operation| {
-                self.sessions
-                    .get(operation.session_id())
-                    .map(|session| (operation, session))
-            })
-            .map(|(operation, session)| {
-                let appended_tokens = match operation {
-                    Operation::Prefill { audio_bytes, .. }
-                    | Operation::Prepare { audio_bytes, .. } => audio_bytes.div_ceil(3200) + 32,
-                    _ => 0,
-                };
-                // One in-flight operation keeps this cache length stable until completion.
-                session.context_tokens.saturating_add(appended_tokens)
-            })
+            .filter_map(|operation| self.operation_input_context(operation))
             .max()
             .unwrap_or(0);
-        self.costs
-            .observe(kind, elapsed_ms, operations.len(), context);
+        self.forward_costs
+            .observe(kind, elapsed_ms, operations.len(), input_context_tokens);
     }
 
-    fn complete_open(&mut self, key: &str, outcome: Outcome) -> Result<(), RuntimeError> {
-        let session = self.sessions.get_mut(key).expect("opening session");
+    fn operation_input_context(&self, operation: &Operation) -> Option<usize> {
+        let session = self.sessions.get(operation.session_id())?;
+        let appended_tokens = match operation {
+            Operation::Prefill { audio_bytes, .. } | Operation::Prepare { audio_bytes, .. } => {
+                audio_bytes.div_ceil(3200) + 32
+            }
+            _ => 0,
+        };
+        // One in-flight operation keeps this cache length stable until completion.
+        Some(session.context_tokens.saturating_add(appended_tokens))
+    }
+
+    fn complete_open(&mut self, session_key: &str, outcome: Outcome) -> Result<(), RuntimeError> {
+        let session = self.sessions.get_mut(session_key).expect("opening session");
         match outcome {
             Outcome::Opened => {
                 session.opened = true;
@@ -122,7 +132,7 @@ impl WorkerActor {
                     .fetch_add(1, Ordering::Relaxed);
                 let _ = session.events.try_send(SessionEvent::Opened {
                     session_id: session.record.session_id.clone(),
-                    worker_id: self.id,
+                    worker_id: self.worker_id,
                 });
                 if let Some(reply) = session.open_reply.take() {
                     let _ = reply.send(Ok(()));
@@ -135,16 +145,17 @@ impl WorkerActor {
                 if !session.closing {
                     self.metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
                 }
-                self.sessions.remove(key);
-                self.load.store(self.sessions.len(), Ordering::Relaxed);
+                self.sessions.remove(session_key);
+                self.session_count
+                    .store(self.sessions.len(), Ordering::Relaxed);
             }
             _ => return Err(protocol_error("unexpected open result")),
         }
         Ok(())
     }
 
-    fn complete_close(&mut self, key: &str, outcome: Outcome) -> Result<(), RuntimeError> {
-        let session = self.sessions.get_mut(key).expect("closing session");
+    fn complete_close(&mut self, session_key: &str, outcome: Outcome) -> Result<(), RuntimeError> {
+        let session = self.sessions.get_mut(session_key).expect("closing session");
         session.backend_closed = true;
         let failure = match outcome {
             Outcome::Closed => None,
@@ -152,14 +163,14 @@ impl WorkerActor {
             _ => Some(protocol_error("unexpected close result")),
         };
         if session.close_reply.is_some() || session.events.is_closed() {
-            self.remove_closed(key);
+            self.remove_closed(session_key);
         }
         failure.map_or(Ok(()), Err)
     }
 
     fn complete_inference(
         &mut self,
-        key: &str,
+        session_key: &str,
         turn_id: u64,
         generation: u64,
         result: OperationResult,
@@ -167,11 +178,14 @@ impl WorkerActor {
         if result.turn_id != Some(turn_id) || result.generation != Some(generation) {
             return Err(protocol_error("turn/generation mismatch in backend result"));
         }
-        let session = self.sessions.get_mut(key).expect("inference session");
+        let session = self
+            .sessions
+            .get_mut(session_key)
+            .expect("inference session");
         match result.outcome {
             Outcome::Failed { code, message } => {
                 if !session.closing {
-                    session.finish(if code == ErrorCode::ContextLimit {
+                    session.finish_turn(if code == ErrorCode::ContextLimit {
                         FinishReason::ContextLimit
                     } else {
                         FinishReason::BackendFailed
@@ -180,7 +194,7 @@ impl WorkerActor {
                     self.metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
                 }
                 let _ = session.events.try_send(SessionEvent::Failed {
-                    turn_id: session.turn().map(|turn| turn.turn_id),
+                    turn_id: session.current_turn().map(|turn| turn.turn_id),
                     code,
                     message,
                 });
@@ -196,10 +210,11 @@ impl WorkerActor {
                 context_tokens,
             } => {
                 session.context_tokens = context_tokens;
-                if session.generation() != generation || session.closing || !session.active() {
+                if session.generation != generation || session.closing || !session.has_active_turn()
+                {
                     self.metrics.stale_results.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    self.accept_token(key, token_id, text_delta, eos, context_tokens)?;
+                    self.accept_token(session_key, token_id, text_delta, eos, context_tokens)?;
                 }
             }
             _ => return Err(protocol_error("unexpected inference result")),
@@ -209,7 +224,7 @@ impl WorkerActor {
 
     fn complete_activation(
         &mut self,
-        key: &str,
+        session_key: &str,
         turn_id: u64,
         generation: u64,
         result: OperationResult,
@@ -218,7 +233,10 @@ impl WorkerActor {
             return Err(protocol_error("activation turn/generation mismatch"));
         }
         if matches!(result.outcome, Outcome::Failed { .. }) {
-            let session = self.sessions.get_mut(key).expect("activating session");
+            let session = self
+                .sessions
+                .get_mut(session_key)
+                .expect("activating session");
             if matches!(session.preparation, Preparation::Ready(_)) {
                 session.preparation.invalidate();
             }
@@ -227,7 +245,10 @@ impl WorkerActor {
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        let session = self.sessions.get_mut(key).expect("activating session");
+        let session = self
+            .sessions
+            .get_mut(session_key)
+            .expect("activating session");
         session.pending_token = None;
         session.preparation = match session.preparation {
             Preparation::DiscardPending { next } => {
@@ -238,7 +259,7 @@ impl WorkerActor {
         self.metrics
             .preparations_activated
             .fetch_add(1, Ordering::Relaxed);
-        self.complete_inference(key, turn_id, generation, result)
+        self.complete_inference(session_key, turn_id, generation, result)
     }
 }
 

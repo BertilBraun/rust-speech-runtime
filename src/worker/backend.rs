@@ -15,6 +15,7 @@ use tokio::{
 };
 
 const MAX_METADATA_BYTES: usize = 1024 * 1024;
+
 pub(crate) struct BackendConnection {
     stream: TcpStream,
 }
@@ -45,6 +46,17 @@ impl BackendConnection {
         request: &BatchRequest,
         audio: &[u8],
     ) -> Result<BatchResponse, RuntimeError> {
+        self.write_request(request, audio).await?;
+        let response = self.read_json::<BatchResponse>().await?;
+        validate_response(request, &response)?;
+        Ok(response)
+    }
+
+    async fn write_request(
+        &mut self,
+        request: &BatchRequest,
+        audio: &[u8],
+    ) -> Result<(), RuntimeError> {
         let metadata = serde_json::to_vec(request).map_err(protocol_error)?;
         if metadata.len() > MAX_METADATA_BYTES {
             return Err(RuntimeError::new(
@@ -62,27 +74,7 @@ impl BackendConnection {
             .map_err(network_error)?;
         self.stream.write_all(audio).await.map_err(network_error)?;
         self.stream.flush().await.map_err(network_error)?;
-        let response = self.read_json::<BatchResponse>().await?;
-        if response.request_id != request.request_id
-            || response.body_bytes != 0
-            || response.results.len() != request.operations.len()
-        {
-            return Err(RuntimeError::new(
-                ErrorCode::BackendFailed,
-                "worker response framing or batch identity mismatch",
-            ));
-        }
-        for (operation, result) in request.operations.iter().zip(&response.results) {
-            if operation.operation_id() != result.operation_id
-                || operation.session_id() != result.session_id
-            {
-                return Err(RuntimeError::new(
-                    ErrorCode::BackendFailed,
-                    "worker result identity mismatch",
-                ));
-            }
-        }
-        Ok(response)
+        Ok(())
     }
 
     async fn read_json<T: serde::de::DeserializeOwned>(&mut self) -> Result<T, RuntimeError> {
@@ -100,6 +92,29 @@ impl BackendConnection {
             .map_err(network_error)?;
         serde_json::from_slice(&metadata).map_err(protocol_error)
     }
+}
+
+fn validate_response(request: &BatchRequest, response: &BatchResponse) -> Result<(), RuntimeError> {
+    if response.request_id != request.request_id
+        || response.body_bytes != 0
+        || response.results.len() != request.operations.len()
+    {
+        return Err(RuntimeError::new(
+            ErrorCode::BackendFailed,
+            "worker response framing or batch identity mismatch",
+        ));
+    }
+    for (operation, result) in request.operations.iter().zip(&response.results) {
+        if operation.operation_id() != result.operation_id
+            || operation.session_id() != result.session_id
+        {
+            return Err(RuntimeError::new(
+                ErrorCode::BackendFailed,
+                "worker result identity mismatch",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn network_error(error: std::io::Error) -> RuntimeError {

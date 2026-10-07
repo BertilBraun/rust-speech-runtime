@@ -12,55 +12,61 @@ use std::time::Duration;
 use tokio::{sync::mpsc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
-pub(super) struct Job {
+/// Owned request and packed PCM body; this never borrows scheduling state.
+pub(super) struct BatchJob {
     pub request: BatchRequest,
     pub audio: Vec<u8>,
 }
-pub(super) struct Completion {
+
+/// Backend proposals and complete round-trip time, awaiting actor acceptance.
+pub(super) struct BatchCompletion {
     pub response: Result<BatchResponse, RuntimeError>,
     pub elapsed_ms: f64,
 }
 
-pub(super) async fn run_backend(
+pub(super) async fn execute_batches(
     mut connection: BackendConnection,
-    mut jobs: mpsc::Receiver<Job>,
-    results: mpsc::Sender<Completion>,
+    mut job_receiver: mpsc::Receiver<BatchJob>,
+    completion_sender: mpsc::Sender<BatchCompletion>,
     timeout: Duration,
     cancellation: CancellationToken,
 ) {
     loop {
-        let job = tokio::select! {
-            _ = cancellation.cancelled() => break,
-            job = jobs.recv() => {
-                let Some(job) = job else {
-                    break;
-                };
-                job
-            }
+        let next_job = tokio::select! {
+            _ = cancellation.cancelled() => None,
+            job = job_receiver.recv() => job,
         };
-        let started = Instant::now();
-        let response = tokio::select! {
-            _ = cancellation.cancelled() => break,
-            result = tokio::time::timeout(timeout, connection.execute(&job.request, &job.audio)) => {
-                result.unwrap_or_else(|_| {
-                    Err(RuntimeError::new(
-                        ErrorCode::BackendUnavailable,
-                        "worker execution timeout",
-                    ))
-                })
-            }
+        let Some(job) = next_job else {
+            break;
         };
-        let failed = response.is_err();
-        if results
-            .send(Completion {
-                response,
-                elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
-            })
-            .await
-            .is_err()
-            || failed
-        {
+
+        let completion = tokio::select! {
+            _ = cancellation.cancelled() => break,
+            completion = execute_batch(&mut connection, job, timeout) => completion,
+        };
+        let backend_failed = completion.response.is_err();
+        if completion_sender.send(completion).await.is_err() || backend_failed {
             break;
         }
+    }
+}
+
+async fn execute_batch(
+    connection: &mut BackendConnection,
+    job: BatchJob,
+    timeout: Duration,
+) -> BatchCompletion {
+    let started = Instant::now();
+    let response =
+        match tokio::time::timeout(timeout, connection.execute(&job.request, &job.audio)).await {
+            Ok(response) => response,
+            Err(_) => Err(RuntimeError::new(
+                ErrorCode::BackendUnavailable,
+                "worker execution timeout",
+            )),
+        };
+    BatchCompletion {
+        response,
+        elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
     }
 }

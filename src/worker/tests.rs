@@ -14,22 +14,22 @@ fn bounded_worker_mailbox_rejects_without_allocating_more_queue_slots() {
     let (sender, _receiver) = mpsc::channel(1);
     let metrics = Arc::new(Metrics::default());
     let worker = WorkerHandle {
-        id: 0,
+        worker_id: 0,
         sender,
-        load: Arc::new(AtomicUsize::new(0)),
-        available: Arc::new(AtomicBool::new(true)),
+        session_count: Arc::new(AtomicUsize::new(0)),
+        backend_available: Arc::new(AtomicBool::new(true)),
         metrics: metrics.clone(),
     };
     worker
         .send(Command::Close {
-            key: "first".into(),
+            session_key: "first".into(),
             reply: None,
         })
         .unwrap();
     assert_eq!(
         worker
             .send(Command::Close {
-                key: "second".into(),
+                session_key: "second".into(),
                 reply: None
             })
             .unwrap_err()
@@ -43,15 +43,15 @@ fn bounded_worker_mailbox_rejects_without_allocating_more_queue_slots() {
 async fn close_waits_for_bounded_mailbox_space_and_preserves_record_reply() {
     let (sender, mut receiver) = mpsc::channel(1);
     let worker = WorkerHandle {
-        id: 0,
+        worker_id: 0,
         sender,
-        load: Arc::new(AtomicUsize::new(1)),
-        available: Arc::new(AtomicBool::new(true)),
+        session_count: Arc::new(AtomicUsize::new(1)),
+        backend_available: Arc::new(AtomicBool::new(true)),
         metrics: Arc::new(Metrics::default()),
     };
     worker
         .send(Command::Close {
-            key: "occupied".into(),
+            session_key: "occupied".into(),
             reply: None,
         })
         .unwrap();
@@ -63,10 +63,10 @@ async fn close_waits_for_bounded_mailbox_space_and_preserves_record_reply() {
     close.await.unwrap().unwrap();
     match receiver.recv().await.unwrap() {
         Command::Close {
-            key,
+            session_key,
             reply: Some(reply),
         } => {
-            assert_eq!(key, "archive");
+            assert_eq!(session_key, "archive");
             reply
                 .send(Ok(SessionRecord {
                     session_id: SessionId("archive".into()),

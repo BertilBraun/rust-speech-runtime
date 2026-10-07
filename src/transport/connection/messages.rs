@@ -5,7 +5,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::{
     SessionHandle,
-    protocol::{ErrorCode, SessionEvent},
+    protocol::{ErrorCode, SessionEvent, SessionId},
     transport::{
         GatewayError,
         wire::{AudioChunk, ClientControl},
@@ -14,29 +14,46 @@ use crate::{
 
 use super::Connection;
 
+pub(super) enum ConnectionAction {
+    Continue,
+    Close,
+}
+
 impl Connection {
-    pub(super) async fn message(&mut self, message: Message) -> Result<bool, GatewayError> {
+    pub(super) async fn handle_message(
+        &mut self,
+        message: Message,
+    ) -> Result<ConnectionAction, GatewayError> {
         let result = match message {
-            Message::Close(_) => return Ok(false),
-            Message::Text(text) => match serde_json::from_str::<ClientControl>(&text) {
-                Ok(ClientControl::Close) => {
-                    self.application_close_requested = true;
-                    return Ok(false);
-                }
-                Ok(control) => self.control(control).await,
-                Err(error) => Err(error.into()),
-            },
-            Message::Binary(bytes) => self.audio(bytes).await,
-            Message::Ping(_) | Message::Pong(_) => Ok(()),
+            Message::Close(_) => return Ok(ConnectionAction::Close),
+            Message::Text(text) => self.handle_text_message(&text).await,
+            Message::Binary(bytes) => self
+                .handle_audio_chunk(bytes)
+                .await
+                .map(|()| ConnectionAction::Continue),
+            Message::Ping(_) | Message::Pong(_) => Ok(ConnectionAction::Continue),
             Message::Frame(_) => Err(GatewayError::Protocol("unexpected raw WebSocket frame")),
         };
-        if let Err(error) = result {
-            self.failure(error)?;
+        match result {
+            Ok(action) => Ok(action),
+            Err(error) => {
+                self.emit_failure(error)?;
+                Ok(ConnectionAction::Continue)
+            }
         }
-        Ok(true)
     }
 
-    async fn audio(&self, bytes: Bytes) -> Result<(), GatewayError> {
+    async fn handle_text_message(&mut self, text: &str) -> Result<ConnectionAction, GatewayError> {
+        let control = serde_json::from_str::<ClientControl>(text)?;
+        if matches!(control, ClientControl::Close) {
+            self.application_close_requested = true;
+            return Ok(ConnectionAction::Close);
+        }
+        self.handle_control(control).await?;
+        Ok(ConnectionAction::Continue)
+    }
+
+    async fn handle_audio_chunk(&self, bytes: Bytes) -> Result<(), GatewayError> {
         let chunk = AudioChunk::decode(bytes)?;
         self.require_session()?
             .audio(chunk.turn_id, chunk.chunk_index, chunk.pcm16)
@@ -44,17 +61,9 @@ impl Connection {
         Ok(())
     }
 
-    async fn control(&mut self, control: ClientControl) -> Result<(), GatewayError> {
+    async fn handle_control(&mut self, control: ClientControl) -> Result<(), GatewayError> {
         match control {
-            ClientControl::Open { session_id } => {
-                if self.session.is_some() {
-                    return Err(GatewayError::Protocol("connection already owns a session"));
-                }
-                self.session = Some(tokio::select! {
-                    _ = self.cancellation.cancelled() => return Ok(()),
-                    session = self.ingress.open_session(session_id) => session?,
-                });
-            }
+            ClientControl::Open { session_id } => self.open_session(session_id).await?,
             ClientControl::StartTurn { turn_id } => {
                 self.require_session()?.begin_turn(turn_id).await?
             }
@@ -82,13 +91,25 @@ impl Connection {
         Ok(())
     }
 
+    async fn open_session(&mut self, session_id: SessionId) -> Result<(), GatewayError> {
+        if self.session.is_some() {
+            return Err(GatewayError::Protocol("connection already owns a session"));
+        }
+        let session = tokio::select! {
+            _ = self.cancellation.cancelled() => return Ok(()),
+            session = self.ingress.open_session(session_id) => session?,
+        };
+        self.session = Some(session);
+        Ok(())
+    }
+
     fn require_session(&self) -> Result<&SessionHandle, GatewayError> {
         self.session
             .as_ref()
             .ok_or(GatewayError::Protocol("open a session first"))
     }
 
-    fn failure(&self, error: GatewayError) -> Result<(), GatewayError> {
+    fn emit_failure(&self, error: GatewayError) -> Result<(), GatewayError> {
         let code = match &error {
             GatewayError::Runtime(error) => error.code(),
             _ => ErrorCode::InvalidInput,

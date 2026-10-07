@@ -1,7 +1,7 @@
 //! Canonical scheduling limits, validated before any worker is started.
 
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 use thiserror::Error;
 
 /// Endpoint of one persistent, warmed model process with an exclusive device cache.
@@ -71,6 +71,11 @@ impl Default for RuntimeConfig {
 pub struct ConfigError(pub String);
 
 impl RuntimeConfig {
+    /// Maximum desired interval between accepted tokens, after validated startup.
+    pub(crate) fn token_interval(&self) -> Duration {
+        Duration::from_secs_f64(1.0 / self.target_tokens_per_second)
+    }
+
     /// Checks limits, timer ranges and unique endpoints before allocating node resources.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_positive_limits()?;

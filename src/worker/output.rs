@@ -13,20 +13,25 @@ use tokio::time::Instant;
 impl WorkerActor {
     pub(super) fn accept_token(
         &mut self,
-        key: &str,
+        session_key: &str,
         token_id: u32,
         text: String,
         eos: bool,
         context_tokens: usize,
     ) -> Result<(), RuntimeError> {
-        let interval = SessionState::token_interval(self.config.target_tokens_per_second);
-        let limit = self
-            .config
-            .max_context_tokens
-            .min(self.ready.max_context_tokens);
-        let session = self.sessions.get_mut(key).expect("completion session");
+        let token_interval = self.configuration.token_interval();
+        let context_limit = self.context_token_limit();
+        let session = self
+            .sessions
+            .get_mut(session_key)
+            .expect("completion session");
         session.context_tokens = context_tokens;
-        if !enforce_token_limits(session, limit, self.config.max_history_bytes, text.len()) {
+        if !enforce_token_limits(
+            session,
+            context_limit,
+            self.configuration.max_history_bytes,
+            text.len(),
+        ) {
             return Ok(());
         }
 
@@ -38,14 +43,14 @@ impl WorkerActor {
 
         session.stage = Stage::Generating {
             last_token_at: now,
-            deadline: now + interval,
+            deadline: now + token_interval,
         };
         if eos {
-            session.finish(FinishReason::Eos);
-        } else if session.turn().expect("inference turn").tokens.len()
-            >= self.config.max_output_tokens
+            session.finish_turn(FinishReason::Eos);
+        } else if session.current_turn().expect("inference turn").tokens.len()
+            >= self.configuration.max_output_tokens
         {
-            session.finish(FinishReason::TokenLimit);
+            session.finish_turn(FinishReason::TokenLimit);
         }
         Ok(())
     }
@@ -58,13 +63,13 @@ fn enforce_token_limits(
     text_bytes: usize,
 ) -> bool {
     if session.context_tokens >= context_limit {
-        session.finish(FinishReason::ContextLimit);
+        session.finish_turn(FinishReason::ContextLimit);
         return false;
     }
     if session.history_bytes.saturating_add(text_bytes + 64) > history_limit {
-        session.finish(FinishReason::ContextLimit);
+        session.finish_turn(FinishReason::ContextLimit);
         let _ = session.events.try_send(SessionEvent::Failed {
-            turn_id: session.turn().map(|turn| turn.turn_id),
+            turn_id: session.current_turn().map(|turn| turn.turn_id),
             code: ErrorCode::HistoryLimit,
             message: "session record limit exceeded".into(),
         });
@@ -113,8 +118,8 @@ fn publish_token(
     metrics: &Metrics,
 ) -> bool {
     let committed_at = session.committed_at.expect("committed inference turn");
-    let generation = session.generation();
-    let turn = session.turn_mut().expect("inference turn");
+    let generation = session.generation;
+    let turn = session.current_turn_mut().expect("inference turn");
     let index = turn.tokens.len() as u64;
     let turn_id = turn.turn_id;
     let token = TokenRecord {
@@ -133,13 +138,13 @@ fn publish_token(
     // Only successfully queued proposals become recorded output and future cache acknowledgements.
     if session.events.try_send(event).is_err() {
         metrics.saturation.fetch_add(1, Ordering::Relaxed);
-        session.finish(FinishReason::SlowConsumer);
+        session.finish_turn(FinishReason::SlowConsumer);
         session.cancellation.cancel();
         return false;
     }
     session.history_bytes += token.text.len() + 64;
     session
-        .turn_mut()
+        .current_turn_mut()
         .expect("inference turn")
         .tokens
         .push(token);

@@ -4,7 +4,6 @@ use crate::{
     },
     runtime::RuntimeError,
 };
-use std::time::Duration;
 use tokio::{sync::mpsc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -35,6 +34,7 @@ pub(crate) struct PreparationRequest {
     pub snapshot: CaptureSnapshot,
     pub queued_at: Instant,
 }
+
 pub(crate) enum Preparation {
     None,
     Queued(PreparationRequest),
@@ -45,6 +45,21 @@ pub(crate) enum Preparation {
 }
 
 impl Preparation {
+    /// Queue changed audio after any in-flight provisional cache has been discarded.
+    pub fn queue(&mut self, request: PreparationRequest) {
+        *self = match self {
+            Self::None | Self::Queued(_) => Self::Queued(request),
+            Self::Discarding { .. } => Self::Discarding {
+                next: Some(request),
+            },
+            Self::Running(_) | Self::Ready(_) | Self::DiscardPending { .. } => {
+                Self::DiscardPending {
+                    next: Some(request),
+                }
+            }
+        };
+    }
+
     pub fn invalidate(&mut self) {
         *self = match self {
             Self::None | Self::Queued(_) => Self::None,
@@ -66,6 +81,7 @@ impl Preparation {
         }
     }
 }
+
 pub(crate) struct SessionState {
     pub record: SessionRecord,
     pub events: mpsc::Sender<SessionEvent>,
@@ -120,33 +136,37 @@ impl SessionState {
         }
     }
 
-    pub fn active(&self) -> bool {
+    pub fn has_active_turn(&self) -> bool {
         !self.closing && !matches!(self.stage, Stage::Idle)
     }
 
-    pub fn generation(&self) -> u64 {
-        self.generation
+    /// A disconnected record remains owned until its last operation and cache release finish.
+    pub fn can_remove_after_disconnect(&self) -> bool {
+        self.closing
+            && !self.in_flight
+            && (!self.opened || self.backend_closed)
+            && self.events.is_closed()
     }
 
-    pub fn turn(&self) -> Option<&TurnRecord> {
+    pub fn current_turn(&self) -> Option<&TurnRecord> {
         self.record.turns.last()
     }
 
-    pub fn turn_mut(&mut self) -> Option<&mut TurnRecord> {
+    pub fn current_turn_mut(&mut self) -> Option<&mut TurnRecord> {
         self.record.turns.last_mut()
     }
 
     pub fn interrupt(&mut self, next_generation: u64) {
         self.preparation.invalidate();
-        if self.active() {
-            self.finish(FinishReason::Cancelled);
+        if self.has_active_turn() {
+            self.finish_turn(FinishReason::Cancelled);
         }
         self.generation = next_generation;
     }
 
-    pub fn finish(&mut self, reason: FinishReason) {
-        let generation = self.generation();
-        if let Some(turn) = self.turn_mut() {
+    pub fn finish_turn(&mut self, reason: FinishReason) {
+        let generation = self.generation;
+        if let Some(turn) = self.current_turn_mut() {
             turn.finish_reason = Some(reason);
             let event = SessionEvent::Finished {
                 turn_id: turn.turn_id,
@@ -155,15 +175,12 @@ impl SessionState {
                 generated_tokens: turn.tokens.len(),
             };
             if self.events.try_send(event).is_err() {
-                self.turn_mut().expect("finished turn").finish_reason =
-                    Some(FinishReason::SlowConsumer);
+                self.current_turn_mut()
+                    .expect("finished turn")
+                    .finish_reason = Some(FinishReason::SlowConsumer);
                 self.cancellation.cancel();
             }
         }
         self.stage = Stage::Idle;
-    }
-
-    pub fn token_interval(target: f64) -> Duration {
-        Duration::from_secs_f64(1.0 / target)
     }
 }

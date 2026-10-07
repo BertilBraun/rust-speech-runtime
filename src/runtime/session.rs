@@ -17,7 +17,8 @@ use super::RuntimeError;
 /// inference. Consume events throughout the session: bounded output stops slow consumers.
 /// Close explicitly to retrieve the archive record; dropping the handle only cancels.
 pub struct SessionHandle {
-    pub(crate) key: String,
+    // Incarnation keys prevent late releases from removing a reopened caller-chosen session ID.
+    pub(crate) session_key: String,
     pub(crate) worker_id: usize,
     pub(crate) worker: WorkerHandle,
     pub(crate) events: mpsc::Receiver<SessionEvent>,
@@ -38,7 +39,7 @@ impl SessionHandle {
     /// already accepted text. Rejection leaves that response intact.
     pub async fn begin_turn(&self, turn_id: TurnId) -> Result<(), RuntimeError> {
         self.request(|reply| Command::Begin {
-            key: self.key.clone(),
+            session_key: self.session_key.clone(),
             turn_id,
             reply,
         })
@@ -57,7 +58,7 @@ impl SessionHandle {
         audio: Bytes,
     ) -> Result<(), RuntimeError> {
         self.request(|reply| Command::Audio {
-            key: self.key.clone(),
+            session_key: self.session_key.clone(),
             turn_id,
             chunk_index,
             audio,
@@ -78,7 +79,7 @@ impl SessionHandle {
         sample_count: usize,
     ) -> Result<(), RuntimeError> {
         self.request(|reply| Command::Prepare {
-            key: self.key.clone(),
+            session_key: self.session_key.clone(),
             turn_id,
             chunk_count,
             sample_count,
@@ -99,7 +100,7 @@ impl SessionHandle {
         sample_count: usize,
     ) -> Result<(), RuntimeError> {
         self.request(|reply| Command::Commit {
-            key: self.key.clone(),
+            session_key: self.session_key.clone(),
             turn_id,
             final_chunk_count,
             sample_count,
@@ -114,7 +115,7 @@ impl SessionHandle {
     /// does not rewind committed model state or erase events already accepted for delivery.
     pub async fn cancel(&self, turn_id: TurnId) -> Result<(), RuntimeError> {
         self.request(|reply| Command::Cancel {
-            key: self.key.clone(),
+            session_key: self.session_key.clone(),
             turn_id,
             reply,
         })
@@ -144,7 +145,7 @@ impl SessionHandle {
     /// drop a record. After success, drain remaining events if they must reach the client.
     pub async fn close(&mut self) -> Result<SessionRecord, RuntimeError> {
         let (reply, response) = oneshot::channel();
-        self.worker.close(self.key.clone(), reply).await?;
+        self.worker.close(self.session_key.clone(), reply).await?;
         let record = response
             .await
             .map_err(|_| RuntimeError::new(ErrorCode::Shutdown, "worker stopped"))??;
@@ -152,7 +153,7 @@ impl SessionHandle {
         self.cancellation.cancel();
         let _ = self.manager.try_send(ManagerCommand::Release {
             session_id: self.session_id.clone(),
-            key: self.key.clone(),
+            session_key: self.session_key.clone(),
         });
         Ok(record)
     }

@@ -6,6 +6,7 @@ mod messages;
 
 use cleanup::serve_and_close;
 use handshake::accept;
+use messages::ConnectionAction;
 
 use std::sync::Arc;
 
@@ -94,7 +95,7 @@ impl Connection {
                         return Ok(());
                     };
                     last_activity = Instant::now();
-                    if !self.message(message?).await? {
+                    if matches!(self.handle_message(message?).await?, ConnectionAction::Close) {
                         return Ok(());
                     }
                 }
