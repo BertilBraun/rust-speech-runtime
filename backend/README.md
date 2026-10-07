@@ -24,7 +24,7 @@ The [shared RTX 3090 deployment](../docs/DEPLOYMENT_3090.md) additionally valida
 
 ## Linux GPU deployment
 
-Use a CUDA-capable Linux node with sufficient driver support for the locked PyTorch wheel. The worker uses the node's existing driver; it does not install or change it. Initial deployment can use two 3090s, with one worker configuration and process per device.
+Use a CUDA-capable Linux node with sufficient driver support for the locked PyTorch wheel. The worker uses the node's existing driver; it does not install or change it. Use one worker configuration and process per selected device. The [current hardware report](../docs/GPU_IMMEDIATE_COMMIT_3090.md) measures one RTX 3090; physical multi-GPU execution remains unbenchmarked.
 
 1. Copy the repository and the trained `projector.safetensors` to the node. Copy `config.example.json` to a deployment configuration and update the checkpoint path and **actual SHA256**. The example identifies the handoff's 6 October checkpoint; a newly trained checkpoint needs a new manifest hash.
 2. In `backend/`, create the environment using `uv sync --locked`. Check actual driver/runtime visibility before loading models:
@@ -74,7 +74,7 @@ Session admission reserves the estimated maximum configured context's attention 
 
 `allocator_memory_fraction` defaults to 1.0 and caps this process's PyTorch CUDA allocator. Admission and workspace checks also respect the remaining quota after allocator-reserved memory, even if other device memory is free. This does not cap allocations made directly by external CUDA libraries or partition the GPU against another process. The shared-node smoke deployment uses 0.25, one session and a resource guard; its guard tool targets the inspected Linux cgroup-v1 host and stops only its owned child.
 
-## Measurement and tomorrow's assumptions
+## Measurement and remaining assumptions
 
 Forward timings use CUDA events on the device stream, including cache join/split. Returning scalar proposed token IDs already synchronizes the completed batch, so timing does not add another per-token device synchronization. These are completed device-stream elapsed times, including host launch gaps, rather than SM busy time. `encode_ms` starts after CPU Whisper feature extraction and includes host-to-device transfer, encoder and projector execution. CPU PCM conversion and mel preprocessing are included in the RPC's total `elapsed_ms`; the wire protocol does not expose a separate CPU preprocessing phase. Responses report actual CUDA allocated and allocator-reserved bytes.
 
@@ -82,7 +82,7 @@ The implementation currently copies hybrid tensors when joining and splitting dy
 
 Transformers supports a pure PyTorch fallback for Qwen's linear attention when optional fast kernels are absent. The lockfile intentionally uses that supported path initially; kernel optimization, CUDA graphs, paged caches and packed variable-length prefills require separate parity and speed validation. Bounded representative warmup does not eliminate every later batch/context shape's first-use overhead.
 
-The retained interleaved speech/text history is the agreed serving target and a training-owned model-quality assumption. The runtime supports it with persistent hybrid state. Tomorrow's measurements must establish real audio TTFT, token-gap p50/p95/p99, per-session rolling token rate, encoding/prefill/decode cost by batch/context, queue delay and peak VRAM, then tune scheduler headroom and capacity to the four-token-per-second objective. The old audio-echo benchmark is unrelated to this model's capacity.
+The retained interleaved speech/text history is the agreed serving target and a training-owned model-quality assumption. The runtime supports it with persistent hybrid state. The [immediate-commit benchmark](../docs/GPU_IMMEDIATE_COMMIT_3090.md) records real audio TTFT, token gaps, rolling generation rates, stage costs and sampled RAM/VRAM. Longer varied conversations, external networks, physical multi-GPU execution and capacity tuning remain separate validation work. The old audio-echo benchmark is unrelated to this model's capacity.
 
 The strict version-one metadata and PCM wire contract is documented in the repository's `docs/WORKER_PROTOCOL.md`; `protocol.py` mirrors the Rust types. Only one gateway connection owns a worker at a time. Frames, bodies, active caches and transport wait durations have bounds; model forwards run on one dedicated thread so Python's network event loop remains responsive.
 

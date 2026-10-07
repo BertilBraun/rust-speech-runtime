@@ -1,110 +1,172 @@
-# Turn-based Rust speech inference scheduler
+# Turn-based speech inference in Rust
 
-A Tokio gateway schedules persistent audio conversations across a configurable list of GPU workers. Ordinary WebSocket clients send user audio, commit the turn and receive streamed text tokens. Rust owns admission, sticky placement, turn state, dynamic batching, interruption and output acceptance. A persistent Python process per GPU owns the PyTorch model and complete hybrid conversation cache. There is no authentication, database, frontend or text-to-speech stage.
+A Rust/Tokio gateway serves persistent speech conversations through ordinary WebSocket connections. Clients send audio, mark the end of a user turn, and receive streamed text. Sessions stay on one GPU worker, retaining their model cache across turns. Rust schedules the work; a persistent PyTorch process per GPU performs real inference.
 
-The model is Whisper Small, a speech projection layer and Qwen3.5-2B. The serving target is **10 Hz audio embeddings**, with **100 ms audio packets** from clients. Bidirectional Whisper encodes a complete candidate at optional `prepare`, or the final utterance at `commit`. Preparation holds its first token and isolated cache privately during endpoint detection; matching commit activates them. Prior audio embeddings and accepted assistant tokens stay in the worker's cache across turns. The endpoint list controls GPU count.
+The model comes from **[speech-llm-projection](https://github.com/BertilBraun/speech-llm-projection)**: a trained projection layer connects frozen Whisper Small to frozen Qwen3.5-2B. Whisper features are pooled into **10 speech embeddings per second**. This repository implements the serving architecture around that model; the linked research project documents training, evaluation and model-quality limitations.
 
-Start with the **[visual architecture guide](docs/ARCHITECTURE.md)** for seven Mermaid diagrams covering the system, one turn, computation, cache/storage ownership, batching, interruption and shutdown. Each diagram links to the code that implements it.
+This is a working runtime showcase with real-model RTX 3090 measurements. It streams **text**, with no text-to-speech, built-in VAD, authentication, database or frontend.
+
+## What was built
+
+- A versioned WebSocket gateway accepting session IDs and ordered PCM16 packets, normally every **100 ms**.
+- Actor-owned session and scheduling state, bounded channels, explicit backpressure and rejection before accepting an overloaded turn.
+- Sticky GPU placement and dynamic prefill/decode batches, using measured forward costs rather than assuming linear batch scaling.
+- Persistent multi-turn hybrid caches: attention KV, convolution state and recurrent state.
+- Safe interruption: preserve accepted text, stop scheduling the old generation, and discard late proposals by generation ID.
+- Bounded RAM conversation records and asynchronous file archives containing original audio, accepted token IDs/text and timing.
+- Network workload clients reporting latency percentiles, rolling per-session token rates, admission, batch fill and resource observations.
+
+## Measured on real hardware
+
+The [final immediate-commit benchmark](docs/GPU_IMMEDIATE_COMMIT_3090.md) uses one RTX 3090, BF16 serving weights and a real 5.94-second speech recording. Clients send 100 ms audio packets over loopback WebSocket and commit immediately after the final packet. **No speculative preparation or added endpointing delay is used.** The configured resident-session and active-turn limits are raised to 128 for the offered-concurrency sweep.
+
+| Offered conversations | Completed / refused turns, run 1; run 2 | First-token p95, run 1; run 2 |
+| --- | --- | --- |
+| 8 | 16 / 0; 16 / 0 | 106 ms; 109 ms |
+| 16 | 32 / 0; 30 / 1 | 173 ms; 257 ms |
+| 32 | 64 / 0; 30 / 17 | 673 ms; 239 ms |
+| 96 | 30 / 81; 16 / 88 | 372 ms; 197 ms |
+
+The first 32-conversation run reached **215 aggregate model tokens/s** including capture and think time. Every evaluated generation met the rolling four-token/second objective, but individual token gaps reached **896 ms**. All 96 offered conversations could open; many could not start a turn. Latencies describe accepted responses only. Later runs admitted less work because the conservative cost model retained slower observations; this is not an independently established concurrency ceiling.
+
+The report includes all latency percentiles, admission counts, token-rate violations, resource usage and reproducible commands. Latencies exclude client VAD decision time and an external network; the benchmark client knows where its recording ends. Model quality is evaluated in the training project, separately from serving behavior. Short trials on repeated audio do not establish sustainable capacity.
+
+The older [endpoint-preparation experiment](docs/GPU_ENDPOINTING_3090.md) obtained **35.9–42.3 ms post-commit p95** at eight offered sessions by doing inference during an artificial 200 ms confirmation interval. Its **237–242 ms last-audio-to-first-token p95** is the relevant full interval. Those numbers are not the ordinary path's response latency. Historical experiments remain available with their limitations and raw-evidence identities.
+
+## How the system fits together
 
 ```mermaid
-flowchart LR
-    client["WebSocket client"] <-->|"Audio and text"| gateway["Rust gateway"]
-    gateway <-->|"Bounded messages"| scheduler["Assigned worker actor<br/>Scheduling and RAM record"]
-    scheduler <-->|"Persistent TCP"| model["Python / GPU worker<br/>Model and conversation cache"]
-    gateway -->|"Final record on close"| archive[("Session archive files")]
+flowchart TB
+    client["Application / benchmark client<br/>PCM audio in, streamed text out"]
+    subgraph rust["Rust process - CPU / Tokio"]
+        gateway["WebSocket gateway"]
+        manager["Session manager<br/>Admission and sticky placement"]
+        actors["One scheduling actor per GPU<br/>Bounded session records in RAM"]
+        execution["One backend execution task per GPU"]
+        archive["Bounded archive queue<br/>Blocking file writer"]
+    end
+    subgraph workers["One persistent Python process per configured GPU"]
+        model["PyTorch model execution<br/>Whisper → projector → Qwen"]
+        cache[("GPU memory<br/>Resident weights + per-session hybrid caches")]
+    end
+    files[("Disk<br/>Conversation JSON archives")]
+    client <-->|"WebSocket"| gateway
+    gateway -->|"Open session"| manager
+    manager -.->|"Assign once"| actors
+    gateway <-->|"Bounded commands / events"| actors
+    actors <-->|"Bounded jobs / completions"| execution
+    execution <-->|"Framed TCP: metadata, PCM, token proposals"| model
+    model <-->|"Read / update"| cache
+    gateway -->|"Final RAM record on close"| archive --> files
 ```
 
-The agreed design is in [PLAN.md](PLAN.md), implementation decisions in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md), measured local results in [docs/LOCAL_VALIDATION.md](docs/LOCAL_VALIDATION.md), and GPU checks in [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md). The [model integration status](docs/MODEL_INTEGRATION.md) records the checked training architecture and remaining checkpoint/hardware work. [PERFORMANCE.md](PERFORMANCE.md) preserves measurements of the superseded periodic audio-echo workload; those results do not establish this model's capacity. The old TCP echo transport and simulator have been replaced.
+GPU count is configuration, not a constant. Each backend owns its device, model and caches; the Rust actor owns scheduling and output acceptance. There is one forward request in flight per worker. Separate workers can run independently. Physical multi-GPU execution has not yet been benchmarked.
 
-The [RTX 3090 benchmark report](docs/GPU_BENCHMARK_3090.md) records the completed step-9,550 checkpoint, 65 passing on-node Python tests and real-speech workloads through 80 offered sessions. The two 32-session runs measured 148–164 aggregate model tokens/s with active-turn rejections. Churn, interruption, bounded archive backpressure and exact audio/token archival passed. The report includes percentile tables, configuration, a data-flow diagram and current startup commands. Model quality and sustained capacity remain unmeasured. The earlier [shared-node smoke deployment](docs/DEPLOYMENT_3090.md) is retained as historical evidence.
+The **[visual architecture guide](docs/ARCHITECTURE.md)** expands this into seven diagrams with code links: data flow, computation, cache/storage ownership, batching, interruption and shutdown.
 
-The newer [endpointing benchmark](docs/GPU_ENDPOINTING_3090.md) measures preparation before commit, with [cache lifecycle diagrams](docs/ENDPOINTING_PREPARATION.md), identical endpointing delays for both paths, native-cache parity tests and explicit cold-start limitations.
+## What happens during a conversation
 
-## Run the pipeline
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant R as Rust worker actor
+    participant P as Python / GPU worker
+    C->>R: Open session, reserve worker-local cache
+    R->>P: Allocate conversation state
+    C->>R: Start turn, reserve compute capacity
+    loop User speaks: one packet about every 100 ms
+        C->>R: PCM16 audio
+        R->>R: Append to bounded RAM record
+    end
+    C->>R: Commit final audio counts
+    R->>P: Complete-utterance encode + prefill
+    P->>P: Whisper → projector → Qwen, using prior history cache
+    P-->>R: First token proposal
+    R-->>C: Accept and stream text
+    loop Until EOS, interruption or token limit
+        R->>P: Decode batch, acknowledging accepted token
+        P-->>R: Next token proposal
+        R-->>C: Accept and stream text
+    end
+    Note over R,P: Keep session record and model cache for the next turn
+    C->>R: Close session
+    R->>P: Free conversation cache
+    R->>R: Transfer final record for file archival
+```
 
-Start actual model workers using [backend/README.md](backend/README.md). For local orchestration measurements, the separate test fixture implements the same worker protocol without loading a model:
+**Current audio cannot be incrementally prefetched into a final cache.** Whisper is bidirectional: extending the utterance changes earlier audio representations. Packet arrival therefore buffers audio; the ordinary path encodes and prefills the complete utterance after commit. Prior turns remain cached, so they are not replayed on every response.
+
+An optional `prepare` control computes a complete candidate on a private cache branch and holds its first token until commit. More speech invalidates it. Repeating that on every packet would repeatedly encode and prefill the growing utterance; it is not streaming inference. The final benchmark leaves preparation disabled. A genuinely incremental audio path needs a compatible streaming encoder/model. See [the preparation lifecycle](docs/ENDPOINTING_PREPARATION.md).
+
+## Scheduling and the four-token target
+
+The objective is **at least four accepted model tokens per second per generating session after its first token**. Fast responses run as fast as the scheduler allows. First-token latency is measured separately and currently has no enforced SLA.
+
+Decode selection prioritizes the earliest next-token targets. Prefill uses available slack, with a bounded-wait policy so admitted user turns can make progress. Recent measured batch/context costs drive admission with headroom; a nonpreemptive forward can still cause individual gaps above 250 ms. Reports distinguish those gaps from the rolling two-second token-rate objective.
+
+Three different limits matter: open conversations reserve cache and record space; active turns reserve compute capacity; transport limits bound connections and queues. An idle resident session is not a generator. An open session can still have a new turn refused. Offered concurrency, admitted work and hardware capacity are reported separately.
+
+## Try the pipeline locally
+
+The test fixture exercises the real IPC and WebSocket boundaries without a GPU. It returns deterministic text and charges the full configured duration for each nonempty batch; it supplies no model-quality or GPU-speed evidence.
 
 ```powershell
-# Terminal 1, from backend/.
+# Terminal 1, from backend/
+uv sync --locked
 uv run python tests/fixture_worker.py --port 9100 --response-tokens 12 --prefill-ms 20 --decode-ms 12
 
-# Terminal 2, from the repository root.
+# Terminal 2, from the repository root
 cargo run --release -- serve --runtime-config examples/runtime.json
 
-# Terminal 3: ordinary clients, random starts and 100 ms packets.
-cargo run --release -- benchmark --sessions 1 --turns 3
-cargo run --release -- benchmark --sessions 16 --turns 3 --report benchmark-results/turns.json
-cargo run --release -- benchmark --sessions 16 --turns 4 --interrupt-after-tokens 3 --churn-rounds 3 --report benchmark-results/interruption.json
-cargo run --release -- suite --session-budget 16 --sessions 8 --turns 2 --report benchmark-results/suite.json
-cargo run --example session
+# Terminal 3, from the repository root
+cargo run --release -- benchmark --sessions 1 --turns 2
+cargo run --release -- benchmark --sessions 8 --turns 2 --report benchmark-results/local.json
 ```
 
-The fixture charges its full configured duration for every nonempty batch. Its response has 12 ordinary tokens followed by an accepted EOS token. This exercises transport, cache and scheduling; it does not measure GPU performance. `benchmark` connects to an independently running gateway and never bypasses the network. `suite` offers low/50%/80%/95%/120% of the explicit session budget, then aligned starts at 100 ms cadence, jitter with 100–110 ms capture intervals, churn and interruption. The budget is an offered-load reference rather than measured hardware capacity.
+For real inference, follow **[backend/README.md](backend/README.md)**: supply a projector checkpoint and its SHA256, configure one worker per GPU, wait for model warmup/readiness, and point [examples/runtime.json](examples/runtime.json) at those endpoints. Model weights use BF16; native recurrent state and accumulation retain FP32 where required by the model. The runtime benchmark used checkpoint step 9,550; the training project's selected quality checkpoint is step 6,775. Checkpoint identity is explicit in every deployment and archive.
 
-Run the one-session warmup first so reactive estimates have observations. The example starts with a conservative 100 ms unknown-forward estimate; it can reject turns until it learns the active batch/context shapes. Warmup does not establish every future shape's cost or guarantee that all offered sessions will be accepted. Inspect reported rejections and measured hardware results before raising capacity.
+Clients connect to `/v1`, send `open` and `start_turn`, send ordered binary audio, then `commit`. The gateway streams `text_delta` and `finished` events. Starting a new admitted turn interrupts generation. **[The client guide](docs/CLIENT_GUIDE.md)** documents wire fields, example commands, configuration, latency definitions and archival behavior. [examples/session.rs](examples/session.rs) shows the Rust client API; [WORKER_PROTOCOL.md](docs/WORKER_PROTOCOL.md) specifies the private Rust/Python boundary.
 
-Use `--audio-file path/to/audio.pcm` for real speech. It must contain raw little-endian signed PCM16, mono, 16 kHz, up to 30 seconds. The benchmark sends silence when omitted. Use `--url ws://host:8080/v1` for another machine. Default packets contain 100 ms of audio: 1,600 samples / 3,200 PCM bytes. A final shorter packet retains the utterance tail. `--minimum-packet-ms` and `--maximum-packet-ms` remain configurable for timing experiments; packet length follows the sampled capture interval. The gateway validates order and sample counts rather than imposing a wall-clock arrival rate. Model embedding frequency is determined by the projector, independently of transport packet boundaries.
+## Find your way through the code
 
-`examples/runtime.json` is the canonical runtime configuration. Add or remove worker endpoints to change GPU count. Each endpoint refers to a ready, warmed worker exclusively owned by this gateway. Runtime JSON is strict: important fields are explicit and unknown fields fail. Tune session/cache limits, active-turn reservations, batch limits and reactive timing headroom on actual hardware. CLI `--listen`, `--max-connections`, `--archive-directory` and `--no-archive` concern only the gateway.
+| Responsibility | Location |
+| --- | --- |
+| Public node, ingress and session APIs | [src/runtime/](src/runtime/) |
+| Admission, placement and conversation records | [src/session/](src/session/) |
+| Owned scheduling state, batching, cancellation and token acceptance | [src/worker/](src/worker/) |
+| Selection policy and measured cost estimates | [src/scheduler/](src/scheduler/) |
+| Canonical public events and typed backend protocol | [src/protocol/](src/protocol/) |
+| WebSocket connections, bounded writers and archives | [src/transport/](src/transport/) |
+| Workload clients and measurements | [src/simulation/](src/simulation/), [src/metrics/](src/metrics/) |
+| PyTorch model, hybrid caches and worker server | [backend/src/voice_worker/](backend/src/voice_worker/) |
 
-## Public WebSocket protocol, version 1
-
-Connect to `/v1`; other paths receive an HTTP rejection. One connection owns one session. Controls and events are strict JSON tagged by `type`; unknown fields are rejected. Session IDs contain 1–128 bytes; turn IDs are unique within a session. This protocol version fixes audio to signed PCM16, mono, 16 kHz.
-
-```json
-{"type":"open","session_id":"conversation-123"}
-{"type":"start_turn","turn_id":1}
-{"type":"prepare","turn_id":1,"chunk_count":10,"sample_count":16000}
-{"type":"commit","turn_id":1,"chunk_count":10,"sample_count":16000}
-{"type":"cancel","turn_id":1}
-{"type":"close"}
-```
-
-After `start_turn` and before `commit`, send binary messages: eight bytes of little-endian `turn_id`, four bytes of little-endian zero-based `chunk_index`, then nonempty PCM16 samples. Indices must be contiguous; commit chunk/sample counts must match exactly. Duplicate commits with identical counts are idempotent. Post-commit audio needs a new turn. `start_turn` interrupts active generation and obtains the new capture reservation; rejected turns never accept audio.
-
-`prepare` is optional: send it when a pause suggests speech has ended, with counts matching the received audio so far. It starts provisional whole-utterance inference while endpoint detection continues. `prepared {turn_id,chunk_count,sample_count}` announces readiness without exposing any generated text. More audio invalidates the candidate; the client can prepare again or commit directly. Only `commit` confirms the turn and allows output. A commit arriving during preparation waits for that candidate. Preparation does not require an acknowledgement before committing.
-
-Events are `opened {session_id,worker_id}`, `accepted {turn_id}`, `prepared {turn_id,chunk_count,sample_count}`, `text_delta {turn_id,generation,sequence,token_id,text}`, `finished {turn_id,generation,reason,generated_tokens}`, `failed {turn_id,code,message}` and `closed {session_id}`. EOS is an accepted model token and may have an empty text delta. A delta is not necessarily a word or character. Counts include EOS and empty deltas. Stable enum failure codes identify rejected work.
-
-The worker actor defines acceptance order. Interruption prevents further proposals from being accepted or consumed into cache. Already accepted events retain FIFO stream order before the next turn's acceptance, even when network delivery lags. Archives record accepted output rather than a delivery acknowledgement; a broken connection can retain committed tokens the client never received.
-
-Connection count, frame/message sizes, outbound queues and handshake/write/idle waits are bounded. The default incoming message limit is 16 KiB. A slow writer closes only its own connection. Audio/history limits belong to the runtime. Explicit close drains accepted events before `closed`; disconnect and shutdown also release backend state. Output activity keeps an active generator alive without requiring incoming audio.
-
-## Measurements and admission
-
-The objective is at least four accepted model tokens per second per generating session after its first token. The 250 ms next-token target is separate from end-of-turn-to-first-token latency. Reactive admission uses observed forward durations, batch shapes and context, reserves headroom and rejects turns when the budget is exhausted. It never assumes half-full batches take half the time.
-
-Client reports include TTFT and token-gap p50/p95/p99/max, aggregate throughput, per-session rates, rejections, failures and interruptions. Rolling throughput defaults to a two-second window sampled every 100 ms, including stalls without new output. Gaps above target are reported separately. Short responses have no rolling sample if they never span the window; token gaps and complete-turn rates remain visible. The response timeout bounds a whole generation. Aggregate wall throughput includes capture/thinking time; per-turn token rates exclude those phases. Churn closes conversations between rounds and creates fresh sessions.
-
-To compare endpoint preparation fairly, use the same endpoint confirmation delay for both runs:
+The [Rust style guide](docs/RUST_STYLE.md) covers small functions/modules, shallow async control flow, boundary documentation and ownership. [rustfmt.toml](rustfmt.toml) defines formatting. API documentation is available with `cargo doc --no-deps --open`.
 
 ```powershell
-cargo run --release -- benchmark --sessions 8 --endpointing-ms 300 --report benchmark-results/endpoint-baseline.json
-cargo run --release -- benchmark --sessions 8 --endpointing-ms 300 --prepare-before-commit --report benchmark-results/endpoint-prepared.json
-```
-
-TTFT begins when the client sends the definitive commit, after the confirmation delay. Reports also measure the actual confirmation interval and last-audio-to-first-token latency, so moving work into endpoint detection does not conceal the full user-visible wait. The example client prepares during a fixed 300 ms delay; it does not implement voice activity or end-of-turn detection.
-
-On Ctrl+C, the gateway closes sessions, drains archive work and prints admissions/rejections, stale proposals, saturation, queue/forward/stage distributions, batch fill, worker utilization and backend memory observations. Speech quality, GPU cache parity, VRAM limits and sustainable concurrency require the trained checkpoint and hardware validation.
-
-## Session records
-
-Closed conversations are archived under `session-archives/` by default. Records contain timestamps, session/worker IDs, backend model/manifest identity, original PCM16, turn commit/finish state, exact accepted token IDs/text and token timing. Audio is currently represented as JSON integer arrays: inspectable but less compact than binary sidecars. History is bounded and never silently truncated.
-
-Archival has a bounded queue and one blocking file writer outside Tokio async workers. Files are flushed, synced and atomically renamed from a temporary file. A full archive queue delays connection teardown while preserving the record; inference workers continue independently. Each waiting connection retains its connection permit, bounding pending records by the connection limit plus archive queue capacity and one writer. Backpressure is counted; a stopped writer or disk error is logged and counted. Configure disk throughput for expected churn.
-
-## Code and validation
-
-The [Rust style guide](docs/RUST_STYLE.md) defines formatting, function/module boundaries, async control flow and interface documentation. [rustfmt.toml](rustfmt.toml) supplies the stable formatter configuration. Generate browsable API documentation with `cargo doc --no-deps --open`.
-
-`runtime/` exposes `Node`, `Ingress` and session handles. `session/` owns placement/lifecycle and records; `worker/` owns scheduling/execution; `scheduler/` owns fairness/cost estimates. `protocol/` defines canonical public models and the typed backend boundary. `transport/` separates connection control, bounded writing, client/codec and archives. `simulation/` contains ordinary network workloads and client measurements. Model-specific code lives under `backend/src/voice_worker/`.
-
-```powershell
-cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-# After installing the backend uv environment:
-cargo test --locked --test transport python_worker_process_to_websocket_client_full_pipeline -- --ignored --nocapture
+cargo test --locked --test transport python_worker_process_to_websocket_client_full_pipeline -- --ignored
+
+# From backend/
+uv run ruff format
+uv run ruff check --fix
+uv run pytest tests tools/test_guard_worker.py -q
 ```
 
-Ordinary Rust tests use test-local workers over real framed TCP. The explicit cross-language test starts a Python fixture process and exercises IPC, Rust scheduling and ordinary WebSocket clients together. Python and GPU test instructions are in the backend README.
+Ordinary tests cover placement, admission, dynamic batching, full hybrid cache state, interruption, stale results, bounded overload and archive cleanup. The explicit cross-language test starts a Python fixture. CUDA tests require a configured checkpoint and device; the hardware reports state which tests actually ran.
+
+## Documentation and current limits
+
+| Read next | Purpose |
+| --- | --- |
+| [Visual architecture](docs/ARCHITECTURE.md) | Data movement, computation and cache/storage ownership |
+| [Immediate-commit GPU results](docs/GPU_IMMEDIATE_COMMIT_3090.md) | Current ordinary-path latency and offered-concurrency sweep |
+| [Client and operating guide](docs/CLIENT_GUIDE.md) | Public protocol, benchmark controls, records and limits |
+| [Backend guide](backend/README.md) | Model integration, deployment, cache invariants and GPU tests |
+| [Preparation diagrams](docs/ENDPOINTING_PREPARATION.md) | Optional speculative branch and activation semantics |
+| [Rust style](docs/RUST_STYLE.md) | Code organization and review conventions |
+| [Implementation decisions](docs/IMPLEMENTATION.md), [original plan](PLAN.md) | Design context and documented assumptions |
+| [Earlier GPU benchmark](docs/GPU_BENCHMARK_3090.md), [endpointing experiment](docs/GPU_ENDPOINTING_3090.md) | Historical evidence and its limitations |
+
+This prototype does not implement crash recovery, automatic history replay, cache migration, paged allocation or silent context truncation. Hybrid cache join/split currently copies tensors; unequal context lengths require padding. Short repeated-recording trials do not establish sustainable production capacity, general speech quality or external-network latency. [PERFORMANCE.md](PERFORMANCE.md) concerns the superseded audio-echo prototype and does not describe this model's capacity.

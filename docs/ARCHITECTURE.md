@@ -14,7 +14,7 @@ Read the diagrams in order for a walkthrough, or jump to a question:
 | What happens when the user interrupts? | [6. Interruption](#6-interruption) |
 | What is freed or saved at disconnect? | [7. Closing a session](#7-closing-a-session) |
 
-These diagrams describe the current implementation. The completed 10 Hz checkpoint has passed [RTX 3090 runtime benchmarks](GPU_BENCHMARK_3090.md), including real speech over the gateway. Model quality, multi-GPU behavior and sustained capacity still need validation. The optional [preparation path](ENDPOINTING_PREPARATION.md) overlaps encoding and prefill with end-of-turn detection. Earlier local tests used a separate synthetic worker; see [those results](LOCAL_VALIDATION.md).
+These diagrams describe the current implementation. Start with the [immediate-commit RTX 3090 benchmark](GPU_IMMEDIATE_COMMIT_3090.md) for the ordinary path: continuous 100 ms packets, preparation disabled and no added endpointing delay. The optional [preparation path](ENDPOINTING_PREPARATION.md) computes whole candidates during client endpoint detection; it does not provide incremental Whisper prefill. Model quality belongs to [the training project](https://github.com/BertilBraun/speech-llm-projection). Physical multi-GPU behavior and sustained capacity remain unmeasured. Earlier local tests used a separate synthetic worker; see [those results](LOCAL_VALIDATION.md).
 
 ## 1. Whole system
 
@@ -346,4 +346,4 @@ Use these questions to compare the implementation with the intended product:
 - **Storage:** Are bounded RAM records plus JSON archives enough? There is no crash recovery or archive replay, and archived PCM integer arrays are larger than binary audio sidecars.
 - **Throughput:** Are the bounded prefill batches and reactive admission limits appropriate? Background batch construction and reduced cache-copy overhead remain possible improvements after GPU profiling.
 
-For detailed wire fields use [WORKER_PROTOCOL.md](WORKER_PROTOCOL.md). For configurable limits see [examples/runtime.json](../examples/runtime.json) and [backend/config.example.json](../backend/config.example.json). For tested behavior use [LOCAL_VALIDATION.md](LOCAL_VALIDATION.md); for tomorrow's real-model checks use [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md).
+For public wire fields use [CLIENT_GUIDE.md](CLIENT_GUIDE.md), and for the backend boundary use [WORKER_PROTOCOL.md](WORKER_PROTOCOL.md). For configurable limits see [examples/runtime.json](../examples/runtime.json) and [backend/config.example.json](../backend/config.example.json). For tested behavior use [LOCAL_VALIDATION.md](LOCAL_VALIDATION.md) and the [current hardware results](GPU_IMMEDIATE_COMMIT_3090.md); [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) remains the checklist for new deployments.
