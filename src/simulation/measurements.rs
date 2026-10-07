@@ -9,6 +9,8 @@ use crate::metrics::LatencyDistribution;
 pub(crate) struct Measurements {
     pub summary: SessionSummary,
     pub ttft: Histogram<u64>,
+    pub end_of_audio_to_first_token: Histogram<u64>,
+    pub endpoint_confirmation: Histogram<u64>,
     pub token_gaps: Histogram<u64>,
 }
 
@@ -17,6 +19,8 @@ impl Measurements {
         Self {
             summary: SessionSummary::new(session_id),
             ttft: histogram(),
+            end_of_audio_to_first_token: histogram(),
+            endpoint_confirmation: histogram(),
             token_gaps: histogram(),
         }
     }
@@ -43,6 +47,7 @@ pub(crate) fn distribution(histogram: &Histogram<u64>) -> LatencyDistribution {
 }
 
 pub(crate) struct TurnTiming {
+    audio_finished: Instant,
     committed: Instant,
     first_token: Option<Instant>,
     previous_token: Option<Instant>,
@@ -51,14 +56,19 @@ pub(crate) struct TurnTiming {
 }
 
 impl TurnTiming {
-    pub fn new(committed: Instant) -> Self {
+    pub fn new(audio_finished: Instant, committed: Instant) -> Self {
         Self {
+            audio_finished,
             committed,
             first_token: None,
             previous_token: None,
             arrivals: VecDeque::new(),
             tokens: 0,
         }
+    }
+
+    pub fn committed(&self) -> Instant {
+        self.committed
     }
 
     pub fn token(&mut self, now: Instant, measurements: &mut Measurements, target: f64) {
@@ -70,6 +80,14 @@ impl TurnTiming {
             }
         } else {
             record(&mut measurements.ttft, now - self.committed);
+            record(
+                &mut measurements.end_of_audio_to_first_token,
+                now - self.audio_finished,
+            );
+            record(
+                &mut measurements.endpoint_confirmation,
+                self.committed - self.audio_finished,
+            );
             self.first_token = Some(now);
         }
         self.previous_token = Some(now);
@@ -126,9 +144,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn endpoint_confirmation_is_separate_from_commit_to_first_token() {
+        let audio_finished = Instant::now();
+        let committed = audio_finished + Duration::from_millis(300);
+        let mut timing = TurnTiming::new(audio_finished, committed);
+        let mut measurements = Measurements::new("endpointing".into());
+        timing.token(
+            committed + Duration::from_millis(12),
+            &mut measurements,
+            4.0,
+        );
+        assert_eq!(distribution(&measurements.ttft).p50_ms.round(), 12.0);
+        assert_eq!(
+            distribution(&measurements.end_of_audio_to_first_token)
+                .p50_ms
+                .round(),
+            312.0,
+        );
+        assert_eq!(
+            distribution(&measurements.endpoint_confirmation)
+                .p50_ms
+                .round(),
+            300.0,
+        );
+    }
+
+    #[test]
     fn stalled_generation_has_zero_rolling_throughput() {
         let started = Instant::now();
-        let mut timing = TurnTiming::new(started);
+        let mut timing = TurnTiming::new(started, started);
         let mut measurements = Measurements::new("stalled".into());
         timing.token(started, &mut measurements, 4.0);
         timing.observe_rate(

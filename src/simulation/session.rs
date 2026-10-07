@@ -85,9 +85,24 @@ async fn turns(
         client.begin_turn(turn_id).await?;
         measurements.summary.admitted_turns += 1;
         let chunks = send_audio(client, turn_id, audio.clone(), configuration, random).await?;
+        let audio_finished = Instant::now();
+        if configuration.prepare_before_commit {
+            client.prepare(turn_id, chunks, audio.len() / 2).await?;
+        }
+        tokio::time::sleep_until(
+            audio_finished + Duration::from_millis(configuration.endpointing_ms),
+        )
+        .await;
         let committed = Instant::now();
         client.commit(turn_id, chunks, audio.len() / 2).await?;
-        generate(client, turn_id, committed, configuration, measurements).await?;
+        generate(
+            client,
+            turn_id,
+            TurnTiming::new(audio_finished, committed),
+            configuration,
+            measurements,
+        )
+        .await?;
         if index + 1 < configuration.turns_per_session {
             tokio::time::sleep(Duration::from_millis(configuration.think_ms)).await;
         }
@@ -121,11 +136,11 @@ async fn send_audio(
 async fn generate(
     client: &mut VoiceClient,
     turn_id: TurnId,
-    committed: Instant,
+    mut timing: TurnTiming,
     configuration: &SimulationConfig,
     measurements: &mut Measurements,
 ) -> Result<(), GatewayError> {
-    let mut timing = TurnTiming::new(committed);
+    let deadline = timing.committed() + configuration.response_timeout;
     let mut received = 0;
     let mut previous_sequence = None;
     let mut interrupted = false;
@@ -133,7 +148,7 @@ async fn generate(
     observations.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let event = tokio::select! {
-            _ = tokio::time::sleep_until(committed + configuration.response_timeout) => return Err(GatewayError::Timeout),
+            _ = tokio::time::sleep_until(deadline) => return Err(GatewayError::Timeout),
             _ = observations.tick() => {
                 timing.observe_rate(Instant::now(), measurements, configuration.target_tokens_per_second, Duration::from_millis(configuration.throughput_window_ms));
                 continue;

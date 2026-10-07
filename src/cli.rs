@@ -67,6 +67,12 @@ pub struct BenchmarkArguments {
     pub start_spread_ms: u64,
     #[arg(long, default_value_t = 250)]
     pub think_ms: u64,
+    /// Delay between the last audio packet and confirmed end of turn.
+    #[arg(long, default_value_t = 0)]
+    pub endpointing_ms: u64,
+    /// Prepare inference provisionally during the endpoint confirmation delay.
+    #[arg(long)]
+    pub prepare_before_commit: bool,
     #[arg(long, default_value_t = 4.0)]
     pub target_tokens_per_second: f64,
     #[arg(long, default_value_t = 2000)]
@@ -96,6 +102,8 @@ impl BenchmarkArguments {
             maximum_packet_ms: self.maximum_packet_ms,
             start_spread_ms: self.start_spread_ms,
             think_ms: self.think_ms,
+            endpointing_ms: self.endpointing_ms,
+            prepare_before_commit: self.prepare_before_commit,
             target_tokens_per_second: self.target_tokens_per_second,
             throughput_window_ms: self.throughput_window_ms,
             response_timeout: Duration::from_secs(self.timeout_secs),

@@ -38,6 +38,31 @@ class Prefill(Record):
     accepted: AcceptedToken | None = None
 
 
+class Prepare(Record):
+    type: Literal["prepare"] = "prepare"
+    operation_id: Identifier
+    session_id: SessionId
+    turn_id: Identifier
+    generation: Identifier
+    audio_offset: Annotated[int, Field(ge=0)]
+    audio_bytes: Annotated[int, Field(gt=0)]
+    accepted: AcceptedToken | None = None
+
+
+class Activate(Record):
+    type: Literal["activate"] = "activate"
+    operation_id: Identifier
+    session_id: SessionId
+    turn_id: Identifier
+    generation: Identifier
+
+
+class DiscardPrepared(Record):
+    type: Literal["discard_prepared"] = "discard_prepared"
+    operation_id: Identifier
+    session_id: SessionId
+
+
 class Decode(Record):
     type: Literal["decode"] = "decode"
     operation_id: Identifier
@@ -53,7 +78,10 @@ class Close(Record):
     session_id: SessionId
 
 
-Operation = Annotated[Open | Prefill | Decode | Close, Field(discriminator="type")]
+Operation = Annotated[
+    Open | Prefill | Prepare | Activate | DiscardPrepared | Decode | Close,
+    Field(discriminator="type"),
+]
 
 
 class Request(Record):
@@ -73,7 +101,10 @@ class Request(Record):
         expected_offset = 0
         for operation in self.operations:
             match operation:
-                case Prefill(audio_offset=offset, audio_bytes=length):
+                case (
+                    Prefill(audio_offset=offset, audio_bytes=length)
+                    | Prepare(audio_offset=offset, audio_bytes=length)
+                ):
                     if offset != expected_offset or length % 2:
                         raise ValueError("PCM16 slices must be contiguous, ordered and even-sized")
                     expected_offset += length
@@ -88,6 +119,10 @@ class Opened(Record):
 
 class Closed(Record):
     type: Literal["closed"] = "closed"
+
+
+class Discarded(Record):
+    type: Literal["discarded"] = "discarded"
 
 
 class Token(Record):
@@ -120,7 +155,7 @@ class Failed(Record):
     message: str
 
 
-Outcome = Annotated[Opened | Closed | Token | Failed, Field(discriminator="type")]
+Outcome = Annotated[Opened | Closed | Discarded | Token | Failed, Field(discriminator="type")]
 
 
 class OperationResult(Record):

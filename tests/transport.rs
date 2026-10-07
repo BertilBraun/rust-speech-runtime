@@ -1,3 +1,5 @@
+#[path = "transport/endpointing.rs"]
+mod endpointing;
 mod support;
 
 use std::{ffi::OsString, path::PathBuf, time::Duration};
@@ -125,7 +127,12 @@ async fn websocket_multi_turn_preserves_assignment_and_exact_archive() {
     )
     .await;
     let mut client = connected(&gateway.url, "conversation").await;
-    commit(&mut client, 1).await;
+    endpointing::prepare(&mut client, 1).await;
+    endpointing::prepared(&mut client, 1, 1, 800).await;
+    client
+        .commit(TurnId(1), 1, 800)
+        .await
+        .expect("confirmed turn");
     let first = finish(&mut client, 1).await;
     commit(&mut client, 2).await;
     let second = finish(&mut client, 2).await;
@@ -475,6 +482,8 @@ async fn python_worker_process_to_websocket_client_full_pipeline() {
             utterance_ms: 50,
             start_spread_ms: 10,
             think_ms: 0,
+            endpointing_ms: 100,
+            prepare_before_commit: true,
             ..SimulationConfig::default()
         },
     )

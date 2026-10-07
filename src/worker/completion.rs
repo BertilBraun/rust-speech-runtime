@@ -32,6 +32,21 @@ impl WorkerActor {
                 Operation::Close { session_id, .. } => {
                     self.complete_close(&session_id, result.outcome)?
                 }
+                Operation::DiscardPrepared { session_id, .. } => {
+                    self.complete_discard(&session_id, result.outcome)?
+                }
+                Operation::Prepare {
+                    session_id,
+                    turn_id,
+                    generation,
+                    ..
+                } => self.complete_preparation(&session_id, turn_id, generation, result)?,
+                Operation::Activate {
+                    session_id,
+                    turn_id,
+                    generation,
+                    ..
+                } => self.complete_activation(&session_id, turn_id, generation, result)?,
                 Operation::Prefill {
                     session_id,
                     turn_id,
@@ -80,7 +95,8 @@ impl WorkerActor {
             })
             .map(|(operation, session)| {
                 let appended_tokens = match operation {
-                    Operation::Prefill { audio_bytes, .. } => audio_bytes.div_ceil(3200) + 32,
+                    Operation::Prefill { audio_bytes, .. }
+                    | Operation::Prepare { audio_bytes, .. } => audio_bytes.div_ceil(3200) + 32,
                     _ => 0,
                 };
                 // One in-flight operation keeps this cache length stable until completion.
@@ -182,6 +198,43 @@ impl WorkerActor {
             _ => return Err(protocol_error("unexpected inference result")),
         }
         Ok(())
+    }
+    fn complete_activation(
+        &mut self,
+        key: &str,
+        turn_id: u64,
+        generation: u64,
+        result: OperationResult,
+    ) -> Result<(), RuntimeError> {
+        if result.turn_id != Some(turn_id) || result.generation != Some(generation) {
+            return Err(protocol_error("activation turn/generation mismatch"));
+        }
+        if matches!(result.outcome, Outcome::Failed { .. }) {
+            let session = self.sessions.get_mut(key).expect("activating session");
+            if matches!(
+                session.preparation,
+                crate::session::state::Preparation::Ready(_)
+            ) {
+                session.preparation.invalidate();
+            }
+            self.metrics
+                .preparation_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        let session = self.sessions.get_mut(key).expect("activating session");
+        session.pending_token = None;
+        session.preparation = match session.preparation {
+            crate::session::state::Preparation::DiscardPending { next } => next.map_or(
+                crate::session::state::Preparation::None,
+                crate::session::state::Preparation::Queued,
+            ),
+            _ => crate::session::state::Preparation::None,
+        };
+        self.metrics
+            .preparations_activated
+            .fetch_add(1, Ordering::Relaxed);
+        self.complete_inference(key, turn_id, generation, result)
     }
 }
 fn protocol_error(message: &str) -> RuntimeError {

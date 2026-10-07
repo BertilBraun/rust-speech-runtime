@@ -80,6 +80,7 @@ def pseudo_token_count(samples: int) -> int:
 
 class SpeechModel:
     def __init__(self, configuration: WorkerConfig) -> None:
+        self.configuration = configuration
         self.device = torch.device(configuration.device)
         if not torch.cuda.is_available():
             raise ValueError("The production PyTorch worker requires a CUDA device")
@@ -194,9 +195,39 @@ class SpeechModel:
 
     def warmup(self) -> None:
         with torch.inference_mode():
-            projected, _ = self.encode_audio((bytes(3200),))
-            prompt = torch.cat(
-                (self.embed(USER_PREFIX), projected[0], self.embed(ASSISTANT_SUFFIX))
-            )
-            first = self.forward_batch((prompt,), (DynamicCache(config=self.text_config),))
-            self.forward_batch((self.embed((first.token_ids[0],)),), first.caches)
+            self._warm_audio_prefill()
+            for length in self.configuration.warmup.prefill_tokens:
+                length = min(length, (self.configuration.max_context_tokens - 2) // 3)
+                prompt = self.embed((NEWLINE,) * length)
+                self._warm_prompt(prompt)
+        torch.cuda.empty_cache()
+
+    def _warm_audio_prefill(self) -> None:
+        samples = min(
+            self.configuration.warmup.audio_samples,
+            max(1600, (self.configuration.max_context_tokens // 3 - 15) * 1600),
+        )
+        projected, _ = self.encode_audio((bytes(samples * 2),))
+        prompt = torch.cat((self.embed(USER_PREFIX), projected[0], self.embed(ASSISTANT_SUFFIX)))
+        self._warm_prompt(prompt)
+
+    def _warm_prompt(self, prompt: Tensor) -> None:
+        first = self.forward_batch((prompt,), (DynamicCache(config=self.text_config),))
+        self._warm_decode_batches(first)
+        continuation = torch.cat((self.embed((first.token_ids[0], EOS, NEWLINE)), prompt))
+        second = self.forward_batch((continuation,), first.caches)
+        self._warm_decode_batches(second)
+
+    def _warm_decode_batches(self, batch: ForwardBatch) -> None:
+        maximum = min(
+            self.configuration.max_batch_size,
+            self.configuration.warmup.max_decode_batch_size,
+        )
+        sizes = {1, maximum}
+        size = 2
+        while size < maximum:
+            sizes.add(size)
+            size *= 2
+        token = self.embed((batch.token_ids[0],))
+        for size in sorted(sizes):
+            self.forward_batch((token,) * size, batch.caches * size)

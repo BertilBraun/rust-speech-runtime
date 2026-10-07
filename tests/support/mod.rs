@@ -50,6 +50,7 @@ impl Fixture {
             )
             .await;
             let mut contexts = HashMap::<String, usize>::new();
+            let mut prepared = HashMap::<String, PreparedCache>::new();
             while let Ok(length) = stream.read_u32().await {
                 assert!(length < 1024 * 1024);
                 let mut metadata = vec![0; length as usize];
@@ -58,6 +59,13 @@ impl Fixture {
                 }
                 let request: BatchRequest =
                     serde_json::from_slice(&metadata).expect("typed request");
+                assert!(
+                    request
+                        .operations
+                        .iter()
+                        .all(|operation| std::mem::discriminant(operation)
+                            == std::mem::discriminant(&request.operations[0]))
+                );
                 assert!(request.body_bytes <= 16 * 960_000);
                 let mut audio = vec![0; request.body_bytes];
                 stream.read_exact(&mut audio).await.expect("audio body");
@@ -65,7 +73,7 @@ impl Fixture {
                 let results = request
                     .operations
                     .into_iter()
-                    .map(|operation| result(operation, &mut contexts, fail_decode))
+                    .map(|operation| result(operation, &mut contexts, &mut prepared, fail_decode))
                     .collect();
                 write_json(
                     &mut stream,
@@ -104,9 +112,16 @@ impl Drop for Fixture {
     }
 }
 
+struct PreparedCache {
+    turn_id: u64,
+    generation: u64,
+    context: usize,
+}
+
 fn result(
     operation: Operation,
     contexts: &mut HashMap<String, usize>,
+    prepared: &mut HashMap<String, PreparedCache>,
     fail_decode: bool,
 ) -> OperationResult {
     let operation_id = operation.operation_id();
@@ -118,7 +133,61 @@ fn result(
         }
         Operation::Close { .. } => {
             contexts.remove(&session_id);
+            prepared.remove(&session_id);
             (None, None, Outcome::Closed)
+        }
+        Operation::Prepare {
+            turn_id,
+            generation,
+            audio_bytes,
+            accepted,
+            ..
+        } => {
+            let context = contexts[&session_id]
+                + audio_bytes.div_ceil(3200)
+                + 12
+                + usize::from(accepted.is_some());
+            prepared.insert(
+                session_id.clone(),
+                PreparedCache {
+                    turn_id,
+                    generation,
+                    context,
+                },
+            );
+            (
+                Some(turn_id),
+                Some(generation),
+                Outcome::Token {
+                    token_id: 100,
+                    text_delta: "a".into(),
+                    eos: false,
+                    context_tokens: context,
+                },
+            )
+        }
+        Operation::Activate {
+            turn_id,
+            generation,
+            ..
+        } => {
+            let cache = prepared.remove(&session_id).expect("prepared cache");
+            assert_eq!((cache.turn_id, cache.generation), (turn_id, generation));
+            contexts.insert(session_id.clone(), cache.context);
+            (
+                Some(turn_id),
+                Some(generation),
+                Outcome::Token {
+                    token_id: 100,
+                    text_delta: "a".into(),
+                    eos: false,
+                    context_tokens: cache.context,
+                },
+            )
+        }
+        Operation::DiscardPrepared { .. } => {
+            prepared.remove(&session_id);
+            (None, None, Outcome::Discarded)
         }
         Operation::Prefill {
             turn_id,

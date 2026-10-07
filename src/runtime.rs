@@ -185,6 +185,21 @@ impl SessionHandle {
         })
         .await
     }
+    pub async fn prepare(
+        &self,
+        turn_id: TurnId,
+        chunk_count: u32,
+        sample_count: usize,
+    ) -> Result<(), RuntimeError> {
+        self.request(|reply| Command::Prepare {
+            key: self.key.clone(),
+            turn_id,
+            chunk_count,
+            sample_count,
+            reply,
+        })
+        .await
+    }
     pub async fn commit(
         &self,
         turn_id: TurnId,

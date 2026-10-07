@@ -33,6 +33,8 @@ pub async fn run(
     let url: Arc<str> = Arc::from(url);
     let started = Instant::now();
     let mut ttft = measurements::histogram();
+    let mut end_of_audio_to_first_token = measurements::histogram();
+    let mut endpoint_confirmation = measurements::histogram();
     let mut gaps = measurements::histogram();
     let mut sessions = Vec::with_capacity(configuration.sessions * configuration.churn_rounds);
     for round in 0..configuration.churn_rounds {
@@ -50,6 +52,12 @@ pub async fn run(
             let measurement = result?;
             ttft.add(&measurement.ttft)
                 .expect("matching histogram precision");
+            end_of_audio_to_first_token
+                .add(&measurement.end_of_audio_to_first_token)
+                .expect("matching histogram precision");
+            endpoint_confirmation
+                .add(&measurement.endpoint_confirmation)
+                .expect("matching histogram precision");
             gaps.add(&measurement.token_gaps)
                 .expect("matching histogram precision");
             sessions.push(measurement.summary);
@@ -59,6 +67,8 @@ pub async fn run(
     let elapsed_seconds = started.elapsed().as_secs_f64();
     let received_tokens = sessions.iter().map(|session| session.received_tokens).sum();
     Ok(SimulationReport {
+        prepare_before_commit: configuration.prepare_before_commit,
+        endpointing_ms: configuration.endpointing_ms,
         elapsed_seconds,
         offered_sessions: sessions.len(),
         admitted_sessions: sessions.iter().filter(|session| session.admitted).count(),
@@ -86,6 +96,8 @@ pub async fn run(
             .map(|session| session.token_gaps_over_target)
             .sum(),
         time_to_first_token_ms: measurements::distribution(&ttft),
+        end_of_audio_to_first_token_ms: measurements::distribution(&end_of_audio_to_first_token),
+        endpoint_confirmation_ms: measurements::distribution(&endpoint_confirmation),
         token_gap_ms: measurements::distribution(&gaps),
         sessions,
     })

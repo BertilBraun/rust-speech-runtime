@@ -33,6 +33,14 @@ struct FixtureConfiguration {
     response_tokens: u64,
     maximum_sessions: usize,
     fail_decode: bool,
+    fail_prepare: bool,
+    fail_activate: bool,
+    activate_delay_ms: u64,
+}
+struct PreparedCache {
+    turn_id: u64,
+    generation: u64,
+    context: usize,
 }
 impl Fixture {
     async fn start(delay_ms: u64) -> Self {
@@ -49,6 +57,9 @@ impl Fixture {
             response_tokens: 4,
             maximum_sessions,
             fail_decode,
+            fail_prepare: false,
+            fail_activate: false,
+            activate_delay_ms: 0,
         })
         .await
     }
@@ -74,19 +85,31 @@ impl Fixture {
             )
             .await;
             let mut contexts = HashMap::<String, usize>::new();
+            let mut prepared = HashMap::<String, PreparedCache>::new();
             while let Ok(length) = stream.read_u32().await {
                 let mut metadata = vec![0; length as usize];
                 if stream.read_exact(&mut metadata).await.is_err() {
                     break;
                 }
                 let request: BatchRequest = serde_json::from_slice(&metadata).unwrap();
+                assert!(
+                    request
+                        .operations
+                        .iter()
+                        .all(|operation| std::mem::discriminant(operation)
+                            == std::mem::discriminant(&request.operations[0]))
+                );
                 let mut audio = vec![0; request.body_bytes];
                 stream.read_exact(&mut audio).await.unwrap();
                 let mut results = Vec::new();
                 recorded.lock().unwrap().extend(request.operations.clone());
                 let delay_ms = match request.operations[0] {
-                    Operation::Prefill { .. } => configuration.prefill_delay_ms,
+                    Operation::Prefill { .. } | Operation::Prepare { .. } => {
+                        configuration.prefill_delay_ms
+                    }
                     Operation::Decode { .. } => configuration.decode_delay_ms,
+                    Operation::Activate { .. } => configuration.activate_delay_ms,
+                    Operation::DiscardPrepared { .. } => 0,
                     _ => configuration.open_delay_ms,
                 };
                 if delay_ms > 0 {
@@ -113,7 +136,87 @@ impl Fixture {
                         }
                         Operation::Close { .. } => {
                             contexts.remove(&session_id);
+                            prepared.remove(&session_id);
                             (None, None, Outcome::Closed)
+                        }
+                        Operation::Prepare {
+                            turn_id,
+                            generation,
+                            audio_bytes,
+                            accepted,
+                            ..
+                        } => {
+                            if configuration.fail_prepare {
+                                results.push(OperationResult {
+                                    operation_id,
+                                    session_id,
+                                    turn_id: Some(turn_id),
+                                    generation: Some(generation),
+                                    outcome: Outcome::Failed {
+                                        code: ErrorCode::CapacityExceeded,
+                                        message: "preparation capacity unavailable".into(),
+                                    },
+                                });
+                                continue;
+                            }
+                            let context = contexts[&session_id]
+                                + audio_bytes.div_ceil(3200)
+                                + 12
+                                + usize::from(accepted.is_some());
+                            prepared.insert(
+                                session_id.clone(),
+                                PreparedCache {
+                                    turn_id,
+                                    generation,
+                                    context,
+                                },
+                            );
+                            (
+                                Some(turn_id),
+                                Some(generation),
+                                Outcome::Token {
+                                    token_id: 100,
+                                    text_delta: "a".into(),
+                                    eos: false,
+                                    context_tokens: context,
+                                },
+                            )
+                        }
+                        Operation::Activate {
+                            turn_id,
+                            generation,
+                            ..
+                        } => {
+                            if configuration.fail_activate {
+                                results.push(OperationResult {
+                                    operation_id,
+                                    session_id,
+                                    turn_id: Some(turn_id),
+                                    generation: Some(generation),
+                                    outcome: Outcome::Failed {
+                                        code: ErrorCode::InvalidState,
+                                        message: "preparation unavailable".into(),
+                                    },
+                                });
+                                continue;
+                            }
+                            let cache = prepared.remove(&session_id).expect("prepared cache");
+                            assert_eq!((cache.turn_id, cache.generation), (turn_id, generation));
+                            contexts.insert(session_id.clone(), cache.context);
+                            (
+                                Some(turn_id),
+                                Some(generation),
+                                Outcome::Token {
+                                    token_id: 100,
+                                    text_delta: "a".into(),
+                                    eos: false,
+                                    context_tokens: cache.context,
+                                },
+                            )
+                        }
+                        Operation::DiscardPrepared { .. } => {
+                            prepared.remove(&session_id);
+                            (None, None, Outcome::Discarded)
                         }
                         Operation::Prefill {
                             turn_id,
@@ -726,6 +829,9 @@ async fn slow_prefill_with_fast_decode_still_allows_sequential_turns() {
         response_tokens: 4,
         maximum_sessions: 64,
         fail_decode: false,
+        fail_prepare: false,
+        fail_activate: false,
+        activate_delay_ms: 0,
     })
     .await;
     let node = Node::start(backend.config()).await.unwrap();
@@ -753,6 +859,9 @@ async fn admitted_prefill_has_bounded_wait_even_when_it_exceeds_token_gap_budget
         response_tokens: 100,
         maximum_sessions: 64,
         fail_decode: false,
+        fail_prepare: false,
+        fail_activate: false,
+        activate_delay_ms: 0,
     })
     .await;
     let node = Node::start(RuntimeConfig {
@@ -831,5 +940,364 @@ async fn rejected_accepted_event_does_not_leave_capture_reservation_alive() {
         Some(FinishReason::SlowConsumer)
     );
     assert_eq!(node.metrics().active_sessions, 0);
+    node.shutdown().await.unwrap();
+}
+
+async fn capture(session: &SessionHandle, turn_id: u64) {
+    session.begin_turn(TurnId(turn_id)).await.unwrap();
+    session
+        .audio(TurnId(turn_id), 0, Bytes::from(vec![0; 1600]))
+        .await
+        .unwrap();
+}
+
+async fn wait_for_operation(backend: &Fixture, predicate: impl Fn(&Operation) -> bool) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut interval = tokio::time::interval(Duration::from_millis(1));
+        loop {
+            if backend.operations.lock().unwrap().iter().any(&predicate) {
+                return;
+            }
+            interval.tick().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn wait_prepared(
+    session: &mut SessionHandle,
+    turn_id: u64,
+    chunk_count: u32,
+    sample_count: usize,
+) {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), session.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            SessionEvent::Prepared {
+                turn_id: prepared_turn,
+                chunk_count: prepared_chunks,
+                sample_count: prepared_samples,
+            } => {
+                assert_eq!(
+                    (prepared_turn.0, prepared_chunks, prepared_samples),
+                    (turn_id, chunk_count, sample_count)
+                );
+                return;
+            }
+            SessionEvent::TextDelta { .. } => panic!("provisional output must remain private"),
+            SessionEvent::Failed { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn preparation_is_private_idempotent_and_activation_avoids_another_forward() {
+    let backend = Fixture::configured(80, 64, false).await;
+    let node = Node::start(backend.config()).await.unwrap();
+    let mut session = node
+        .ingress()
+        .open_session(SessionId("prepared".into()))
+        .await
+        .unwrap();
+    capture(&session, 1).await;
+    assert_eq!(
+        session.prepare(TurnId(1), 2, 800).await.unwrap_err().code(),
+        ErrorCode::InvalidInput
+    );
+    session.prepare(TurnId(1), 1, 800).await.unwrap();
+    session.prepare(TurnId(1), 1, 800).await.unwrap();
+    wait_prepared(&mut session, 1, 1, 800).await;
+    session.prepare(TurnId(1), 1, 800).await.unwrap();
+    assert_eq!(node.metrics().generated_tokens, 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), session.next_event())
+            .await
+            .is_err()
+    );
+    session.commit(TurnId(1), 1, 800).await.unwrap();
+    assert_eq!(finish_turn(&mut session).await, 5);
+    assert!(node.metrics().ttft.max_ms < 70.0);
+    let record = session.close().await.unwrap();
+    assert_eq!(
+        record.turns[0]
+            .tokens
+            .iter()
+            .map(|token| token.index)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4]
+    );
+    assert_eq!(node.metrics().preparations_started, 1);
+    assert_eq!(node.metrics().preparations_activated, 1);
+    assert!(
+        !backend
+            .operations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|operation| matches!(operation, Operation::Prefill { .. }))
+    );
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn commit_during_running_preparation_waits_then_activates_once() {
+    let backend = Fixture::start(50).await;
+    let node = Node::start(backend.config()).await.unwrap();
+    let mut session = node
+        .ingress()
+        .open_session(SessionId("commit-running".into()))
+        .await
+        .unwrap();
+    capture(&session, 1).await;
+    session.prepare(TurnId(1), 1, 800).await.unwrap();
+    wait_for_operation(&backend, |operation| {
+        matches!(operation, Operation::Prepare { .. })
+    })
+    .await;
+    session.commit(TurnId(1), 1, 800).await.unwrap();
+    session.commit(TurnId(1), 1, 800).await.unwrap();
+    assert_eq!(finish_turn(&mut session).await, 5);
+    assert_eq!(node.metrics().preparations_activated, 1);
+    assert!(
+        !backend
+            .operations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|operation| matches!(operation, Operation::Prefill { .. }))
+    );
+    session.close().await.unwrap();
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn resumed_audio_invalidates_running_preparation_and_can_prepare_the_new_snapshot() {
+    let backend = Fixture::start(60).await;
+    let node = Node::start(backend.config()).await.unwrap();
+    let mut session = node
+        .ingress()
+        .open_session(SessionId("resumed".into()))
+        .await
+        .unwrap();
+    capture(&session, 1).await;
+    session.prepare(TurnId(1), 1, 800).await.unwrap();
+    wait_for_operation(&backend, |operation| {
+        matches!(operation, Operation::Prepare { .. })
+    })
+    .await;
+    session
+        .audio(TurnId(1), 1, Bytes::from(vec![0; 1600]))
+        .await
+        .unwrap();
+    session.prepare(TurnId(1), 2, 1600).await.unwrap();
+    session.commit(TurnId(1), 2, 1600).await.unwrap();
+    wait_prepared(&mut session, 1, 2, 1600).await;
+    assert_eq!(finish_turn(&mut session).await, 5);
+    let metrics = node.metrics();
+    assert_eq!(metrics.preparations_started, 2);
+    assert_eq!(metrics.preparations_discarded, 1);
+    assert_eq!(metrics.preparations_activated, 1);
+    assert_eq!(metrics.stale_results_discarded, 1);
+    let record = session.close().await.unwrap();
+    assert_eq!(record.turns[0].audio_pcm16.len(), 3200);
+    assert_eq!(record.turns[0].tokens.len(), 5);
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_preparation_does_not_change_the_next_turn_history() {
+    let backend = Fixture::start(30).await;
+    let node = Node::start(backend.config()).await.unwrap();
+    let mut session = node
+        .ingress()
+        .open_session(SessionId("cancelled-preparation".into()))
+        .await
+        .unwrap();
+    capture(&session, 1).await;
+    session.prepare(TurnId(1), 1, 800).await.unwrap();
+    wait_for_operation(&backend, |operation| {
+        matches!(operation, Operation::Prepare { .. })
+    })
+    .await;
+    session.cancel(TurnId(1)).await.unwrap();
+    capture(&session, 2).await;
+    session.prepare(TurnId(2), 1, 800).await.unwrap();
+    session.commit(TurnId(2), 1, 800).await.unwrap();
+    assert_eq!(finish_turn(&mut session).await, 5);
+    let record = session.close().await.unwrap();
+    assert!(!record.turns[0].committed);
+    assert!(record.turns[0].tokens.is_empty());
+    assert_eq!(record.turns[0].finish_reason, Some(FinishReason::Cancelled));
+    assert_eq!(record.turns[1].tokens.len(), 5);
+    assert_eq!(node.metrics().preparations_discarded, 1);
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn resumed_audio_without_new_preparation_falls_back_to_full_prefill() {
+    let backend = Fixture::start(20).await;
+    let node = Node::start(backend.config()).await.unwrap();
+    let mut session = node
+        .ingress()
+        .open_session(SessionId("fallback-audio".into()))
+        .await
+        .unwrap();
+    capture(&session, 1).await;
+    session.prepare(TurnId(1), 1, 800).await.unwrap();
+    wait_prepared(&mut session, 1, 1, 800).await;
+    session
+        .audio(TurnId(1), 1, Bytes::from(vec![0; 1600]))
+        .await
+        .unwrap();
+    session.commit(TurnId(1), 2, 1600).await.unwrap();
+    assert_eq!(finish_turn(&mut session).await, 5);
+    assert_eq!(node.metrics().preparations_activated, 0);
+    assert!(
+        backend
+            .operations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|operation| matches!(
+                operation,
+                Operation::Prefill {
+                    audio_bytes: 3200,
+                    ..
+                }
+            ))
+    );
+    session.close().await.unwrap();
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_preparation_and_activation_preserve_previous_accepted_token_for_fallback() {
+    for fail_prepare in [true, false] {
+        let backend = Fixture::with_configuration(FixtureConfiguration {
+            open_delay_ms: 0,
+            prefill_delay_ms: 20,
+            decode_delay_ms: 5,
+            response_tokens: 4,
+            maximum_sessions: 64,
+            fail_decode: false,
+            fail_prepare,
+            fail_activate: !fail_prepare,
+            activate_delay_ms: 0,
+        })
+        .await;
+        let node = Node::start(backend.config()).await.unwrap();
+        let mut session = node
+            .ingress()
+            .open_session(SessionId("failed-speculation".into()))
+            .await
+            .unwrap();
+        start_turn(&session, 1).await;
+        assert_eq!(finish_turn(&mut session).await, 5);
+        capture(&session, 2).await;
+        session.prepare(TurnId(2), 1, 800).await.unwrap();
+        session.commit(TurnId(2), 1, 800).await.unwrap();
+        assert_eq!(finish_turn(&mut session).await, 5);
+        let record = session.close().await.unwrap();
+        assert_eq!(record.turns[0].tokens.len(), 5);
+        assert_eq!(record.turns[1].tokens.len(), 5);
+        assert_eq!(node.metrics().preparation_fallbacks, 1);
+        assert_eq!(node.metrics().backend_failures, 0);
+        assert!(backend.operations.lock().unwrap().iter().any(|operation| matches!(operation, Operation::Prefill {turn_id: 2, accepted: Some(accepted), .. } if accepted.turn_id == 1 && accepted.index == 4)));
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn stale_failed_preparation_does_not_terminate_a_new_turn() {
+    let backend = Fixture::with_configuration(FixtureConfiguration {
+        open_delay_ms: 0,
+        prefill_delay_ms: 40,
+        decode_delay_ms: 2,
+        response_tokens: 4,
+        maximum_sessions: 64,
+        fail_decode: false,
+        fail_prepare: true,
+        fail_activate: false,
+        activate_delay_ms: 0,
+    })
+    .await;
+    let node = Node::start(backend.config()).await.unwrap();
+    let mut session = node
+        .ingress()
+        .open_session(SessionId("stale-failure".into()))
+        .await
+        .unwrap();
+    capture(&session, 1).await;
+    session.prepare(TurnId(1), 1, 800).await.unwrap();
+    wait_for_operation(&backend, |operation| {
+        matches!(operation, Operation::Prepare { .. })
+    })
+    .await;
+    start_turn(&session, 2).await;
+    assert_eq!(finish_turn(&mut session).await, 5);
+    let record = session.close().await.unwrap();
+    assert!(record.turns[0].tokens.is_empty());
+    assert_eq!(record.turns[1].tokens.len(), 5);
+    assert_eq!(node.metrics().backend_failures, 0);
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn interrupted_activation_does_not_resend_previously_reconciled_token() {
+    let backend = Fixture::with_configuration(FixtureConfiguration {
+        open_delay_ms: 0,
+        prefill_delay_ms: 5,
+        decode_delay_ms: 2,
+        response_tokens: 4,
+        maximum_sessions: 64,
+        fail_decode: false,
+        fail_prepare: false,
+        fail_activate: false,
+        activate_delay_ms: 60,
+    })
+    .await;
+    let node = Node::start(backend.config()).await.unwrap();
+    let mut session = node
+        .ingress()
+        .open_session(SessionId("interrupted-activation".into()))
+        .await
+        .unwrap();
+    start_turn(&session, 1).await;
+    assert_eq!(finish_turn(&mut session).await, 5);
+    capture(&session, 2).await;
+    session.prepare(TurnId(2), 1, 800).await.unwrap();
+    wait_prepared(&mut session, 2, 1, 800).await;
+    session.commit(TurnId(2), 1, 800).await.unwrap();
+    wait_for_operation(&backend, |operation| {
+        matches!(operation, Operation::Activate { turn_id: 2, .. })
+    })
+    .await;
+    capture(&session, 3).await;
+    session.prepare(TurnId(3), 1, 800).await.unwrap();
+    session.commit(TurnId(3), 1, 800).await.unwrap();
+    assert_eq!(finish_turn(&mut session).await, 5);
+    let record = session.close().await.unwrap();
+    assert!(record.turns[1].tokens.is_empty());
+    assert_eq!(record.turns[2].tokens.len(), 5);
+    assert!(
+        backend
+            .operations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|operation| matches!(
+                operation,
+                Operation::Prepare {
+                    turn_id: 3,
+                    accepted: None,
+                    ..
+                }
+            ))
+    );
     node.shutdown().await.unwrap();
 }

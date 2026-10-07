@@ -2,7 +2,7 @@ use super::{Command, actor::WorkerActor};
 use crate::{
     protocol::{ErrorCode, SessionEvent, TurnId, TurnRecord},
     runtime::RuntimeError,
-    session::state::{SessionState, Stage},
+    session::state::{Preparation, SessionState, Stage},
 };
 use std::sync::atomic::Ordering;
 
@@ -58,6 +58,16 @@ impl WorkerActor {
                 let result = self.audio(&key, turn_id, chunk_index, &audio);
                 let _ = reply.send(result);
             }
+            Command::Prepare {
+                key,
+                turn_id,
+                chunk_count,
+                sample_count,
+                reply,
+            } => {
+                let result = self.prepare(&key, turn_id, chunk_count, sample_count);
+                let _ = reply.send(result);
+            }
             Command::Commit {
                 key,
                 turn_id,
@@ -104,7 +114,7 @@ impl WorkerActor {
             }
         }
     }
-    fn session(&mut self, key: &str) -> Result<&mut SessionState, RuntimeError> {
+    pub(super) fn session(&mut self, key: &str) -> Result<&mut SessionState, RuntimeError> {
         if !self.available.load(Ordering::Acquire) {
             return Err(error(
                 ErrorCode::BackendUnavailable,
@@ -236,6 +246,7 @@ impl WorkerActor {
             .min(self.ready.max_audio_samples)
             * 2;
         let history_limit = self.config.max_history_bytes;
+        let generation = self.generation();
         let session = self.session(key)?;
         check_turn(session, turn_id)?;
         let chunks = match session.stage {
@@ -265,6 +276,10 @@ impl WorkerActor {
                 ErrorCode::HistoryLimit,
                 "session record limit exceeded",
             ));
+        }
+        if !matches!(session.preparation, Preparation::None) {
+            session.preparation.invalidate();
+            session.generation = generation;
         }
         session
             .turn_mut()
@@ -343,7 +358,7 @@ impl WorkerActor {
 fn error(code: ErrorCode, message: &str) -> RuntimeError {
     RuntimeError::new(code, message)
 }
-fn check_turn(session: &SessionState, turn_id: TurnId) -> Result<(), RuntimeError> {
+pub(super) fn check_turn(session: &SessionState, turn_id: TurnId) -> Result<(), RuntimeError> {
     if session.turn().is_some_and(|turn| turn.turn_id == turn_id) {
         Ok(())
     } else {

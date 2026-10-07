@@ -25,6 +25,15 @@ class ModelManifest(Record):
         return self
 
 
+class WarmupConfig(Record):
+    audio_samples: Annotated[int, Field(ge=1600, le=480_000)] = 96_000
+    prefill_tokens: Annotated[tuple[Annotated[int, Field(gt=0)], ...], Field(min_length=1)] = (
+        64,
+        256,
+    )
+    max_decode_batch_size: Annotated[int, Field(gt=0)] = 4
+
+
 class WorkerConfig(Record):
     model: ModelManifest
     device: Annotated[str, Field(pattern="^cuda(?::[0-9]+)?$")]
@@ -38,6 +47,7 @@ class WorkerConfig(Record):
     allocator_memory_fraction: Annotated[float, Field(gt=0, le=1)] = 1.0
     max_metadata_bytes: Annotated[int, Field(gt=0)] = 1024 * 1024
     connection_timeout_seconds: Annotated[float, Field(gt=0)] = 300.0
+    warmup: WarmupConfig = Field(default_factory=WarmupConfig)
 
     @property
     def max_body_bytes(self) -> int:

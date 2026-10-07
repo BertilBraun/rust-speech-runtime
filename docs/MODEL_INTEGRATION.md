@@ -6,7 +6,7 @@ The completed 10 Hz step-9,550 checkpoint is integrated in an independent servin
 
 | Component | Training reference | Serving adapter |
 | --- | --- | --- |
-| Audio | Mono 16 kHz | PCM16, mono 16 kHz; complete utterance at commit |
+| Audio | Mono 16 kHz | PCM16, mono 16 kHz; complete candidate at prepare or final utterance at commit |
 | Encoder | Whisper Small, width 768, native 50 Hz | Whisper Small, BF16 |
 | Projector | FP32 LayerNorm, mean pool by five, MLP 768 → 1,024 → 2,048 | Same architecture, BF16 serving weights; 10 speech embeddings/second |
 | Language model | Qwen3.5-2B | Pinned Qwen3.5-2B text backbone, BF16 |
@@ -40,7 +40,7 @@ flowchart LR
     decode -->|"Accepted text deltas over WebSocket"| client
 ```
 
-Packets are not separate prefill jobs. Whisper is bidirectional, so the backend encodes the complete utterance after commit. A one-second utterance normally travels as ten packets and produces ten speech embeddings; partial utterances use the projector's partial-block rule. The gateway accepts a short final packet and validates exact counts, without imposing a wall-clock arrival frequency. The jitter benchmark varies capture intervals between 100 and 110 ms; packet size follows the interval, without changing model pooling.
+Packets are not separate prefill jobs. Whisper is bidirectional, so the backend encodes a complete candidate waveform. The diagram shows the ordinary commit path; optional `prepare` can perform the same work before commit against an isolated cache branch. Matching commit activates its held first token without a second forward; more audio invalidates it. See [preparation and cache ownership](ENDPOINTING_PREPARATION.md). A one-second utterance normally travels as ten packets and produces ten speech embeddings; partial utterances use the projector's partial-block rule. The gateway accepts a short final packet and validates exact counts, without imposing a wall-clock arrival frequency. The jitter benchmark varies capture intervals between 100 and 110 ms; packet size follows the interval, without changing model pooling.
 
 ## Hardware experiment and remaining work
 

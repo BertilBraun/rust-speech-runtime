@@ -21,6 +21,47 @@ pub(crate) enum Stage {
         deadline: Instant,
     },
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CaptureSnapshot {
+    pub turn_id: crate::protocol::TurnId,
+    pub generation: u64,
+    pub chunk_count: u32,
+    pub sample_count: usize,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct PreparationRequest {
+    pub snapshot: CaptureSnapshot,
+    pub queued_at: Instant,
+}
+pub(crate) enum Preparation {
+    None,
+    Queued(PreparationRequest),
+    Running(CaptureSnapshot),
+    Ready(CaptureSnapshot),
+    DiscardPending { next: Option<PreparationRequest> },
+    Discarding { next: Option<PreparationRequest> },
+}
+impl Preparation {
+    pub fn invalidate(&mut self) {
+        *self = match self {
+            Self::None | Self::Queued(_) => Self::None,
+            Self::Discarding { .. } => Self::Discarding { next: None },
+            Self::Running(_) | Self::Ready(_) | Self::DiscardPending { .. } => {
+                Self::DiscardPending { next: None }
+            }
+        };
+    }
+    pub fn snapshot(&self) -> Option<CaptureSnapshot> {
+        match self {
+            Self::Queued(request) => Some(request.snapshot),
+            Self::Running(snapshot) | Self::Ready(snapshot) => Some(*snapshot),
+            Self::DiscardPending { next } | Self::Discarding { next } => {
+                next.map(|request| request.snapshot)
+            }
+            Self::None => None,
+        }
+    }
+}
 pub(crate) struct SessionState {
     pub record: SessionRecord,
     pub events: mpsc::Sender<SessionEvent>,
@@ -38,6 +79,7 @@ pub(crate) struct SessionState {
     pub open_reply: Option<tokio::sync::oneshot::Sender<Result<(), RuntimeError>>>,
     pub backend_closed: bool,
     pub chunk_count: u32,
+    pub preparation: Preparation,
 }
 impl SessionState {
     pub fn new(
@@ -69,6 +111,7 @@ impl SessionState {
             open_reply: None,
             backend_closed: false,
             chunk_count: 0,
+            preparation: Preparation::None,
         }
     }
     pub fn active(&self) -> bool {
@@ -84,6 +127,7 @@ impl SessionState {
         self.record.turns.last_mut()
     }
     pub fn interrupt(&mut self, next_generation: u64) {
+        self.preparation.invalidate();
         if self.active() {
             self.finish(FinishReason::Cancelled);
         }

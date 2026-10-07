@@ -3,7 +3,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from voice_worker.protocol import Decode, Open, Prefill, Request
+from voice_worker.protocol import Activate, Decode, DiscardPrepared, Open, Prefill, Prepare, Request
 
 
 def test_rust_wire_json_roundtrip() -> None:
@@ -89,4 +89,55 @@ def test_unknown_fields_and_missing_acceptance_rejected() -> None:
     with pytest.raises(ValidationError):
         Decode.model_validate_json(
             '{"type":"decode","operation_id":1,"session_id":"a","turn_id":1,"generation":1}'
+        )
+
+
+@pytest.mark.parametrize(
+    "operation,body_bytes",
+    [
+        (
+            Prepare(
+                operation_id=1,
+                session_id="a",
+                turn_id=2,
+                generation=3,
+                audio_offset=0,
+                audio_bytes=3200,
+            ),
+            3200,
+        ),
+        (Activate(operation_id=1, session_id="a", turn_id=2, generation=3), 0),
+        (DiscardPrepared(operation_id=1, session_id="a"), 0),
+    ],
+)
+def test_preparation_operations_roundtrip_strictly(
+    operation: Prepare | Activate | DiscardPrepared, body_bytes: int
+) -> None:
+    request = Request(request_id=1, body_bytes=body_bytes, operations=(operation,))
+    assert Request.model_validate_json(request.model_dump_json()) == request
+
+
+def test_prepare_and_prefill_remain_separate_batch_kinds() -> None:
+    with pytest.raises(ValidationError, match="one operation kind"):
+        Request(
+            request_id=1,
+            body_bytes=6400,
+            operations=(
+                Prepare(
+                    operation_id=1,
+                    session_id="a",
+                    turn_id=1,
+                    generation=1,
+                    audio_offset=0,
+                    audio_bytes=3200,
+                ),
+                Prefill(
+                    operation_id=2,
+                    session_id="b",
+                    turn_id=1,
+                    generation=1,
+                    audio_offset=3200,
+                    audio_bytes=3200,
+                ),
+            ),
         )

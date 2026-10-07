@@ -1,9 +1,11 @@
 import os
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import torch
+from test_preparation import assert_cache_identical
 from torch import Tensor
 from transformers.cache_utils import DynamicCache
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -11,6 +13,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from voice_worker.cache import continuation_mask, continuation_positions, join_caches
 from voice_worker.config import WorkerConfig
 from voice_worker.model import ASSISTANT_SUFFIX, USER_PREFIX, SpeechModel
+from voice_worker.protocol import AcceptedToken, Activate, Open, Prefill, Prepare, Request, Token
+from voice_worker.pytorch_engine import PyTorchEngine
 
 
 @pytest.fixture(scope="module")
@@ -124,3 +128,76 @@ def test_real_ragged_decode_batch_matches_serial(configured_model: SpeechModel) 
         next_batched = logits(model, continued, decoded.caches)
         torch.testing.assert_close(next_batched, next_serial, atol=0.25, rtol=0.03)
         torch.testing.assert_close(next_batched.argmax(-1), next_serial.argmax(-1), atol=0, rtol=0)
+
+
+@pytest.mark.integration
+def test_real_preparation_preserves_committed_hybrid_cache_and_matches_prefill(
+    configured_model: SpeechModel,
+) -> None:
+    model = configured_model
+    engine = PyTorchEngine(model.configuration, model)
+
+    def request(operation: Open | Prefill | Prepare | Activate, body: bytes = b"") -> Token | None:
+        response = engine.execute(
+            Request(
+                request_id=operation.operation_id, body_bytes=len(body), operations=(operation,)
+            ),
+            body,
+        )
+        outcome = response.results[0].outcome
+        if isinstance(operation, Open):
+            assert outcome.type == "opened"
+            return None
+        assert isinstance(outcome, Token)
+        return outcome
+
+    request(Open(operation_id=0, session_id="a"))
+    first = request(
+        Prefill(
+            operation_id=1,
+            session_id="a",
+            turn_id=1,
+            generation=1,
+            audio_offset=0,
+            audio_bytes=32000,
+        ),
+        bytes(32000),
+    )
+    assert first is not None
+    canonical = engine.sessions["a"]
+    with torch.inference_mode():
+        snapshot = join_caches((canonical.cache,), model.text_config)
+    baseline = replace(canonical, cache=snapshot)
+    accepted = AcceptedToken(turn_id=1, index=0, token_id=first.token_id)
+    prepared = request(
+        Prepare(
+            operation_id=2,
+            session_id="a",
+            turn_id=2,
+            generation=2,
+            audio_offset=0,
+            audio_bytes=64000,
+            accepted=accepted,
+        ),
+        bytes(64000),
+    )
+    assert engine.sessions["a"] is canonical
+    assert_cache_identical(canonical.cache, snapshot, model.text_config)
+    activated = request(Activate(operation_id=3, session_id="a", turn_id=2, generation=2))
+    assert activated == prepared
+    activated_session = engine.sessions["a"]
+    engine.sessions["a"] = baseline
+    ordinary = request(
+        Prefill(
+            operation_id=4,
+            session_id="a",
+            turn_id=2,
+            generation=2,
+            audio_offset=0,
+            audio_bytes=64000,
+            accepted=accepted,
+        ),
+        bytes(64000),
+    )
+    assert ordinary == activated
+    assert_cache_identical(activated_session.cache, engine.sessions["a"].cache, model.text_config)

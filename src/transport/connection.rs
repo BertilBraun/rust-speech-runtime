@@ -227,6 +227,15 @@ impl Connection {
             ClientControl::StartTurn { turn_id } => {
                 self.require_session()?.begin_turn(turn_id).await?
             }
+            ClientControl::Prepare {
+                turn_id,
+                chunk_count,
+                sample_count,
+            } => {
+                self.require_session()?
+                    .prepare(turn_id, chunk_count, sample_count)
+                    .await?
+            }
             ClientControl::Commit {
                 turn_id,
                 chunk_count,

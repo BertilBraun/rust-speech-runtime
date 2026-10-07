@@ -35,6 +35,25 @@ pub enum Operation {
         audio_bytes: usize,
         accepted: Option<AcceptedToken>,
     },
+    Prepare {
+        operation_id: u64,
+        session_id: String,
+        turn_id: u64,
+        generation: u64,
+        audio_offset: usize,
+        audio_bytes: usize,
+        accepted: Option<AcceptedToken>,
+    },
+    Activate {
+        operation_id: u64,
+        session_id: String,
+        turn_id: u64,
+        generation: u64,
+    },
+    DiscardPrepared {
+        operation_id: u64,
+        session_id: String,
+    },
     Decode {
         operation_id: u64,
         session_id: String,
@@ -52,6 +71,9 @@ impl Operation {
         match self {
             Self::Open { operation_id, .. }
             | Self::Prefill { operation_id, .. }
+            | Self::Prepare { operation_id, .. }
+            | Self::Activate { operation_id, .. }
+            | Self::DiscardPrepared { operation_id, .. }
             | Self::Decode { operation_id, .. }
             | Self::Close { operation_id, .. } => *operation_id,
         }
@@ -60,6 +82,9 @@ impl Operation {
         match self {
             Self::Open { session_id, .. }
             | Self::Prefill { session_id, .. }
+            | Self::Prepare { session_id, .. }
+            | Self::Activate { session_id, .. }
+            | Self::DiscardPrepared { session_id, .. }
             | Self::Decode { session_id, .. }
             | Self::Close { session_id, .. } => session_id,
         }
@@ -77,6 +102,7 @@ pub struct BatchRequest {
 pub enum Outcome {
     Opened,
     Closed,
+    Discarded,
     Token {
         token_id: u32,
         text_delta: String,

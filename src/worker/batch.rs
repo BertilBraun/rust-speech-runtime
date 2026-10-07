@@ -2,7 +2,7 @@ use super::actor::{ActiveBatch, Job, WorkerActor};
 use crate::{
     protocol::backend::{BatchRequest, Operation},
     scheduler::BatchKind,
-    session::state::Stage,
+    session::state::{Preparation, Stage},
 };
 use std::sync::atomic::Ordering;
 
@@ -24,6 +24,22 @@ impl WorkerActor {
                     operation_id,
                     session_id: key,
                 },
+                BatchKind::Discard => {
+                    let Preparation::DiscardPending { next } = session.preparation else {
+                        unreachable!("selected discard")
+                    };
+                    session.preparation = Preparation::Discarding { next };
+                    Operation::DiscardPrepared {
+                        operation_id,
+                        session_id: key,
+                    }
+                }
+                BatchKind::Activate => Operation::Activate {
+                    operation_id,
+                    session_id: key,
+                    turn_id: session.turn().expect("activation turn").turn_id.0,
+                    generation: session.generation(),
+                },
                 BatchKind::Prefill => {
                     let turn = session.turn().expect("prefill turn");
                     let turn_id = turn.turn_id.0;
@@ -35,14 +51,30 @@ impl WorkerActor {
                             .queue_delay
                             .record(queued_at.elapsed().as_secs_f64() * 1000.0);
                     }
-                    Operation::Prefill {
-                        operation_id,
-                        session_id: key,
-                        turn_id,
-                        generation: session.generation(),
-                        audio_offset: offset,
-                        audio_bytes: bytes,
-                        accepted: session.pending_token.take(),
+                    if let Preparation::Queued(request) = session.preparation {
+                        self.metrics
+                            .preparations_started
+                            .fetch_add(1, Ordering::Relaxed);
+                        session.preparation = Preparation::Running(request.snapshot);
+                        Operation::Prepare {
+                            operation_id,
+                            session_id: key,
+                            turn_id,
+                            generation: request.snapshot.generation,
+                            audio_offset: offset,
+                            audio_bytes: bytes,
+                            accepted: session.pending_token.clone(),
+                        }
+                    } else {
+                        Operation::Prefill {
+                            operation_id,
+                            session_id: key,
+                            turn_id,
+                            generation: session.generation(),
+                            audio_offset: offset,
+                            audio_bytes: bytes,
+                            accepted: session.pending_token.take(),
+                        }
                     }
                 }
                 BatchKind::Decode => Operation::Decode {

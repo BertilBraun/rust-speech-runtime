@@ -37,6 +37,7 @@ pub struct RuntimeConfig {
     pub mailbox_capacity: usize,
     pub event_capacity: usize,
     pub max_batch_size: usize,
+    pub max_prefill_batch_size: usize,
     pub target_tokens_per_second: f64,
     pub backend_timeout_ms: u64,
     pub max_prefill_wait_ms: u64,
@@ -59,9 +60,10 @@ impl Default for RuntimeConfig {
             mailbox_capacity: 128,
             event_capacity: 128,
             max_batch_size: 16,
+            max_prefill_batch_size: 4,
             target_tokens_per_second: 4.0,
             backend_timeout_ms: 120_000,
-            max_prefill_wait_ms: 2_000,
+            max_prefill_wait_ms: 100,
             admission_headroom: 0.8,
             initial_forward_estimate_ms: 100.0,
         }
@@ -92,6 +94,7 @@ impl RuntimeConfig {
             ("mailbox_capacity", self.mailbox_capacity),
             ("event_capacity", self.event_capacity),
             ("max_batch_size", self.max_batch_size),
+            ("max_prefill_batch_size", self.max_prefill_batch_size),
         ] {
             if value == 0 {
                 return Err(ConfigError(format!("{name} must be positive")));

@@ -14,7 +14,7 @@ Read the diagrams in order for a walkthrough, or jump to a question:
 | What happens when the user interrupts? | [6. Interruption](#6-interruption) |
 | What is freed or saved at disconnect? | [7. Closing a session](#7-closing-a-session) |
 
-These diagrams describe the current implementation. An intermediate 10 Hz checkpoint has passed a small [RTX 3090 integration check](DEPLOYMENT_3090.md), including real speech over the gateway. Final-checkpoint quality, multi-GPU behavior and capacity still need [hardware validation](HARDWARE_VALIDATION.md). Earlier local tests used a separate synthetic worker; see [those results](LOCAL_VALIDATION.md).
+These diagrams describe the current implementation. The completed 10 Hz checkpoint has passed [RTX 3090 runtime benchmarks](GPU_BENCHMARK_3090.md), including real speech over the gateway. Model quality, multi-GPU behavior and sustained capacity still need validation. The optional [preparation path](ENDPOINTING_PREPARATION.md) overlaps encoding and prefill with end-of-turn detection. Earlier local tests used a separate synthetic worker; see [those results](LOCAL_VALIDATION.md).
 
 ## 1. Whole system
 
@@ -167,7 +167,7 @@ flowchart TB
 | Text conversion | Incremental UTF-8 text from the proposed token | Python CPU |
 | Scheduling and acceptance | Select work, fence stale results, decide which tokens are committed | Rust CPU actor |
 
-Whisper is bidirectional, which is why current serving waits for the complete utterance. A text proposal is **not automatically fed back into the model**: Rust must accept it first. Python never runs an independent, uninterruptible response-generation loop.
+Whisper is bidirectional, so encoding uses a complete candidate waveform rather than permanently appending partial-utterance embeddings. The ordinary path starts at commit. Optional `prepare` starts earlier against an isolated conversation-cache branch and holds its first token privately; matching commit activates it without another forward. Resumed audio discards that branch. See the [preparation diagrams](ENDPOINTING_PREPARATION.md). A text proposal is **not automatically fed back into the model**: Rust must accept it first. Python never runs an independent, uninterruptible response-generation loop.
 
 **Inspect:** [model loading and forwards](../backend/src/voice_worker/model.py), [projector](../backend/src/voice_worker/projector.py), [prefill/decode orchestration](../backend/src/voice_worker/pytorch_engine.py), [detokenization](../backend/src/voice_worker/detokenizer.py).
 
@@ -216,6 +216,7 @@ Solid arrows show data movement; dotted arrows show ownership or bookkeeping rel
 | Last accepted token awaiting model consumption | Rust worker actor, RAM | Until the next decode/prefill request acknowledges it |
 | Pending proposal and detokenizer state | Python model owner, RAM | Until acceptance, interruption or close |
 | Attention KV and convolution/recurrent state | Python-owned tensors on the assigned GPU | Across turns, released on close/disconnect or invalidating failure |
+| Optional provisional conversation branch and first token | Python model owner; tensor state on the assigned GPU | From preparation until activation or discard; at most one per session, with a separate cache reservation |
 | Model weights | Python-owned GPU tensors | Process lifetime; shared by that worker's sessions |
 | Batched cache copies and intermediate tensors | Python/PyTorch, mainly GPU | Temporary forward workspace; allocator memory may remain reserved for reuse |
 | Session archive | Local filesystem, default `session-archives/` | Persists after session close; no automatic retention/deletion policy |
@@ -238,10 +239,10 @@ flowchart TB
     wait["Keep processing control/input<br/>Wait for backend completion"]
     completion["Completion: validate identities and generation<br/>Accept current tokens, discard stale proposals"]
     costs["Observed costs<br/>Phase, batch size, context bucket"]
-    selection["Select eligible work<br/>Close/open first; then prefill or decode"]
-    control["Close or open<br/>Control batch"]
+    selection["Select eligible work<br/>Close/discard/open/activate first; then prefill or decode"]
+    control["Close, discard, open or activate<br/>Control batch; activation uses held token"]
     decode["Decode: earliest next-token targets<br/>Dynamic batch up to configured limit"]
-    prefill["Prefill: oldest queued complete utterance<br/>One session per current scheduling batch"]
+    prefill["Prefill or Prepare: oldest eligible operation class<br/>Up to max_prefill_batch_size sessions"]
     build["Build homogeneous batch request"]
     execution["Execution task sends request<br/>One forward request in flight per worker"]
     backend["Python worker computes and returns results"]
@@ -262,11 +263,11 @@ flowchart TB
 
 The target is at least **four accepted model tokens/second per generating session after its first token**. The scheduler uses a 250 ms next-token target; first-token latency (TTFT) is measured separately. It can run work earlier than the target and does not deliberately pace fast responses at four tokens/second.
 
-Prefill normally uses available decode slack. The policy also considers consecutive decode batches, and an admitted prefill waiting beyond `max_prefill_wait_ms` (initially 2000 ms) must run. A long nonpreemptive forward can therefore cause token-gap violations; the runtime reports them. Admission has separate resident-session/cache limits and active-turn/compute limits, so an open idle session does not imply unlimited simultaneous generation capacity.
+Prefill and preparation normally use available decode slack. The policy also considers consecutive decode batches, and admitted work waiting beyond `max_prefill_wait_ms` (default 100 ms) must run. Compatible operations form batches up to `max_prefill_batch_size` (default four, also bounded by the worker's batch limit). Prepare and ordinary Prefill use separate homogeneous requests. A long nonpreemptive forward can therefore cause token-gap violations; the runtime reports them. Admission has separate resident-session/cache limits and active-turn/compute limits, so an open idle session does not imply unlimited simultaneous generation capacity.
 
 Observed costs use conservative recent measurements, with no assumption that a half-filled batch takes half the time. Unknown shapes use conservative estimates. On real hardware these estimates and limits must be tuned from measurements.
 
-**Current pipeline boundary:** the actor receives commands and updates eligibility while inference runs. The next concrete batch request is selected and built after the current completion; there is no second fully prepared GPU batch in flight or a separate background batch builder. Decode tensors are joined by Python when that request executes. Prefill scheduling currently submits one utterance at a time, even though the Python backend can group compatible prefills.
+**Current pipeline boundary:** the actor receives commands and updates eligibility while inference runs. The next concrete batch request is selected and built after the current completion; there is no second fully prepared GPU batch in flight or a separate background batch builder. Decode tensors are joined by Python when that request executes. Preparation overlaps with external endpoint detection, not with a second forward on the same GPU.
 
 Bounded worker job and completion channels each have capacity one. The ingress, worker commands, session events, socket writer and archive queues also have explicit bounds. Ordinary command saturation rejects work; a slow output consumer stops its own session. Archive saturation waits during bounded connection teardown rather than dropping a record or blocking a GPU scheduler.
 
@@ -339,10 +340,10 @@ On ordinary close, backend state is released before the record is transferred. I
 
 Use these questions to compare the implementation with the intended product:
 
-- **Input:** Is complete-utterance processing at client `commit` appropriate, or should a future encoder support incremental audio? Current Whisper processing starts only at commit.
+- **Input:** Is candidate-based preparation during endpoint detection enough, or should a future encoder support incremental audio? Current Whisper recomputes each complete candidate; changed audio invalidates its provisional branch.
 - **Latency:** Is four model tokens/second sufficient, and what TTFT target should be added? The runtime currently reports TTFT without enforcing a service-level TTFT target.
 - **History:** Should an already-running cancelled prefill remain part of the model's conversation? Current cancellation preserves its valid cache effects and retains all received audio in the audit.
 - **Storage:** Are bounded RAM records plus JSON archives enough? There is no crash recovery or archive replay, and archived PCM integer arrays are larger than binary audio sidecars.
-- **Throughput:** Is the first single-utterance prefill policy enough? Multi-session prefill scheduling, background prepared batches and reduced cache-copy overhead remain possible improvements after GPU profiling.
+- **Throughput:** Are the bounded prefill batches and reactive admission limits appropriate? Background batch construction and reduced cache-copy overhead remain possible improvements after GPU profiling.
 
 For detailed wire fields use [WORKER_PROTOCOL.md](WORKER_PROTOCOL.md). For configurable limits see [examples/runtime.json](../examples/runtime.json) and [backend/config.example.json](../backend/config.example.json). For tested behavior use [LOCAL_VALIDATION.md](LOCAL_VALIDATION.md); for tomorrow's real-model checks use [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md).

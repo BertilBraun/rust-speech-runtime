@@ -16,6 +16,11 @@ pub enum ClientControl {
     StartTurn {
         turn_id: TurnId,
     },
+    Prepare {
+        turn_id: TurnId,
+        chunk_count: u32,
+        sample_count: usize,
+    },
     Commit {
         turn_id: TurnId,
         chunk_count: u32,

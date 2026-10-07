@@ -3,7 +3,7 @@
 import logging
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import cast
 
 import torch
@@ -17,9 +17,12 @@ from voice_worker.engine import Engine
 from voice_worker.model import ASSISTANT_SUFFIX, EOS, USER_PREFIX, SpeechModel, pseudo_token_count
 from voice_worker.protocol import (
     AcceptedToken,
+    Activate,
     Close,
     Closed,
     Decode,
+    Discarded,
+    DiscardPrepared,
     ErrorCode,
     Failed,
     Memory,
@@ -28,6 +31,7 @@ from voice_worker.protocol import (
     Operation,
     OperationResult,
     Prefill,
+    Prepare,
     Ready,
     Request,
     Response,
@@ -41,7 +45,7 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class PreparedPrefill:
-    operation: Prefill
+    operation: Prefill | Prepare
     session: ModelSession
     audio: bytes
     prefix: tuple[int, ...]
@@ -49,15 +53,26 @@ class PreparedPrefill:
 
 @dataclass(frozen=True)
 class PreparedForward:
-    operation: Prefill | Decode
+    operation: Prefill | Prepare | Decode
     session: ModelSession
     embeddings: Tensor
 
 
-def result_for(operation: Operation, outcome: Opened | Closed | Token | Failed) -> OperationResult:
+@dataclass(frozen=True)
+class ProvisionalSession:
+    session: ModelSession
+    token: Token
+    source_cache: DynamicCache
+
+
+def result_for(
+    operation: Operation, outcome: Opened | Closed | Discarded | Token | Failed
+) -> OperationResult:
     match operation:
         case (
             Prefill(turn_id=turn_id, generation=generation)
+            | Prepare(turn_id=turn_id, generation=generation)
+            | Activate(turn_id=turn_id, generation=generation)
             | Decode(turn_id=turn_id, generation=generation)
         ):
             return OperationResult(
@@ -67,7 +82,7 @@ def result_for(operation: Operation, outcome: Opened | Closed | Token | Failed) 
                 generation=generation,
                 outcome=outcome,
             )
-        case Open() | Close():
+        case Open() | Close() | DiscardPrepared():
             return OperationResult(
                 operation_id=operation.operation_id,
                 session_id=operation.session_id,
@@ -80,6 +95,7 @@ class PyTorchEngine(Engine):
         self.configuration = configuration
         self.model = model
         self.sessions: dict[str, ModelSession] = {}
+        self.prepared_sessions: dict[str, ProvisionalSession] = {}
         self.reservation = reservation_bytes(model.text_config, configuration.max_context_tokens)
         if self.reservation > configuration.cache_budget_bytes:
             raise ValueError("Cache budget cannot reserve even one complete session")
@@ -93,6 +109,7 @@ class PyTorchEngine(Engine):
         )
 
     def reset(self) -> None:
+        self.prepared_sessions.clear()
         self.sessions.clear()
 
     def execute(self, request: Request, body: bytes) -> Response:
@@ -114,10 +131,22 @@ class PyTorchEngine(Engine):
                         self._close(cast(Close, operation)) for operation in request.operations
                     )
                     timing = Timing()
-                case Prefill():
+                case Prefill() | Prepare():
                     results, timing = self._prefill(
-                        cast(tuple[Prefill, ...], request.operations), body
+                        cast(tuple[Prefill | Prepare, ...], request.operations), body
                     )
+                case Activate():
+                    results = tuple(
+                        self._activate(cast(Activate, operation))
+                        for operation in request.operations
+                    )
+                    timing = Timing()
+                case DiscardPrepared():
+                    results = tuple(
+                        self._discard_prepared(cast(DiscardPrepared, operation))
+                        for operation in request.operations
+                    )
+                    timing = Timing()
                 case Decode():
                     results, timing = self._decode(cast(tuple[Decode, ...], request.operations))
         return Response(
@@ -148,7 +177,7 @@ class PyTorchEngine(Engine):
             return result_for(
                 operation, Failed(code=ErrorCode.SESSION_EXISTS, message="Session already exists")
             )
-        reserved = (len(self.sessions) + 1) * self.reservation
+        reserved = (len(self.sessions) + len(self.prepared_sessions) + 1) * self.reservation
         free = self._available_memory()
         if (
             len(self.sessions) >= self.configuration.max_sessions
@@ -176,19 +205,61 @@ class PyTorchEngine(Engine):
     def _unmaterialized_reservations(self) -> int:
         return sum(
             max(0, self.reservation - cache_bytes(session.cache, self.model.text_config))
-            for session in self.sessions.values()
+            for session in (
+                *self.sessions.values(),
+                *(prepared.session for prepared in self.prepared_sessions.values()),
+            )
         )
 
     def _close(self, operation: Close) -> OperationResult:
+        self.prepared_sessions.pop(operation.session_id, None)
         self.sessions.pop(operation.session_id, None)
         return result_for(operation, Closed())
 
+    def _discard_prepared(self, operation: DiscardPrepared) -> OperationResult:
+        self.prepared_sessions.pop(operation.session_id, None)
+        return result_for(operation, Discarded())
+
+    def _activate(self, operation: Activate) -> OperationResult:
+        session = self.sessions.get(operation.session_id)
+        if session is None:
+            return result_for(
+                operation, Failed(code=ErrorCode.SESSION_NOT_FOUND, message="No cache handle")
+            )
+        prepared = self.prepared_sessions.get(operation.session_id)
+        if (
+            prepared is None
+            or prepared.session.turn_id != operation.turn_id
+            or prepared.session.generation != operation.generation
+            or prepared.source_cache is not session.cache
+        ):
+            return result_for(
+                operation,
+                Failed(code=ErrorCode.INVALID_STATE, message="No matching prepared turn"),
+            )
+        self.prepared_sessions.pop(operation.session_id)
+        self.sessions[operation.session_id] = prepared.session
+        return result_for(operation, prepared.token)
+
+    def _preparation_has_capacity(self, pending: int) -> bool:
+        reserved = (
+            len(self.sessions) + len(self.prepared_sessions) + pending + 1
+        ) * self.reservation
+        return (
+            reserved <= self.configuration.cache_budget_bytes
+            and self._available_memory()
+            >= self.configuration.workspace_reserve_bytes
+            + self._unmaterialized_reservations()
+            + (pending + 1) * self.reservation
+        )
+
     def _prefill(
-        self, operations: tuple[Prefill, ...], body: bytes
+        self, operations: tuple[Prefill | Prepare, ...], body: bytes
     ) -> tuple[tuple[OperationResult, ...], Timing]:
         prepared = []
         results = []
         for operation in operations:
+            self.prepared_sessions.pop(operation.session_id, None)
             session = self.sessions.get(operation.session_id)
             if session is None:
                 results.append(
@@ -198,6 +269,20 @@ class PyTorchEngine(Engine):
                     )
                 )
                 continue
+            match operation:
+                case Prepare():
+                    if not self._preparation_has_capacity(len(prepared)):
+                        results.append(
+                            result_for(
+                                operation,
+                                Failed(
+                                    code=ErrorCode.CAPACITY_EXCEEDED,
+                                    message="Provisional cache capacity exhausted",
+                                ),
+                            )
+                        )
+                        continue
+                    session = replace(session)
             audio = body[operation.audio_offset : operation.audio_offset + operation.audio_bytes]
             try:
                 if operation.audio_bytes > 960_000:
@@ -240,15 +325,24 @@ class PyTorchEngine(Engine):
                 )
                 for item, speech in zip(prepared, projected, strict=True)
             )
-            completed, forward_ms = self._forward_groups(forwards)
+            match operations[0]:
+                case Prepare():
+                    provisional_count = len(prepared)
+                case Prefill():
+                    provisional_count = 0
+            completed, forward_ms = self._forward_groups(forwards, provisional_count)
             results.extend(completed)
             return tuple(results), Timing(
                 encode_ms=encoder_timer.elapsed_ms(), prefill_ms=forward_ms
             )
         except (RuntimeError, ValueError) as error:
-            LOGGER.exception("Prefill failed; affected caches invalidated")
+            LOGGER.exception("Prefill failed")
             for item in prepared:
-                self.sessions.pop(item.operation.session_id, None)
+                match item.operation:
+                    case Prefill():
+                        self.sessions.pop(item.operation.session_id, None)
+                    case Prepare():
+                        self.prepared_sessions.pop(item.operation.session_id, None)
                 results.append(
                     result_for(
                         item.operation, Failed(code=ErrorCode.BACKEND_FAILED, message=str(error))
@@ -260,6 +354,7 @@ class PyTorchEngine(Engine):
         forwards = []
         results = []
         for operation in operations:
+            self.prepared_sessions.pop(operation.session_id, None)
             session = self.sessions.get(operation.session_id)
             if session is None:
                 results.append(
@@ -315,7 +410,7 @@ class PyTorchEngine(Engine):
             return tuple(results), Timing()
 
     def _forward_groups(
-        self, forwards: tuple[PreparedForward, ...]
+        self, forwards: tuple[PreparedForward, ...], provisional_count: int = 0
     ) -> tuple[tuple[OperationResult, ...], float]:
         groups: dict[tuple[int, bool], list[PreparedForward]] = defaultdict(list)
         for item in forwards:
@@ -333,6 +428,7 @@ class PyTorchEngine(Engine):
                 free
                 < self.configuration.workspace_reserve_bytes
                 + self._unmaterialized_reservations()
+                + provisional_count * self.reservation
                 + workspace
             ):
                 results.extend(
@@ -356,7 +452,10 @@ class PyTorchEngine(Engine):
                 session = item.session
                 session.cache = cache
                 match item.operation:
-                    case Prefill(turn_id=turn_id, generation=generation):
+                    case (
+                        Prefill(turn_id=turn_id, generation=generation)
+                        | Prepare(turn_id=turn_id, generation=generation)
+                    ):
                         session.start_turn(turn_id, generation)
                         index = 0
                     case Decode(accepted=accepted):
@@ -369,15 +468,19 @@ class PyTorchEngine(Engine):
                     session.pending_text, self.model.token_piece(token), token == EOS
                 )
                 session.proposed = Proposal(proposal, text)
-                results.append(
-                    result_for(
-                        item.operation,
-                        Token(
-                            token_id=token,
-                            text_delta=text.delta,
-                            eos=token == EOS,
-                            context_tokens=session.cache.get_seq_length(),
-                        ),
-                    )
+                outcome = Token(
+                    token_id=token,
+                    text_delta=text.delta,
+                    eos=token == EOS,
+                    context_tokens=session.cache.get_seq_length(),
                 )
+                match item.operation:
+                    case Prepare():
+                        self.prepared_sessions[item.operation.session_id] = ProvisionalSession(
+                            session,
+                            outcome,
+                            self.sessions[item.operation.session_id].cache,
+                        )
+                        provisional_count -= 1
+                results.append(result_for(item.operation, outcome))
         return tuple(results), elapsed

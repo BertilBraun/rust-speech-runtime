@@ -52,6 +52,7 @@ Connect to `/v1`; other paths receive an HTTP rejection. One connection owns one
 ```json
 {"type":"open","session_id":"conversation-123"}
 {"type":"start_turn","turn_id":1}
+{"type":"prepare","turn_id":1,"chunk_count":10,"sample_count":16000}
 {"type":"commit","turn_id":1,"chunk_count":10,"sample_count":16000}
 {"type":"cancel","turn_id":1}
 {"type":"close"}
@@ -59,7 +60,9 @@ Connect to `/v1`; other paths receive an HTTP rejection. One connection owns one
 
 After `start_turn` and before `commit`, send binary messages: eight bytes of little-endian `turn_id`, four bytes of little-endian zero-based `chunk_index`, then nonempty PCM16 samples. Indices must be contiguous; commit chunk/sample counts must match exactly. Duplicate commits with identical counts are idempotent. Post-commit audio needs a new turn. `start_turn` interrupts active generation and obtains the new capture reservation; rejected turns never accept audio.
 
-Events are `opened {session_id,worker_id}`, `accepted {turn_id}`, `text_delta {turn_id,generation,sequence,token_id,text}`, `finished {turn_id,generation,reason,generated_tokens}`, `failed {turn_id,code,message}` and `closed {session_id}`. EOS is an accepted model token and may have an empty text delta. A delta is not necessarily a word or character. Counts include EOS and empty deltas. Stable enum failure codes identify rejected work.
+`prepare` is optional: send it when a pause suggests speech has ended, with counts matching the received audio so far. It starts provisional whole-utterance inference while endpoint detection continues. `prepared {turn_id,chunk_count,sample_count}` announces readiness without exposing any generated text. More audio invalidates the candidate; the client can prepare again or commit directly. Only `commit` confirms the turn and allows output. A commit arriving during preparation waits for that candidate. Preparation does not require an acknowledgement before committing.
+
+Events are `opened {session_id,worker_id}`, `accepted {turn_id}`, `prepared {turn_id,chunk_count,sample_count}`, `text_delta {turn_id,generation,sequence,token_id,text}`, `finished {turn_id,generation,reason,generated_tokens}`, `failed {turn_id,code,message}` and `closed {session_id}`. EOS is an accepted model token and may have an empty text delta. A delta is not necessarily a word or character. Counts include EOS and empty deltas. Stable enum failure codes identify rejected work.
 
 The worker actor defines acceptance order. Interruption prevents further proposals from being accepted or consumed into cache. Already accepted events retain FIFO stream order before the next turn's acceptance, even when network delivery lags. Archives record accepted output rather than a delivery acknowledgement; a broken connection can retain committed tokens the client never received.
 
@@ -70,6 +73,15 @@ Connection count, frame/message sizes, outbound queues and handshake/write/idle 
 The objective is at least four accepted model tokens per second per generating session after its first token. The 250 ms next-token target is separate from end-of-turn-to-first-token latency. Reactive admission uses observed forward durations, batch shapes and context, reserves headroom and rejects turns when the budget is exhausted. It never assumes half-full batches take half the time.
 
 Client reports include TTFT and token-gap p50/p95/p99/max, aggregate throughput, per-session rates, rejections, failures and interruptions. Rolling throughput defaults to a two-second window sampled every 100 ms, including stalls without new output. Gaps above target are reported separately. Short responses have no rolling sample if they never span the window; token gaps and complete-turn rates remain visible. The response timeout bounds a whole generation. Aggregate wall throughput includes capture/thinking time; per-turn token rates exclude those phases. Churn closes conversations between rounds and creates fresh sessions.
+
+To compare endpoint preparation fairly, use the same endpoint confirmation delay for both runs:
+
+```powershell
+cargo run --release -- benchmark --sessions 8 --endpointing-ms 300 --report benchmark-results/endpoint-baseline.json
+cargo run --release -- benchmark --sessions 8 --endpointing-ms 300 --prepare-before-commit --report benchmark-results/endpoint-prepared.json
+```
+
+TTFT begins when the client sends the definitive commit, after the confirmation delay. Reports also measure the actual confirmation interval and last-audio-to-first-token latency, so moving work into endpoint detection does not conceal the full user-visible wait. The example client prepares during a fixed 300 ms delay; it does not implement voice activity or end-of-turn detection.
 
 On Ctrl+C, the gateway closes sessions, drains archive work and prints admissions/rejections, stale proposals, saturation, queue/forward/stage distributions, batch fill, worker utilization and backend memory observations. Speech quality, GPU cache parity, VRAM limits and sustainable concurrency require the trained checkpoint and hardware validation.
 

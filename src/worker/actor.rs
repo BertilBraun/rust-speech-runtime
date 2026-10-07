@@ -114,6 +114,7 @@ impl WorkerActor {
                 && let Some((kind, keys)) = select_batch(
                     &self.sessions,
                     self.config.max_batch_size.min(self.ready.max_batch_size),
+                    self.config.max_prefill_batch_size,
                     self.consecutive_decode_batches,
                     &self.costs,
                     Duration::from_millis(self.config.max_prefill_wait_ms),

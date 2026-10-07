@@ -4,6 +4,7 @@ mod batch;
 mod commands;
 mod completion;
 mod output;
+mod preparation;
 
 use crate::{
     config::{RuntimeConfig, WorkerConfig},
@@ -40,6 +41,13 @@ pub(crate) enum Command {
         turn_id: TurnId,
         chunk_index: u32,
         audio: Bytes,
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    Prepare {
+        key: String,
+        turn_id: TurnId,
+        chunk_count: u32,
+        sample_count: usize,
         reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
     Commit {

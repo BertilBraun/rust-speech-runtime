@@ -22,6 +22,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .audio(turn_id, chunk, Bytes::from(vec![0; 3200]))
                 .await?;
         }
+        client.prepare(turn_id, 10, 16_000).await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         client.commit(turn_id, 10, 16_000).await?;
         loop {
             match client.next_event().await? {

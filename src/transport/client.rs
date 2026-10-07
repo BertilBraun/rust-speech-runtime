@@ -88,6 +88,20 @@ impl VoiceClient {
         .await
     }
 
+    pub async fn prepare(
+        &mut self,
+        turn_id: TurnId,
+        chunk_count: u32,
+        sample_count: usize,
+    ) -> Result<(), GatewayError> {
+        self.send_control(ClientControl::Prepare {
+            turn_id,
+            chunk_count,
+            sample_count,
+        })
+        .await
+    }
+
     pub async fn commit(
         &mut self,
         turn_id: TurnId,

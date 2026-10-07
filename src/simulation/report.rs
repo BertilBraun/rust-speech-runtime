@@ -47,6 +47,8 @@ impl SessionSummary {
 
 #[derive(Debug, Serialize)]
 pub struct SimulationReport {
+    pub prepare_before_commit: bool,
+    pub endpointing_ms: u64,
     pub elapsed_seconds: f64,
     pub offered_sessions: usize,
     pub admitted_sessions: usize,
@@ -62,6 +64,8 @@ pub struct SimulationReport {
     pub sessions_with_rolling_rate_violations: usize,
     pub token_gaps_over_target: usize,
     pub time_to_first_token_ms: LatencyDistribution,
+    pub end_of_audio_to_first_token_ms: LatencyDistribution,
+    pub endpoint_confirmation_ms: LatencyDistribution,
     pub token_gap_ms: LatencyDistribution,
     pub sessions: Vec<SessionSummary>,
 }

@@ -3,15 +3,18 @@
 import argparse
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from voice_worker.engine import Engine
 from voice_worker.framing import FrameLimits
 from voice_worker.protocol import (
     AcceptedToken,
+    Activate,
     Close,
     Closed,
     Decode,
+    Discarded,
+    DiscardPrepared,
     ErrorCode,
     Failed,
     Memory,
@@ -19,6 +22,7 @@ from voice_worker.protocol import (
     Opened,
     OperationResult,
     Prefill,
+    Prepare,
     Ready,
     Request,
     Response,
@@ -46,10 +50,19 @@ class FixtureSession:
     audio_bytes: int = 0
 
 
+@dataclass(frozen=True)
+class FixturePreparation:
+    session: FixtureSession
+    turn_id: int
+    generation: int
+    token: Token
+
+
 class FixtureEngine(Engine):
     def __init__(self, configuration: FixtureConfig) -> None:
         self.configuration = configuration
         self.sessions: dict[str, FixtureSession] = {}
+        self.prepared_sessions: dict[str, FixturePreparation] = {}
 
     def ready(self) -> Ready:
         return Ready(
@@ -60,6 +73,7 @@ class FixtureEngine(Engine):
         )
 
     def reset(self) -> None:
+        self.prepared_sessions.clear()
         self.sessions.clear()
 
     def execute(self, request: Request, body: bytes) -> Response:
@@ -72,7 +86,7 @@ class FixtureEngine(Engine):
         prefill_ms = 0.0
         decode_ms = 0.0
         match request.operations[0]:
-            case Prefill():
+            case Prefill() | Prepare():
                 time.sleep(self.configuration.prefill_ms / 1000)
                 prefill_ms = (time.perf_counter() - started) * 1000
             case Decode():
@@ -96,9 +110,32 @@ class FixtureEngine(Engine):
                         self.sessions[identifier] = FixtureSession()
                         outcome = Opened()
                 case Close(session_id=identifier):
+                    self.prepared_sessions.pop(identifier, None)
                     self.sessions.pop(identifier, None)
                     outcome = Closed()
-                case Prefill(session_id=identifier):
+                case DiscardPrepared(session_id=identifier):
+                    self.prepared_sessions.pop(identifier, None)
+                    outcome = Discarded()
+                case Activate(session_id=identifier, turn_id=turn_id, generation=generation):
+                    prepared = self.prepared_sessions.get(identifier)
+                    if identifier not in self.sessions:
+                        outcome = Failed(
+                            code=ErrorCode.SESSION_NOT_FOUND, message="Unknown cache handle"
+                        )
+                    elif (
+                        prepared is None
+                        or prepared.turn_id != turn_id
+                        or prepared.generation != generation
+                    ):
+                        outcome = Failed(
+                            code=ErrorCode.INVALID_STATE, message="No matching prepared turn"
+                        )
+                    else:
+                        self.sessions[identifier] = prepared.session
+                        self.prepared_sessions.pop(identifier)
+                        outcome = prepared.token
+                case Prefill(session_id=identifier) | Prepare(session_id=identifier):
+                    self.prepared_sessions.pop(identifier, None)
                     turn_id = operation.turn_id
                     generation = operation.generation
                     session = self.sessions.get(identifier)
@@ -116,6 +153,9 @@ class FixtureEngine(Engine):
                             code=ErrorCode.INVALID_INPUT, message="Invalid accepted token"
                         )
                     else:
+                        match operation:
+                            case Prepare():
+                                session = replace(session)
                         if (
                             operation.accepted is not None
                             and operation.accepted != session.consumed
@@ -125,7 +165,13 @@ class FixtureEngine(Engine):
                         session.context_tokens += 12 + (operation.audio_bytes + 3199) // 3200
                         session.consumed = None
                         outcome = self._propose(session, turn_id, 0)
+                        match operation, outcome:
+                            case Prepare(), Token():
+                                self.prepared_sessions[identifier] = FixturePreparation(
+                                    session, turn_id, generation, outcome
+                                )
                 case Decode(session_id=identifier, accepted=accepted):
+                    self.prepared_sessions.pop(identifier, None)
                     turn_id = operation.turn_id
                     generation = operation.generation
                     session = self.sessions.get(identifier)
@@ -161,7 +207,11 @@ class FixtureEngine(Engine):
             ),
             memory=Memory(
                 allocated_bytes=sum(
-                    session.context_tokens * 12288 for session in self.sessions.values()
+                    session.context_tokens * 12288
+                    for session in (
+                        *self.sessions.values(),
+                        *(prepared.session for prepared in self.prepared_sessions.values()),
+                    )
                 )
             ),
         )

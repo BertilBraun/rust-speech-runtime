@@ -49,6 +49,11 @@ pub enum SessionEvent {
     Accepted {
         turn_id: TurnId,
     },
+    Prepared {
+        turn_id: TurnId,
+        chunk_count: u32,
+        sample_count: usize,
+    },
     TextDelta {
         turn_id: TurnId,
         generation: u64,

@@ -163,6 +163,15 @@ fn print_summary(report: &SimulationReport) {
         report.time_to_first_token_ms.max_ms
     );
     println!(
+        "endpoint confirmation: {} ms configured, preparation {}; last audio to first token p50/p95/p99/max: {:.1}/{:.1}/{:.1}/{:.1} ms",
+        report.endpointing_ms,
+        report.prepare_before_commit,
+        report.end_of_audio_to_first_token_ms.p50_ms,
+        report.end_of_audio_to_first_token_ms.p95_ms,
+        report.end_of_audio_to_first_token_ms.p99_ms,
+        report.end_of_audio_to_first_token_ms.max_ms,
+    );
+    println!(
         "token gap p50/p95/p99/max: {:.1}/{:.1}/{:.1}/{:.1} ms; {} gaps above target; {} sessions below rolling rate",
         report.token_gap_ms.p50_ms,
         report.token_gap_ms.p95_ms,
