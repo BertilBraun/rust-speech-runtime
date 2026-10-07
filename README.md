@@ -1,4 +1,4 @@
-# Turn-based speech inference in Rust
+# rust-speech-runtime
 
 A Rust/Tokio gateway serves persistent speech conversations through ordinary WebSocket connections. Clients send audio, mark the end of a user turn, and receive streamed text. Sessions stay on one GPU worker, retaining their model cache across turns. Rust schedules the work; a persistent PyTorch process per GPU performs real inference.
 
@@ -198,3 +198,7 @@ Ordinary tests cover placement, admission, dynamic batching, full hybrid cache s
 | [Earlier GPU benchmark](docs/GPU_BENCHMARK_3090.md), [concurrency sweep](docs/GPU_IMMEDIATE_COMMIT_3090.md), [endpointing experiment](docs/GPU_ENDPOINTING_3090.md) | Historical evidence and its limitations |
 
 This prototype does not implement crash recovery, automatic history replay, cache migration, paged allocation or silent context truncation. Hybrid cache join/split currently copies tensors; unequal context lengths require padding. Short repeated-recording trials do not establish sustainable production capacity, general speech quality or external-network latency. [PERFORMANCE.md](PERFORMANCE.md) concerns the superseded audio-echo prototype and does not describe this model's capacity.
+
+## License
+
+The scheduler and worker code are licensed under the [MIT License](LICENSE).
