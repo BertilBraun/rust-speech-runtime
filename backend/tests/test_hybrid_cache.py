@@ -6,6 +6,7 @@ from torch import Tensor
 from transformers import Qwen3_5ForCausalLM
 from transformers.cache_utils import DynamicCache
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.models.qwen3_5 import modeling_qwen3_5
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from voice_worker.cache import (
@@ -48,7 +49,13 @@ def tiny_model() -> Qwen3_5ForCausalLM:
         pad_token_id=0,
         eos_token_id=63,
     )
-    model = Qwen3_5ForCausalLM(configuration).eval()
+    # CPU fixtures must use reference kernels even when CUDA extensions are installed.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(modeling_qwen3_5, "causal_conv1d_fn", None)
+        patch.setattr(modeling_qwen3_5, "causal_conv1d_update", None)
+        patch.setattr(modeling_qwen3_5, "chunk_gated_delta_rule", None)
+        patch.setattr(modeling_qwen3_5, "fused_recurrent_gated_delta_rule", None)
+        model = Qwen3_5ForCausalLM(configuration).eval()
     model.config._attn_implementation = "sdpa"
     return model
 

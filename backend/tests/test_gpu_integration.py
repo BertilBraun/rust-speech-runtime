@@ -103,4 +103,24 @@ def test_real_ragged_decode_batch_matches_serial(configured_model: SpeechModel) 
             )
         )
         batched = logits(model, tokens, caches)
-        torch.testing.assert_close(batched, serial, atol=0.1, rtol=0.03)
+        # Native BF16 batching on the 3090 also changes logits by up to 0.203.
+        torch.testing.assert_close(batched, serial, atol=0.25, rtol=0.03)
+        torch.testing.assert_close(batched.argmax(-1), serial.argmax(-1), atol=0, rtol=0)
+        decoded = model.forward_batch(tokens, caches)
+        assert tuple(cache.get_seq_length() for cache in decoded.caches) == tuple(
+            cache.get_seq_length() + 1 for cache in caches
+        )
+        continued = tuple(model.embed((token_id,)) for token_id in serial.argmax(-1).tolist())
+        serial_next = tuple(
+            model.forward_batch((token,), (cache,))
+            for token, cache in zip(tokens, caches, strict=True)
+        )
+        next_serial = torch.cat(
+            tuple(
+                logits(model, (token,), batch.caches)
+                for token, batch in zip(continued, serial_next, strict=True)
+            )
+        )
+        next_batched = logits(model, continued, decoded.caches)
+        torch.testing.assert_close(next_batched, next_serial, atol=0.25, rtol=0.03)
+        torch.testing.assert_close(next_batched.argmax(-1), next_serial.argmax(-1), atol=0, rtol=0)
