@@ -149,7 +149,7 @@ class PyTorchEngine(Engine):
                 operation, Failed(code=ErrorCode.SESSION_EXISTS, message="Session already exists")
             )
         reserved = (len(self.sessions) + 1) * self.reservation
-        free, _ = torch.cuda.mem_get_info(self.model.device)
+        free = self._available_memory()
         if (
             len(self.sessions) >= self.configuration.max_sessions
             or reserved > self.configuration.cache_budget_bytes
@@ -166,6 +166,12 @@ class PyTorchEngine(Engine):
             DynamicCache(config=self.model.text_config)
         )
         return result_for(operation, Opened())
+
+    def _available_memory(self) -> int:
+        free, total = torch.cuda.mem_get_info(self.model.device)
+        quota = int(total * self.configuration.allocator_memory_fraction)
+        reserved = torch.cuda.memory_reserved(self.model.device)
+        return min(free, max(0, quota - reserved))
 
     def _unmaterialized_reservations(self) -> int:
         return sum(
@@ -322,7 +328,7 @@ class PyTorchEngine(Engine):
             workspace = batch_workspace_bytes(
                 self.model.text_config, lengths, group[0].embeddings.shape[0]
             )
-            free, _ = torch.cuda.mem_get_info(self.model.device)
+            free = self._available_memory()
             if (
                 free
                 < self.configuration.workspace_reserve_bytes

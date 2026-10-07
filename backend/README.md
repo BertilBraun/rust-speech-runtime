@@ -1,6 +1,6 @@
 # Persistent PyTorch speech worker
 
-One process keeps one GPU's Whisper encoder, FP32 speech projector, BF16 Qwen text model and session caches resident. Rust selects every batch and accepts every output token. The worker performs complete-utterance encoding/prefill or one decode step; it never starts an independent generation loop. The public application's audio and text remain in the Rust session record. Device count is determined by the number of configured worker endpoints.
+One process keeps one GPU's BF16 Whisper encoder, BF16 speech projector, BF16 Qwen text model and session caches resident. The trained FP32 projector weights are cast to BF16 at load time. PyTorch retains higher-precision accumulation and Qwen's FP32 recurrent state where needed. Rust selects every batch and accepts every output token. The worker performs complete-utterance encoding/prefill or one decode step; it never starts an independent generation loop. The public application's audio and text remain in the Rust session record. Device count is determined by the number of configured worker endpoints.
 
 ## Local validation and explicit benchmark fixture
 
@@ -19,6 +19,8 @@ The fixture is a separate test executable implementing the production TCP protoc
 CPU tests run the actual Transformers 5.13 Qwen hybrid model with small random weights, not a mock cache. They compare attention, convolution and recurrent state and logits for ragged decode batches, chunked multimodal-style continuations, changing membership and interruption reconciliation. Test-only model and CUDA-memory fixtures exercise the production engine's dispatch and validation. GPU integration tests are marked and skipped unless `VOICE_WORKER_CONFIG` and a CUDA device are available.
 
 Validated local lockfile: Python 3.12.13, PyTorch 2.14.1 CPU, Transformers 5.13.0, Pydantic 2.13.5. Python 3.10 or newer is supported by the project metadata; numerical checks were run on Python 3.12. PyTorch's CPU execution is used solely for these tests; the production worker requires CUDA.
+
+The [shared RTX 3090 deployment](../docs/DEPLOYMENT_3090.md) additionally validates an intermediate 10 Hz checkpoint with Python 3.12.14, PyTorch 2.6.0+cu124 and the node's existing fast kernels. Its separate environment reads existing CUDA packages without upgrading the training environment. The supported PyTorch minimum is 2.6; the local lockfile remains unchanged apart from that requirement.
 
 ## Linux GPU deployment
 
@@ -65,6 +67,8 @@ Byte-level detokenization buffers incomplete UTF-8 characters. Invalid byte sequ
 EOS itself is an accepted, recorded model token, including when its text delta is empty. Generated model-token counts include EOS; the fixture's configured ordinary response tokens are followed by one EOS token. A later prefill consumes that pending accepted EOS without inserting a second assistant-end delimiter.
 
 Session admission reserves the estimated maximum configured context's attention KV plus FP32 recurrent and BF16 convolution state against `cache_budget_bytes`. Actual free device memory must also cover every admitted session's unmaterialized reservation, the new session and `workspace_reserve_bytes`; already materialized cache tensors are excluded from this additional charge. Each forward separately reserves conservative join/split workspace using the longest padded context and appended positions for every batch row. These checks preserve remaining session reservations while transient copies coexist. `max_sessions` also gates allocation. The reserve is conservative and fixed per admitted session; it is not a paged allocator or a measured throughput guarantee. Free device memory excludes PyTorch's unused allocator blocks, so these checks can conservatively reject a batch that might fit through allocator reuse. Attention state grows only to `max_context_tokens`; context exhaustion is explicit and never silently truncates history. Closing a session or losing the gateway connection releases owned caches. A failed model forward invalidates affected sessions' caches and reports `backend_failed`.
+
+`allocator_memory_fraction` defaults to 1.0 and caps this process's PyTorch CUDA allocator. Admission and workspace checks also respect the remaining quota after allocator-reserved memory, even if other device memory is free. This does not cap allocations made directly by external CUDA libraries or partition the GPU against another process. The shared-node smoke deployment uses 0.25, one session and a resource guard; its guard tool targets the inspected Linux cgroup-v1 host and stops only its owned child.
 
 ## Measurement and tomorrow's assumptions
 

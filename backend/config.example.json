@@ -17,6 +17,7 @@
   "max_batch_size": 16,
   "cache_budget_bytes": 8589934592,
   "workspace_reserve_bytes": 2147483648,
+  "allocator_memory_fraction": 1.0,
   "max_metadata_bytes": 1048576,
   "connection_timeout_seconds": 300.0
 }

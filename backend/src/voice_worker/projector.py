@@ -1,4 +1,4 @@
-"""The trained FP32 LayerNorm, pool-five, MLP speech interface."""
+"""The trained LayerNorm, pool-five, MLP speech interface."""
 
 import torch
 from torch import Tensor, nn
@@ -23,5 +23,5 @@ class SpeechProjector(nn.Module):
         self.projection = nn.Sequential(nn.Linear(768, 1024), nn.GELU(), nn.Linear(1024, 2048))
 
     def forward(self, features: Tensor) -> Tensor:
-        normalized = self.normalization(features.to(torch.float32))
+        normalized = self.normalization(features.to(self.normalization.weight.dtype))
         return self.projection(mean_pool(normalized))

@@ -30,8 +30,9 @@ def test_last_pool_block_uses_real_frames() -> None:
     torch.testing.assert_close(mean_pool(features), expected)
 
 
-def test_exact_projector_checkpoint_layout_and_dtype() -> None:
-    projector = SpeechProjector()
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_exact_projector_checkpoint_layout_and_dtype(dtype: torch.dtype) -> None:
+    projector = SpeechProjector().to(dtype=dtype)
     assert sum(parameter.numel() for parameter in projector.parameters()) == 2888192
     assert set(projector.state_dict()) == {
         "normalization.weight",
@@ -41,4 +42,5 @@ def test_exact_projector_checkpoint_layout_and_dtype() -> None:
         "projection.2.weight",
         "projection.2.bias",
     }
-    assert projector(torch.ones(7, 768, dtype=torch.bfloat16)).dtype == torch.float32
+    assert projector(torch.ones(7, 768, dtype=torch.bfloat16)).dtype == dtype
+    assert all(parameter.dtype == dtype for parameter in projector.parameters())

@@ -2,6 +2,8 @@
 
 The turn-based pipeline targets configurable PyTorch workers. Local orchestration tests and synthetic timing runs are not model performance measurements. Run this checklist after the trained checkpoint and rented GPU node are available.
 
+A limited [shared RTX 3090 check](DEPLOYMENT_3090.md) now passes with an intermediate 10 Hz checkpoint. It covers one native-cache/replay case and small real-speech/cancellation runs. The checklist below remains necessary for final-checkpoint parity, broader batching and capacity validation.
+
 ## Record the deployment
 
 Record GPU model/count, VRAM, driver, CUDA, PyTorch and Transformers versions, model/tokenizer revisions, projector SHA256, prompt version, decoding settings, scheduler limits and Git revision. Preserve the full configuration with each benchmark. Two 3090s are an initial experiment, not a topology invariant.

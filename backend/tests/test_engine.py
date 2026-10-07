@@ -14,6 +14,7 @@ from voice_worker.model import SpeechModel, StageTimer, pseudo_token_count
 from voice_worker.protocol import (
     AcceptedToken,
     Decode,
+    ErrorCode,
     Failed,
     Open,
     Opened,
@@ -189,6 +190,34 @@ def test_open_reserves_unmaterialized_cache_against_actual_free_memory(
     assert isinstance(response.results[0].outcome, Opened)
     assert all(isinstance(result.outcome, Failed) for result in response.results[1:])
     assert len(engine.sessions) == 1
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [Open(operation_id=1, session_id="b"), prefill("a", 1, 1, 1, 0, 3200)],
+)
+def test_process_allocator_quota_rejects_work_even_when_device_memory_is_free(
+    engine: PyTorchEngine, monkeypatch: pytest.MonkeyPatch, operation: Open | Prefill
+) -> None:
+    execute(engine, (Open(operation_id=0, session_id="a"),))
+    engine.configuration = WorkerConfig(
+        model=engine.configuration.model, device="cuda:0", allocator_memory_fraction=0.5
+    )
+
+    def quota_consumed(device: torch.device) -> int:
+        return 2**39
+
+    monkeypatch.setattr(torch.cuda, "memory_reserved", quota_consumed)
+    match operation:
+        case Open():
+            response = execute(engine, (operation,))
+        case Prefill():
+            response = execute(engine, (operation,), bytes(3200))
+    outcome = response.results[0].outcome
+    assert isinstance(outcome, Failed)
+    assert outcome.code is ErrorCode.CAPACITY_EXCEEDED
+    assert set(engine.sessions) == {"a"}
+    assert engine.sessions["a"].cache.get_seq_length() == 0
 
 
 def test_materialized_cache_is_not_charged_twice_against_free_memory(

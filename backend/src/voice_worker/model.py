@@ -83,6 +83,9 @@ class SpeechModel:
         self.device = torch.device(configuration.device)
         if not torch.cuda.is_available():
             raise ValueError("The production PyTorch worker requires a CUDA device")
+        torch.cuda.set_per_process_memory_fraction(
+            configuration.allocator_memory_fraction, self.device
+        )
         checkpoint = configuration.model.projector_checkpoint
         with checkpoint.open("rb") as stream:
             checksum = hashlib.sha256()
@@ -112,7 +115,7 @@ class SpeechModel:
         self.extractor = WhisperFeatureExtractor.from_pretrained(
             configuration.model.encoder_model, revision=configuration.model.encoder_revision
         )
-        self.projector = SpeechProjector().to(self.device, dtype=torch.float32)
+        self.projector = SpeechProjector().to(self.device, dtype=torch.bfloat16)
         self.projector.load_state_dict(
             load_file(str(checkpoint), device=str(self.device)), strict=True
         )

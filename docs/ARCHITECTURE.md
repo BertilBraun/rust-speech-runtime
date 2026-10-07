@@ -14,7 +14,7 @@ Read the diagrams in order for a walkthrough, or jump to a question:
 | What happens when the user interrupts? | [6. Interruption](#6-interruption) |
 | What is freed or saved at disconnect? | [7. Closing a session](#7-closing-a-session) |
 
-These diagrams describe the current implementation. The real PyTorch adapter is implemented, but trained-checkpoint inference and GPU performance still need [hardware validation](HARDWARE_VALIDATION.md). Local tests use a separate synthetic worker over the same network interface; see [verified results](LOCAL_VALIDATION.md).
+These diagrams describe the current implementation. An intermediate 10 Hz checkpoint has passed a small [RTX 3090 integration check](DEPLOYMENT_3090.md), including real speech over the gateway. Final-checkpoint quality, multi-GPU behavior and capacity still need [hardware validation](HARDWARE_VALIDATION.md). Earlier local tests used a separate synthetic worker; see [those results](LOCAL_VALIDATION.md).
 
 ## 1. Whole system
 
@@ -132,7 +132,7 @@ flowchart TB
     end
     subgraph gpu["Assigned GPU - PyTorch"]
         encoder["Whisper Small encoder<br/>BF16"]
-        projector["Speech projector - FP32<br/>LayerNorm, mean-pool five, MLP"]
+        projector["Speech projector - BF16 serving weights<br/>LayerNorm, mean-pool five, MLP"]
         speech["Speech embeddings<br/>Cast to BF16"]
         prompt["Token embeddings plus speech embeddings"]
         language["Qwen3.5-2B text model<br/>Prefill or one decode step"]

@@ -6,7 +6,7 @@ requires-python = ">=3.10"
 dependencies = [
   "pydantic>=2.12,<3",
   "numpy>=2.2,<3",
-  "torch>=2.8,<3",
+  "torch>=2.6,<3",
   "transformers==5.13.0",
   "safetensors>=0.6,<1",
   "accelerate>=1.10,<2",
@@ -36,4 +36,3 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "ANN"]
-

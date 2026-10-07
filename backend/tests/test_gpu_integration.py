@@ -41,6 +41,22 @@ def logits(model: SpeechModel, prompts: Sequence[Tensor], caches: Sequence[Dynam
     return output.logits[:, -1].float().cpu()
 
 
+def native_continuation_logits(model: SpeechModel, prefix: Tensor, continuation: Tensor) -> Tensor:
+    cache = DynamicCache(config=model.text_config)
+    model.language_model(
+        inputs_embeds=prefix.unsqueeze(0), past_key_values=cache, use_cache=True, logits_to_keep=1
+    )
+    output: CausalLMOutputWithPast = model.language_model(
+        inputs_embeds=continuation.unsqueeze(0),
+        past_key_values=cache,
+        attention_mask=continuation_mask([prefix.shape[0]], continuation.shape[0], model.device),
+        position_ids=continuation_positions([prefix.shape[0]], continuation.shape[0], model.device),
+        use_cache=True,
+        logits_to_keep=1,
+    )
+    return output.logits[:, -1].float().cpu()
+
+
 @pytest.mark.integration
 def test_real_speech_multiturn_cache_matches_full_replay(configured_model: SpeechModel) -> None:
     model = configured_model
@@ -58,8 +74,11 @@ def test_real_speech_multiturn_cache_matches_full_replay(configured_model: Speec
             (torch.cat((prompts[0], next_prompt)),),
             (DynamicCache(config=model.text_config),),
         )
-        # Compare BF16 logits before interpreting possible argmax ties.
-        torch.testing.assert_close(cached, replay, atol=0.1, rtol=0.03)
+        native_logits = native_continuation_logits(model, prompts[0], next_prompt)
+        torch.testing.assert_close(cached, native_logits, atol=0, rtol=0)
+        # Native BF16 cached/replayed kernels differed by 0.198 on the shared 3090.
+        torch.testing.assert_close(cached, replay, atol=0.25, rtol=0.03)
+        torch.testing.assert_close(cached.argmax(-1), replay.argmax(-1), atol=0, rtol=0)
 
 
 @pytest.mark.integration

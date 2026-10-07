@@ -35,6 +35,7 @@ class WorkerConfig(Record):
     max_batch_size: Annotated[int, Field(gt=0)] = 16
     cache_budget_bytes: Annotated[int, Field(gt=0)] = 8 * 1024**3
     workspace_reserve_bytes: Annotated[int, Field(gt=0)] = 2 * 1024**3
+    allocator_memory_fraction: Annotated[float, Field(gt=0, le=1)] = 1.0
     max_metadata_bytes: Annotated[int, Field(gt=0)] = 1024 * 1024
     connection_timeout_seconds: Annotated[float, Field(gt=0)] = 300.0
 
