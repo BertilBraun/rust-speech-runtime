@@ -1,5 +1,7 @@
 # Device pipelining and timing experiments
 
+**Current real-model results:** see [the RTX 3090 benchmark report](docs/GPU_BENCHMARK_3090.md) for the turn-based BF16 pipeline, completed 10 Hz checkpoint, GPU correctness tests, latency distributions, throughput, admission and resource observations. The material below describes the earlier mocked periodic scheduler.
+
 **Historical workload:** this document records the periodic mocked audio-echo scheduler through revision `0a857df`. The turn-based speech-to-text overhaul replaces that runtime; these capacity, RTT and GPU utilization figures do not describe the new pipeline. See [PLAN.md](PLAN.md), [implementation evidence](docs/IMPLEMENTATION.md) and [the GPU validation checklist](docs/HARDWARE_VALIDATION.md) for its status. References below to the README code guide describe the historical source layout at the measured revisions.
 
 ## Rust code quality pass, 2026-10-06

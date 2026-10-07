@@ -1,5 +1,7 @@
 # Local pipeline validation — 2026-10-06
 
+This is the initial synthetic validation record. Subsequent actual model/GPU tests and measured throughput are documented in [the RTX 3090 benchmark report](GPU_BENCHMARK_3090.md).
+
 The Rust gateway, scheduler, Python worker protocol and ordinary WebSocket clients have been exercised together on Windows, with additional Rust tests on Ubuntu/WSL. These are synthetic serving measurements. No trained checkpoint, CUDA inference, GPU cache parity or rented GPU node was tested; see [hardware validation](HARDWARE_VALIDATION.md).
 
 The runs below retain their original 48–55 ms packet cadence. On 7 October the default workload changed to 100 ms packets for the final 10 Hz model target. These historical reports have not been rerun or relabeled; current integration checks are recorded in [MODEL_INTEGRATION.md](MODEL_INTEGRATION.md).

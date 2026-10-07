@@ -16,7 +16,7 @@ flowchart LR
 
 The agreed design is in [PLAN.md](PLAN.md), implementation decisions in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md), measured local results in [docs/LOCAL_VALIDATION.md](docs/LOCAL_VALIDATION.md), and GPU checks in [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md). The [model integration status](docs/MODEL_INTEGRATION.md) records the checked training architecture and remaining checkpoint/hardware work. [PERFORMANCE.md](PERFORMANCE.md) preserves measurements of the superseded periodic audio-echo workload; those results do not establish this model's capacity. The old TCP echo transport and simulator have been replaced.
 
-The [RTX 3090 deployment record](docs/DEPLOYMENT_3090.md) covers the preliminary 10 Hz checkpoint, BF16 serving, shared-node resource limits, real-speech smoke results and commands to start the provisioned service. Final-checkpoint quality and sustainable capacity remain unmeasured.
+The [RTX 3090 benchmark report](docs/GPU_BENCHMARK_3090.md) records the completed step-9,550 checkpoint, 65 passing on-node Python tests and real-speech workloads through 80 offered sessions. The two 32-session runs measured 148–164 aggregate model tokens/s with active-turn rejections. Churn, interruption, bounded archive backpressure and exact audio/token archival passed. The report includes percentile tables, configuration, a data-flow diagram and current startup commands. Model quality and sustained capacity remain unmeasured. The earlier [shared-node smoke deployment](docs/DEPLOYMENT_3090.md) is retained as historical evidence.
 
 ## Run the pipeline
 

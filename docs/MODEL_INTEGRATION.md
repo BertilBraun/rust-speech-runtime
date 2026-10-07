@@ -1,6 +1,6 @@
 # Model integration status — 2026-10-07
 
-The real PyTorch adapter now passes a preliminary [RTX 3090 integration check](DEPLOYMENT_3090.md) using a copied step-3,200 checkpoint from the then-active 10 Hz run. Training subsequently completed normally at step 4,775 and follow-up evaluation started; final-checkpoint selection remains pending. The training project was checked locally at revision `46ed242`; its mean-pool-five architecture matches the serving adapter. The archived 2.5 Hz research selection is superseded for this deployment.
+The completed 10 Hz step-9,550 checkpoint is integrated in an independent serving snapshot. The [RTX 3090 benchmark report](GPU_BENCHMARK_3090.md) records its exact configuration/hash, 65 passing on-node Python tests, native-cache and ragged-batch checks, multi-turn speech, interruption and throughput/admission measurements. Model-quality selection and long-duration capacity remain separate validation work. The earlier [step-3,200 shared-node check](DEPLOYMENT_3090.md) is retained as historical evidence. The mean-pool-five architecture matches the serving adapter; the archived 2.5 Hz research selection is superseded for this deployment.
 
 ## Architecture comparison
 
@@ -12,11 +12,11 @@ The real PyTorch adapter now passes a preliminary [RTX 3090 integration check](D
 | Language model | Qwen3.5-2B | Pinned Qwen3.5-2B text backbone, BF16 |
 | Prompt | Chat without system message; empty thinking block | Matching user/assistant delimiters; startup verifies token IDs |
 | Decoding | Greedy | Greedy one-step proposals accepted by Rust |
-| History | Reference configuration limits earlier text; serving target retains speech/text | Persistent attention, convolution and recurrent state; one native-cache/replay case checked on CUDA, broader validation pending |
+| History | Reference configuration limits earlier text; serving target retains speech/text | Persistent attention, convolution and recurrent state; native-cache/replay and ragged split-cache continuation checked on CUDA |
 
 The research reference is `results_preview/overnight_40k_20261007/replay/speech-projector/results_overnight_20261006/overnight_mean_10hz/config.json`. Its preview checkpoint was loaded into `SpeechProjector` on CPU with strict state-dictionary validation: all names and shapes matched. SHA256: `3e8eb8d7cb446a8f0124496ef28b03c213c9bc1f1de78876ff2a03edfdb2821a`. This checks parameter compatibility only. It is not the selected final retraining checkpoint, and no CUDA inference or output parity was tested.
 
-`backend/config.example.json` still names the earlier `teacher_20000_mlp_10hz` checkpoint and its hash. It is a deployment example, not the final trained artifact. When the final checkpoint is available, verify its accompanying configuration, compute its hash and configure each worker with that exact identity. Do not substitute the saved 2.5 Hz checkpoint: its tensor shapes can match while its pooling semantics differ.
+`backend/config.example.json` still names the earlier `teacher_20000_mlp_10hz` checkpoint and its hash. It is a deployment example; the provisioned node uses `checkpoint-9550/worker.json` with the completed checkpoint's verified hash. Any future quality-selected checkpoint should receive another independent snapshot and identity. Do not substitute the saved 2.5 Hz checkpoint: its tensor shapes can match while its pooling semantics differ.
 
 ## Capture and computation
 
@@ -44,23 +44,23 @@ Packets are not separate prefill jobs. Whisper is bidirectional, so the backend 
 
 ## Hardware experiment and remaining work
 
-The later [RTX 3090 deployment](DEPLOYMENT_3090.md) records actual CUDA checks and gateway requests using a copied intermediate checkpoint from the active 10 Hz run. The earlier CPU-only checks and pending-final-checkpoint status below are retained as the initial integration record; they do not describe the later smoke deployment as untested.
+The [current RTX 3090 report](GPU_BENCHMARK_3090.md) records actual CUDA tests and gateway workloads with the completed checkpoint after training/evaluation exited. The original CPU-only and shared-training checks remain historical records.
 
-The immediate goal is a correctness showcase: actual audio in, streamed text out, multi-turn cache continuation, interruption and independent sessions. There is no initial concurrency target; establish working model inference before buying throughput. Start with one RTX 3090 on Linux for its 24 GB memory headroom, then validate two workers on a multi-GPU host. GPU count is configurable. Each GPU holds its own full model replica and conversation caches, and the Rust gateway shares the host. Device memories are separate; session placement does not pool them.
+The correctness showcase now runs actual audio in, streamed text out, multi-turn cache continuation, interruption and independent sessions. One RTX 3090 has been tested; a multi-GPU host is the next topology experiment. GPU count is configurable. Each GPU holds its own full model replica and conversation caches, and the Rust gateway shares the host. Device memories are separate; session placement does not pool them.
 
 Two 12 GB RTX 3060s are a possible lower-cost multi-worker experiment, subject to current rental offers and measured model/workspace memory. They require limits sized for their smaller memory, rather than copying the current deployment example unchanged. Neither their feasibility nor their response latency has been validated. The memory specifications are from [NVIDIA's RTX 3090 page](https://www.nvidia.com/en-eu/geforce/graphics-cards/30-series/rtx-3090/) and [RTX 3060 announcement](https://nvidianews.nvidia.com/news/nvidia-introduces-geforce-rtx-3060-next-generation-of-the-worlds-most-popular-gpu/). A faster GPU may improve forward time; complete response latency also includes utterance processing, queueing, cache manipulation and transport.
 
-The provided one-GPU node is provisioned in a separate serving directory and environment, with small resource limits. Its PyTorch 2.6.0+cu124/Transformers 5.13.0 stack and existing fast kernels passed the limited check documented above. The backend also supports the pure PyTorch linear-attention fallback. Neither this check nor the current rental establishes sustainable session capacity or general fast-kernel performance across hardware.
+The provided one-GPU node uses a separate serving directory and environment. Its PyTorch 2.6.0+cu124/Transformers 5.13.0 stack and existing fast kernels passed both CUDA cache tests and the documented load sweep. The backend also supports the pure PyTorch linear-attention fallback. These short experiments do not establish sustainable session capacity or general fast-kernel performance across hardware.
 
 Remaining gates:
 
-1. Receive the final 10 Hz checkpoint and configuration; verify architecture, model revisions and hash.
+1. Confirm the quality-selected checkpoint; the completed step-9,550 run is already copied, hashed and integrated.
 2. Extend the existing one-GPU deployment to multi-worker hardware when that experiment is needed.
-3. Complete audio-reference/projector parity and broader cache/batching checks; preliminary CUDA cache continuation and gateway interruption now pass.
+3. Complete audio-reference/projector parity and broader mixed-context checks; native cache continuation, ragged decode and gateway interruption now pass.
 4. Profile encode/prefill/decode, cache join/split, CPU preparation, VRAM and end-of-turn-to-first-token latency.
 5. Ramp realistic concurrent conversations and tune reactive admission against per-session four-token/second throughput. Record the utterance, context and output lengths with capacity results.
 
-The detailed correctness and performance procedure is in [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md). The [deployment record](DEPLOYMENT_3090.md) establishes limited GPU integration for the intermediate checkpoint. The final checkpoint and sustained capacity remain untested.
+The detailed correctness and performance procedure is in [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md). The [current benchmark report](GPU_BENCHMARK_3090.md) establishes GPU integration and short workload measurements for the completed checkpoint. Training-reference quality parity, mixed long-context workloads, multiple physical GPUs and sustained capacity remain untested.
 
 ## Validation of the cadence update
 

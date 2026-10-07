@@ -21,4 +21,6 @@ PYTHONPATH=backend/src .venv/bin/python backend/tools/snapshot_checkpoint.py \
   -- .venv/bin/python -m voice_worker.cli --config /absolute/path/to/worker.json
 ```
 
-The serving configuration additionally caps the PyTorch allocator at 25% of device memory, with one session, batch size one, context 2,048 and 128 MiB cache budget. Production `WorkerConfig` defaults remain separate from these deliberately small shared-node limits.
+The original shared-training configuration capped the PyTorch allocator at 25% of device memory, with one session and a 128 MiB cache budget. After training and evaluation finished, the [idle-node benchmark](../../docs/GPU_BENCHMARK_3090.md) used a separate completed checkpoint and bounded larger limits. Production `WorkerConfig` defaults remain separate from either experiment.
+
+The guard handles a child exiting during `/proc` sampling without concealing a missing resource statistic for a live child. Run its six regression cases with `uv run pytest tools/test_guard_worker.py` from `backend/`; include that path alongside `tests` for the full operator/backend suite.

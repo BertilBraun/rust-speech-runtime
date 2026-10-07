@@ -1,5 +1,7 @@
 # Preliminary RTX 3090 integration — 2026-10-07
 
+**Historical shared-training run.** The later [idle-node GPU benchmark](GPU_BENCHMARK_3090.md) integrates the completed step-9,550 checkpoint, validates ragged batching and measures multi-session throughput. Its configuration and startup instructions now describe the provisioned service; the smaller limits and results below belong to the earlier smoke run.
+
 The pipeline has run actual Whisper/projector/Qwen inference on the user's rented RTX 3090 while the 10 Hz training run continued. Tests were deliberately small and serial. **Both serving services are stopped after validation**, returning their RAM/VRAM to training. They are provisioned under Supervisor with automatic start/restart disabled.
 
 ## Deployment and model identity

@@ -1,5 +1,7 @@
 # Implementation record
 
+The latest [RTX 3090 validation](GPU_BENCHMARK_3090.md) adds the completed 10 Hz checkpoint, real-model cache tests, throughput measurements and archive audits. The local validation counts and deferred hardware work below describe the initial implementation stage.
+
 The agreed target and acceptance checklist are in PLAN.md. This file records implementation choices, assumptions, review findings and validation evidence for the turn-based pipeline. Existing PERFORMANCE.md measurements concern the prior periodic echo workload.
 
 ## Decisions during implementation
